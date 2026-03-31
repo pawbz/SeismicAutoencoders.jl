@@ -4,9 +4,11 @@
 using Markdown
 using InteractiveUtils
 
+# ╔═╡ cc11647d-1c56-4ceb-9677-703aca03c9f4
+using Functors
+
 # ╔═╡ d73472ff-9e09-45b0-8811-b7dd8d820358
 using CUDA,
-cuDNN,
     Enzyme,
     Flux,
     MLUtils,
@@ -24,14 +26,1128 @@ cuDNN,
     ParameterSchedulers,
     Metalhead
 
-# ╔═╡ 461f0505-2230-4b84-b6c6-1a9730808437
-md"""# Symmetric Variational Autoencoders"""
+# ╔═╡ 76dbf599-a9b3-459f-992b-16ab2f7b74f1
+using PlutoLinks, PlutoHooks
+
+# ╔═╡ 4a95997e-5c12-4658-9b8e-a5065328e1c1
+using BenchmarkTools
 
 # ╔═╡ 97ae4222-5a3e-4cbd-b4d1-aa028d3e4ca8
 TableOfContents(include_definitions=true)
 
 # ╔═╡ 26fb86d5-c844-469a-aef5-ed3c2a9ba949
 xpu = gpu
+
+# ╔═╡ 631e5584-c4c3-4320-9a2d-477b7945c684
+Base.@kwdef struct GroupConditioning
+    mode::Symbol = :none
+    real1 = nothing
+    real2 = nothing
+    labels = nothing
+    nlabels::Int = 0
+end
+
+# ╔═╡ 96df0a0a-fd55-46b1-95af-067d02558380
+has_conditioning(c::Union{Nothing,GroupConditioning}) = (c !== nothing) && (c.mode != :none)
+
+# ╔═╡ f49d0e70-57e6-44a0-8e46-4d801c4b3f85
+function _vec_condition_input(x)
+    if (x isa Number)
+        return Float32[x]
+    elseif (x isa AbstractVector)
+        return Float32.(collect(x))
+    elseif (x isa AbstractMatrix)
+        if (size(x, 2) == 1)
+            return Float32.(vec(x))
+        else
+            return Float32.(vec(mean(x, dims=2)))
+        end
+    else
+        error("Unsupported condition input type: $(typeof(x)). Use Number, Vector, or Matrix.")
+    end
+end
+
+# ╔═╡ 065f859c-e7cf-4b42-bcc8-dfbf63104d26
+function _label_to_condition(label, nlabels::Int)
+    @assert nlabels > 1 "For label conditioning, nlabels must be > 1"
+    ilabel = Int(label)
+    @assert 1 <= ilabel <= nlabels "Label out of range. Got $ilabel, expected 1:$nlabels"
+    return Float32.(Flux.onehot(ilabel, 1:nlabels))
+end
+
+# ╔═╡ 17f60265-fac3-411c-b1dd-49b284d23597
+function get_group_condition_vector(conditioning::GroupConditioning, group_index::Int)
+    if (conditioning.mode == :none)
+        return Float32[]
+    elseif (conditioning.mode == :real1)
+        @assert conditioning.real1 !== nothing "conditioning.real1 must be set for :real1 mode"
+        return _vec_condition_input(conditioning.real1[group_index])
+    elseif (conditioning.mode == :real2)
+        @assert conditioning.real1 !== nothing "conditioning.real1 must be set for :real2 mode"
+        @assert conditioning.real2 !== nothing "conditioning.real2 must be set for :real2 mode"
+        return vcat(
+            _vec_condition_input(conditioning.real1[group_index]),
+            _vec_condition_input(conditioning.real2[group_index]),
+        )
+    elseif (conditioning.mode == :label)
+        @assert conditioning.labels !== nothing "conditioning.labels must be set for :label mode"
+        return _label_to_condition(conditioning.labels[group_index], conditioning.nlabels)
+    else
+        error("Unsupported conditioning mode: $(conditioning.mode). Supported: :none, :real1, :real2, :label")
+    end
+end
+
+# ╔═╡ 10429267-5808-4840-8678-f9dbf5b453c5
+# fc228dea-21fc-4fcd-82a9-7ac3bc7ee722
+"""
+**Group-Based Batch View Generator**
+
+Creates BatchView objects for each waveform group after shuffling instances and organizing them 
+for sampling `ntau` waveforms at a time.
+
+## Purpose in Group Training:
+- Prepares each group for efficient random sampling during training
+- Maintains group structure while enabling stochastic waveform selection
+- Essential for coherent information learning within groups
+
+## Arguments:
+- `dvec`: Vector of waveform groups [group1, group2, ..., groupN]  
+- `ntau`: Number of waveforms to sample per group (default: 20)
+
+## Returns:
+- Vector of BatchView objects, one per input group
+- Each BatchView enables efficient sampling of `ntau` waveforms from its group
+
+## Usage in Training Pipeline:
+```julia
+# Prepare data for group-based training
+waveform_groups = [recordings_site1, recordings_site2, recordings_site3]
+batch_views = get_batchviews(waveform_groups, ntau=20)
+training_samples = get_sample(batch_views, batchsize=32)
+```
+"""
+function get_batchviews(dvec, ntau=20)
+    X = map(dvec) do d
+        BatchView(shuffleobs(ObsView(d)), batchsize=ntau, partial=false)
+    end
+    return X
+end
+
+# ╔═╡ dc7e0a28-2739-44c2-9a44-c66079aaae17
+DG = @ingredients("/mnt/NAS/EQData/SeismicAutoencoders/data_generators.jl")
+
+# ╔═╡ 6affb3b3-9dc4-4bbc-a582-495fc1783a7a
+activation = x -> leakyrelu(x, 0.1)
+# activation = gelu
+
+# ╔═╡ 5847ea08-43ca-4c6d-a694-0017d7396f60
+# function get_conv_decoder(nt, pq)
+#     @assert nt % 16 == 0 "Output length nt must be divisible by 16 for DCGAN generator."
+#     latent_length = div(nt, 16)
+# 	nc0 = 256
+#     return Conv1DChain(Chain(
+#         Dense(pq, latent_length * nc0, activation),
+# 		x->reshape(x, latent_length, nc0, :),
+#         ConvTranspose((4,), nc0 => div(nc0, 2); stride=2, pad=1),
+# 		BatchNorm(div(nc0, 2)),
+# 		activation,
+# 		ConvTranspose((4,), div(nc0, 2) => div(nc0, 4); stride=2, pad=1),
+# 		BatchNorm(div(nc0, 4)),
+# 		activation,
+# 		ConvTranspose((4,), div(nc0, 4) => div(nc0, 8); stride=2, pad=1),
+# 		BatchNorm(div(nc0, 8)),
+# 		activation,
+# 		ConvTranspose((4,), div(nc0, 8) => 1; stride=2, pad=1),
+#     ))
+# end
+
+# ╔═╡ 4fb77fae-61bb-4484-b733-82e1d1002371
+begin
+end
+
+# ╔═╡ bf31f347-bc9a-4bf8-a086-99dba2f6fea0
+begin
+    Base.@kwdef struct ConvAE
+        # Encoder parameters
+        enc_kernels::Vector{Int} = [64, 32, 16, 4]
+        enc_filters::Vector{Int} = [8, 16, 32, 64]
+        enc_strides::Vector{Int} = [2, 2, 2, 2]
+        use_bn::Bool = false
+
+        # Decoder parameters
+        dec_kernels::Vector{Int} = [8, 16, 32]
+        dec_filters::Vector{Int} = [64, 48, 16, 1]
+        dec_upstrides::Vector{Int} = [2, 2, 1]
+    end
+end
+
+# ╔═╡ 91a25156-e121-4d53-a5a1-422f1230d235
+Base.@kwdef struct SymAE_Para
+    nt::Int
+    p::Int
+    k::Int = 1
+    q::Int
+    network_type = ConvAE()
+    transformer::Symbol = :null
+	transformer_k::Int = 1
+    condition_dim::Int = 0
+    condition_embed_dim::Int = 0
+    seed = nothing
+end
+
+# ╔═╡ 0fbf59a9-74bc-479f-879c-3f72f7c76489
+begin
+    struct DenseAE
+        flat_flag::Bool # linear decrease the width of dense layers, or not?
+        nt_hidden::Int # used in the case of flat flag
+        nlayers::Int # depth
+    end
+    function DenseAE()
+        return DenseAE(false, 256, 4)
+    end
+end
+
+# ╔═╡ 06a8d9e2-495c-4a25-8c23-527ba1b8e089
+begin
+    # DenseConvAE and ViTConvAE removed
+end
+
+# ╔═╡ b65ae9dc-dd50-4007-9894-cadef28e0552
+function accumulate_Gaussians(μ, loginvvar)
+    invvar = exp.(loginvvar)
+    invvarG = sum(invvar, dims=ndims(μ) - 1)
+    cμ = sum(μ .* invvar, dims=ndims(μ) - 1) ./ invvarG
+    logσ = @. -0.5f0 * log(invvarG)
+    return (; μ=cμ, logσ)
+end
+
+# ╔═╡ 8c54f11c-51b2-4500-9923-d3d38aa91e9b
+"""
+Weighted averaging without probabilty thresold
+"""
+function get_cluster_averages(model, D_to_get_prob; D_to_avg=D_to_get_prob)
+    A = cat(map(D_to_get_prob, D_to_avg) do d, da
+            λp = (softmax(model(d, Val(:coherent)).λlogits))
+            cat(map(eachslice(λp, dims=1)) do l
+                    mean(reshape(l, 1, :) .* da, dims=2)
+                end..., dims=2)
+        end..., dims=3)
+    return A
+end
+
+# ╔═╡ 76c4f167-11b5-48a3-b3b3-4fe8fd9646c1
+"""
+Coherent code is distributed across all the wavefield instances
+"""
+function sample_q_decode(cμ, clogσ, nμ, nlogσ, nnoise, cnoise, decoder, temperature; cond_embedding=nothing)
+    if (cnoise)
+        cx = cμ + xpu(randn(Float32, size(clogσ))) .* exp.(clogσ)
+    else
+        cx = cμ
+    end
+    cx = dropdims(cx, dims=ndims(cμ) - 1)
+    cx = Flux.stack(fill(cx, size(nμ, ndims(nμ) - 1)), dims=ndims(nμ) - 1)
+
+    if (nnoise)
+        nx = nμ + xpu(randn(Float32, size(nlogσ))) .* exp.(nlogσ)
+    else
+        nx = nμ
+    end
+
+    latent = cat(cx, nx, dims=1)
+    xhat, xhat_logvar = decoder(latent, cond_embedding)
+    return xhat, xhat_logvar
+end
+
+# ╔═╡ d74b7838-98c4-4356-8a0d-1a2388369788
+# begin
+#     # NOT USED
+#     struct Model_Dropout{T1,T2,T3}
+#         sencb::T1
+#         nencb::T2
+#         decb::T3
+#     end
+#     function (m::Model_Dropout)(x, nnoise, cnoise)
+#         cx, cμ, clogσ = m.sencb(x)
+
+#         nμ, nlogσ = m.nencb(x)
+
+#         if (nnoise)
+#             nx = dropout(nμ, 0.8)
+#         else
+#             nx = nμ
+#         end
+#         cx = dropdims(cx, dims=ndims(cμ) - 1)
+#         cx = Flux.stack(fill(cx, size(nx, ndims(nx) - 1)), dims=ndims(nx) - 1)
+#         xhat, xhat_logvar = m.decb(cat(cx, nx, dims=1))
+
+#         return (;
+#             Z=(; N=(; μ=nμ, logσ=nlogσ), C=(; μ=cμ, logσ=clogσ)),
+#             X=(; xhat, xhat_logvar),
+#         )
+#     end
+#     Flux.@layer Model_Dropout trainable = (sencb, nencb, decb)
+# end
+
+# ╔═╡ e80dd767-72ef-410b-b7a2-38e0545a5df3
+function get_dense_transformer(nt; nt_out=1, nt_hidden=nt)
+    transformer =
+        Chain(
+            Dense(nt, nt_hidden, activation),
+            Dense(nt_hidden, nt_hidden, activation),
+            Dense(nt_hidden, nt_out, init=zeros),
+        ) |> xpu
+    return transformer
+end
+
+# ╔═╡ 1f139691-e19f-41e5-8113-3cc00e8fe2b8
+#===
+        code for full spatial transformer (commented for now, as only Fourier shifts is used)
+              #         shifts = cat(
+              #             cat(
+              #                 xpu(ones(Float32, 1, 1, 1, n2 * n3)),
+              #                 reshape(shifts1, 1, 1, 1, n2 * n3),
+              #                 dims = 2,
+              #             ),
+              #             xpu(zeros(Float32, 1, 2, 1, n2 * n3)),
+              #             dims = 1,
+              #         )
+
+              #         inv_shifts = cat(
+              #             cat(
+              #                 xpu(ones(Float32, 1, 1, 1, n2 * n3)),
+              #                 -1.0f0 * reshape(shifts1, 1, 1, 1, n2 * n3),
+              #                 dims = 2,
+              #             ),
+              #             xpu(zeros(Float32, 1, 2, 1, n2 * n3)),
+              #             dims = 1,
+              #         )
+              # return (; shifts, inv_shifts, shiftsμ = sμ)
+        ===#
+
+# ╔═╡ 825dda0d-6472-405c-b149-5c4d2202963f
+# """
+# code for spatial transformer (commented for now, as only Fourier shifts is used)
+# shift traces with localization net
+# - input_traces have size (nt, nr)
+# - localization_net returns the time shifts (nr)
+# - uses global variable sampling_grid
+# """
+# function shift_traces_grid_sample(input_traces, shifts, sampling_grid)
+#     S = Flux.stack(fill(sampling_grid, size(shifts, 4)), dims=4)
+#     grids = batched_mul(shifts, S)
+#     input_traces1 =
+#         reshape(input_traces, size(input_traces, 1), 1, 1, prod(size(input_traces)[2:end]))
+#     output_traces = grid_sample(input_traces1, grids; padding_mode=:zeros)
+#     return reshape(output_traces, size(input_traces))
+# end
+
+# ╔═╡ 84d56fa3-50de-48ad-8e07-dfaecc1cfdf3
+function fouriertransform1D(𝐱::AbstractArray)
+    return fft(𝐱, 1) # perform fft along first dimension
+end
+
+# ╔═╡ 86a120ae-8865-4e99-a028-f567f3c1bbad
+function inversefouriertransform1D(𝐱_fft::AbstractArray)
+    return real(ifft(𝐱_fft, 1)) # perform ifft along first dimension
+end
+
+# ╔═╡ a48d23b6-86d6-4232-a1b9-300e65b264ff
+begin
+    """
+    Select only μ and logσ from coherent codes
+    Depending on kopt, select respective chunk of the coherent code
+    """
+    function batch_coherent_codes(vec::Vector{<:NamedTuple})
+        merged = (; μ=(getfield.(vec, :μ)..., dims=3), logσ=cat(getfield.(vec, :logσ)..., dims=3))
+        return merged
+    end
+    function batch_coherent_codes(v::NamedTuple)
+        return (; μ=getfield(v, :μ), logσ=getfield(v, :logσ))
+    end
+    function apply_λlogits_cond(vec::Vector{<:NamedTuple}, λlogits_cond)
+        merged = batch_coherent_codes(vec)
+        # select kopt chunk
+        return map(merged) do m
+            m_chunks = chunk(m, size(λlogits_cond, 1), dims=1)
+            λ_chunks = chunk(λlogits_cond, size(λlogits_cond, 1), dims=1)
+            cx = sum(map(m_chunks, λ_chunks) do c, l
+                c .* l
+            end)
+            return cx
+        end
+    end
+    function apply_λlogits_cond(C::NamedTuple, λlogits_cond)
+        merged = (; μ=C.μ, logσ=C.logσ)
+        # select kopt chunk
+        return map(merged) do m
+            m_chunks = chunk(m, size(λlogits_cond, 1), dims=1)
+            λ_chunks = chunk(λlogits_cond, size(λlogits_cond, 1), dims=1)
+            cx = sum(map(m_chunks, λ_chunks) do c, l
+                c .* l
+            end)
+            return cx
+        end
+    end
+end
+
+# ╔═╡ a85b6958-d894-45cc-86c6-933fba757e1c
+# function loss_kl_Qc_accumulated(nuisance_codes, optimal_nuisance_model, C, alpha)
+#     copyto!(optimal_nuisance_model.nuisance_codes, nuisance_codes)
+#     return loss_kl_Qc_accumulated(optimal_nuisance_model, C, alpha)
+# end
+
+# ╔═╡ 74c8e79f-b1c8-484b-86bf-65c2a2831b53
+# """
+# """
+# function optimize_nuisance_code_black_box_optim(d, para, model; MaxTime=10.0)
+#     coherent_codes = model(d, Val(:coherent))
+#     optimal_nuisance_model = get_Model_Optimal_Nuisance(para, model, init=randobs(d))
+#     loss(x) = Float64(
+#         loss_kl_Qc_accumulated(
+#             x,
+#             optimal_nuisance_model,
+#             coherent_codes
+#         )[1],
+#     )
+#     result = bboptimize(
+#         loss;
+#         NumDimensions=para.q,
+#         SearchRange=(-10.0, 10.0),
+#         MaxTime=MaxTime,
+#         MaxSteps=-1,
+#         TraceMode=:silent,
+#         #inDeltaFitnessTolerance = 0.01
+#     )
+#     return optimal_nuisance_model(
+#         best_candidate(result),
+#         coherent_codes.cμ,
+#         coherent_codes.clogσ,
+#     )[1],
+#     result
+# end
+
+# ╔═╡ 073c77d1-7598-45d3-858d-9222f2e4c590
+# """
+# """
+# function optimize_nuisance_code_metaheuristics(d, para, model; MaxTime=10)
+#     coherent_codes = model([d], Val())[1]
+
+#     _, _, ideal_seismogram_ids = kl_Qc_accumulated(para, model, [d], 255, 1)
+#     ideal_seismograms = mapreduce(hcat, ideal_seismogram_ids) do ideal_seismogram_id
+#         d[:, ideal_seismogram_id]
+#     end
+
+#     optimal_nuisance_model =
+#         get_Model_Optimal_Nuisance(para, model, init=ideal_seismograms)
+#     function loss(X)
+#         if (ndims(X) == 2)
+#             x = permutedims(X, (2, 1))
+#         elseif (ndims(X) == 3)
+#             x = permutedims(X, (2, 1, 3))
+#         else
+#             x = X
+#         end
+#         L = loss_kl_Qc_accumulated(
+#             x,
+#             optimal_nuisance_model,
+#             coherent_codes
+#         )[2]
+#         if (ndims(X) == 1)
+#             return Float64(L[1])
+#         else
+#             return Float64.(L[1:size(X, 1)])
+#         end
+#     end
+#     options = Options(
+#         f_calls_limit=0,
+#         time_limit=MaxTime,
+#         parallel_evaluation=true,
+#         iterations=1000,
+#     )
+#     bounds = boxconstraints(lb=-Inf * ones(para.q), ub=Inf * ones(para.q))
+#     algo = GA(
+#         options=options,
+#         mutation=Metaheuristics.PolynomialMutation(; bounds),
+#         crossover=SBX(; bounds),
+#         environmental_selection=GenerationalReplacement(),
+#     )
+#     # algo = ECA(options = options)
+
+#     initial_nuisances =
+#         Float64.(
+#             cpu(
+#                 dropdims(
+#                     permutedims(optimal_nuisance_model.nuisance_codes, (2, 1, 3)),
+#                     dims=3,
+#                 ),
+#             )
+#         )
+#     set_user_solutions!(algo, initial_nuisances[1:100, :], loss)
+#     result = optimize(loss, bounds, algo)
+
+#     return optimal_nuisance_model(
+#         minimizer(result),
+#         coherent_codes.cμ,
+#         coherent_codes.clogσ,
+#     )[1],
+#     result
+# end
+
+# ╔═╡ 4ec8578c-a202-4a3d-9425-60bf623a3a02
+"""
+    # x: point where log-pdf is evaluated (vector)
+    # mean: mean vector of the Gaussian
+    # log_std: log of standard deviations (vector)
+"""
+function neg_logpdf_gaussian(x, mean, log_std)
+    log_det = sum(log_std, dims=1)
+    squared_term = sum(((x .- mean) ./ exp.(log_std)) .^ 2, dims=1)
+
+    neg_log_pdf = @. log_det + 0.5 * squared_term
+    return neg_log_pdf
+end
+
+# ╔═╡ 41b5d143-6a0f-4f4c-8e62-8483d9e0d5f6
+"""
+KL divergence between two categorical distributions
+# Arguments
+- `logits`: logits unnormalized
+- `prior`: prior 
+"""
+function kl_divergence_categorial_distributions(logits, prior)
+    λ = Flux.softmax(logits; dims=1)
+    λ = clamp.(λ, 0.0001f0, 1.0f0) # avoid log(0) in posterior
+    prior = clamp.(prior, 0.0001f0, 1.0f0)  # avoid log(0) in posterior
+    kl = @. (λ * (log(λ) - log(prior)))
+    return sum(kl)
+end
+
+# ╔═╡ e57556e8-b287-4bc5-9ea1-4f68948eccf2
+"""
+    kl_divergence_multivariate_gaussians(mean1, log_std1, mean2, log_std2)
+
+Compute the Kullback-Leibler (KL) divergence between two multivariate Gaussian distributions.
+
+# Arguments
+- `mean1`: The mean of the first Gaussian distribution.
+- `log_std1`: The log standard deviation of the first Gaussian distribution.
+- `mean2`: The mean of the second Gaussian distribution.
+- `log_std2`: The log standard deviation of the second Gaussian distribution.
+
+# Returns
+The KL divergence between the two Gaussian distributions.
+"""
+function kl_divergence_multivariate_gaussians(mean1, log_std1, mean2, log_std2)
+    kl1 = @. (exp(2.0f0 * log_std1) / exp(2.0f0 * log_std2) + abs2(mean1 - mean2) / exp(2.0f0 * log_std2) - 1.0f0 - 2.0f0 * log_std1 + 2.0f0 * log_std2)
+    kl = 0.5f0 .* sum(kl1, dims=1)
+    return kl
+end
+
+# ╔═╡ e46630eb-5e29-4c5e-b792-0f7ca0af0ff0
+"""
+    hellinger_distance_multivariate_gaussians(mean1, log_sigma1, mean2, log_sigma2)
+The Hellinger distance between two multivariate Gaussian distributions
+"""
+function hellinger_distance_multivariate_gaussians(meanX, logσ1, meanY, logσ2)
+    σ1 = exp.(2.0f0 * logσ1)
+    σ2 = exp.(2.0f0 * logσ2)
+
+    detX = prod(σ1)
+    detY = prod(σ2)
+    covXY = (σ1 .+ σ2) / 2.0f0
+    detXY = prod(covXY)
+
+    # Compute the exponent term
+    diff = meanX .- meanY
+    covXY_inverted = 1 ./ covXY  # Since covXY is diagonal, inversion is element-wise
+    exponent_term = exp(-0.125 * sum((diff .^ 2) .* covXY_inverted))
+
+    # Compute the Hellinger distance
+    dist = 1.0 - (fourthroot(detX) * fourthroot(detY) / sqrt(detXY)) * exponent_term
+
+    return dist
+end
+
+# ╔═╡ 361ead1b-3fe3-4ae2-b018-2c6904d0f889
+"""
+    kl_divergence_multivariate_gaussian(mean1, log_std1)
+
+Compute the Kullback-Leibler (KL) divergence between two multivariate Gaussian distributions.
+
+# Arguments
+- `mean1`: The mean of the first Gaussian distribution.
+- `log_std1`: The log standard deviation of the first Gaussian distribution.
+
+# Returns
+The KL divergence between the two Gaussian distributions.
+"""
+function kl_divergence_multivariate_gaussian(mean1, log_std1)
+    return 0.5f0 * sum(@. (exp(2.0f0 * log_std1) + abs2(mean1) - 1.0f0 - 2.0f0 * log_std1))
+end
+
+# ╔═╡ d966211f-012e-45f2-b9ae-abf599666edf
+begin
+    function get_kl(μ, logσ, beta)
+        return beta * kl_divergence_multivariate_gaussian(μ, logσ)
+    end
+    function get_kl(μ, logσ, beta, betadummy)
+        return get_kl(μ, logσ, beta)
+    end
+end
+
+# ╔═╡ 6556c7c7-9934-49be-8f8a-423a0d16e57e
+function kl_divergence_multivariate_gaussians(mean1, log_std1, mean2)
+    # std2 = 1.0  →  log_std2 = 0.0
+    # exp(2*log_std2) = 1
+
+    # σ1^2
+    var1 = @. exp(2f0 * log_std1)
+
+    # (μ1 − μ2)^2
+    diff2 = @. abs2(mean1 - mean2)
+
+    # KL per dimension
+    kl1 = @. var1 + diff2 - 1f0 - 2f0*log_std1
+
+    # Sum over dimensions, keep batch dimension intact
+    return 0.5f0 .* sum(kl1)
+end
+
+# ╔═╡ afb6c675-0ef8-445c-a204-795e300c8589
+"""
+Return KL divergence between accumulated coherent information and coherent information in the instances generated using optimal nuisance model
+"""
+function loss_kl_Qc_accumulated(optimal_nuisance_model, coherent_codes::Vector{T}, alpha; p=1, Bref=1f0, Cref=1f0) where {T}
+
+    virtualdata, cμ_all, clogσ_all, = optimal_nuisance_model(coherent_codes)
+    coherent_codes_batched = apply_λlogits_cond(batch_coherent_codes(coherent_codes), optimal_nuisance_model.λlogits_cond)
+    C_all_logits = apply_λlogits_cond((; μ=cμ_all, logσ=clogσ_all), optimal_nuisance_model.λlogits_cond)
+
+    cμ_in = coherent_codes_batched.μ
+    cμ_in = dropdims(cμ_in, dims=ndims(cμ_in) - 1)
+    cμ_in = Flux.stack(fill(cμ_in, size(cμ_all, ndims(cμ_all) - 1)), dims=ndims(cμ_all) - 1)
+
+    clogσ_in = coherent_codes_batched.logσ
+    clogσ_in = dropdims(clogσ_in, dims=ndims(clogσ_in) - 1)
+    clogσ_in = Flux.stack(fill(clogσ_in, size(clogσ_all, ndims(clogσ_all) - 1)), dims=ndims(clogσ_all) - 1)
+
+    B = kl_divergence_multivariate_gaussians(cμ_in, clogσ_in, C_all_logits.μ, C_all_logits.logσ)
+    # B = neg_logpdf_gaussian(cμ_in, cμ_all, clogσ_all)
+    # virtualdata1 = normalise(virtualdata, dims=1)
+    virtualdata1 = virtualdata
+    return (; loss=sum(B) / Bref + alpha * norm(virtualdata1, p) / Cref, kl=B, L=norm(virtualdata1, p), virtualdata)
+end
+
+# ╔═╡ 6e7c70c8-cffe-4b30-85b4-5942fbb60da8
+"""
+    js_divergence_multivariate_gaussians(mean1, log_std1, mean2, log_std2)
+
+Compute the Jensen-Shannon (JS) divergence between two multivariate Gaussian distributions.
+
+# Arguments
+- `mean1`: The mean of the first Gaussian distribution.
+- `log_std1`: The log standard deviation of the first Gaussian distribution.
+- `mean2`: The mean of the second Gaussian distribution.
+- `log_std2`: The log standard deviation of the second Gaussian distribution.
+
+# Returns
+The JS divergence between the two Gaussian distributions.
+"""
+function js_divergence_multivariate_gaussians(mean1, log_std1, mean2, log_std2)
+    js =
+        0.5 * (
+            kl_divergence_multivariate_gaussians(mean1, log_std1, mean2, log_std2) +
+            kl_divergence_multivariate_gaussians(mean2, log_std2, mean1, log_std1)
+        )
+    return js
+end
+
+# ╔═╡ 4e527961-5734-4294-9f3c-e2aa8314eef6
+"""
+Compute the Bhattacharyya distance between two Gaussian distributions.
+
+Parameters:
+- mean1: The mean of the first Gaussian distribution.
+- log_std1: The log standard deviation of the first Gaussian distribution.
+- mean2: The mean of the second Gaussian distribution.
+- log_std2: The log standard deviation of the second Gaussian distribution.
+
+Returns:
+- bd: The Bhattacharyya distance between the two Gaussian distributions.
+"""
+function bhattacharyya_distance(cμ1, clogσ1, cμ2, clogσ2)
+    # Bhattacharya Distance
+    cvar1 = @. exp(2.0f0 * clogσ1)
+    cvar2 = @. exp(2.0f0 * clogσ2)
+    Dvar = 0.5f0 * (sum(@. 2.0f0 * clogσ1) + sum(@. 2.0f0 * clogσ2))
+    cvarmean = @. 0.5f0 * (cvar1 + cvar2)
+    Nvar = sum(@. log.(cvarmean))
+    return sum(@. abs2(cμ1 - cμ2) / cvarmean) / 8.0f0 + 0.5f0 * (Nvar - Dvar)
+
+    # # Convert log standard deviations to standard deviations
+    # std1 = exp.(log_std1)
+    # std2 = exp.(log_std2)
+
+    # # Compute the Bhattacharyya distance
+    # bd = 0.5 * sum(@. ((mean1 - mean2)^2 / (std1^2 + std2^2) + log((std1 * std2) / sqrt(std1^2 + std2^2))))
+    # return bd
+end
+
+# ╔═╡ c5d5be4d-882e-4c34-ae8f-1a40aa4cf215
+# ╠═╡ show_logs = false
+# ╠═╡ disabled = true
+#=╠═╡
+begin
+    Xv = xpu([randn(100, 10), randn(100, 10)])
+    ref = xpu(randn(100))
+    ref2 = xpu(randn(100, 2))
+    ref3 = xpu(randn(100, 10, 2))
+
+end
+  ╠═╡ =#
+
+# ╔═╡ b9b5f42d-4ec1-43b5-9484-d3ec47dea61a
+"""
+    average_leave_one_out_correlation(X::AbstractMatrix)
+
+Compute the average Pearson correlation between each column of `X` and the mean of the remaining columns.
+
+# Arguments
+- `X`: A matrix of shape (m, n), where columns represent features or signals.
+
+# Returns
+- The average Pearson correlation coefficient.
+"""
+function average_leave_one_out_correlation(X::AbstractMatrix)
+    n = size(X, 2)
+    colsum = sum(X, dims=2)
+    total_corr = 0.0
+
+    for (i, xi) in enumerate(eachcol(X))
+        mean_rest = (colsum .- xi) ./ (n - 1)
+
+        a = vec(xi)
+        b = vec(mean_rest)
+
+        ma, mb = mean(a), mean(b)
+        numerator = sum((a .- ma) .* (b .- mb))
+        denominator = sqrt(sum((a .- ma) .^ 2) * sum((b .- mb) .^ 2))
+        total_corr += numerator / denominator
+    end
+
+    return total_corr / n
+end
+
+# ╔═╡ ae75eee7-ed34-4a2a-8aa3-08a06f504d36
+function average_leave_one_out_correlation(X::Vector)
+    return map(X) do x
+        average_leave_one_out_correlation(x)
+    end
+end
+
+# ╔═╡ eafe181e-19e9-409e-ad1d-ce859cf0e672
+Base.@kwdef struct Training_Para
+    ntau::Int = 20
+    beta = (; N=[1f0], C=[1f0, 1f0])
+    gamma::Float32 = 1f2
+    temperature::Float32 = 1f0
+    batchsize::Int = 32
+    nsteps::Int = 100
+    nprint::Int = 1
+    nepoch::Int = 10
+    initial_learning_rate::Float64 = 0.001
+end
+
+# ╔═╡ 0f0fe0e8-a239-474b-b9af-54507cb968aa
+"""
+use virtual data where source is used from x and nuisance from xaug
+"""
+function generate_virtual_data(x, xaug, nnoise, cnoise, model)
+    output = model(x, xaug, nothing, nnoise, cnoise, 0f0)
+    return output.X.xhat
+end
+
+# ╔═╡ 7531c2eb-5505-4ad2-9f79-111bed3bef74
+"""
+    redatum(d1, d2, model, nnoise=false, cnoise=false)
+
+Redatum two input data `d1` and `d2` using the given `model`. The `model` should be a function that takes input data and returns the redatumed output.
+
+## Arguments
+- `d1`: The first input data.
+- `d2`: The second input data.
+- `model`: symae model
+- `nnoise`: A boolean indicating whether to sample Q(n|x) or use its mean
+- `cnoise`: A boolean indicating whether to sample Q(c|x) or use its mean
+
+## Returns
+A named tuple containing the redatumed data `d1hat`, `d2hat`, `d12hat`, and `d21hat`.
+"""
+function redatum(d1, d2, model, nnoise=false, cnoise=false; condition=nothing, temperature=0f0)
+    d1hat = model(d1, condition, nnoise, cnoise, temperature).X.xhat
+    d2hat = model(d2, condition, nnoise, cnoise, temperature).X.xhat
+    d12hat = model(d1, d2, condition, nnoise, cnoise, temperature).X.xhat
+    d21hat = model(d2, d1, condition, nnoise, cnoise, temperature).X.xhat
+    return map(cpu, (; d1=d1, d2=d2, d1hat, d2hat, d12hat, d21hat))
+end
+
+# ╔═╡ c9f4b3e6-6691-4e7f-86c7-dcacdde924a5
+"""
+Plot training and test loss history with publication-quality styling.
+
+Arguments:
+- loss_history: struct containing loss arrays
+- title: main plot title (default: "")
+
+Returns: PlutoPlotly plot with MSE and other losses in subplots
+"""
+function plot_loss_history(loss_history; title="")
+    # Publication-quality color palette
+    colors_mse = ["#E74C3C", "#3498DB"]
+    colors_other = ["#2ECC71", "#F39C12", "#9B59B6", "#1ABC9C", "#E67E22", "#95A5A6"]
+
+    # MSE traces
+    trace_mse = [
+        PlutoPlotly.scatter(
+            y=cpu(getfield(loss_history, label)),
+            mode="lines",
+            name=string(label),
+            line=attr(color=colors_mse[i], width=2.5)
+        ) for (i, label) in enumerate([:train_mse, :test_mse])
+    ]
+
+    # Other loss traces
+    other_labels = [:train_neg_llh, :test_neg_llh, :train_kl, :test_kl, :train_neg_elbo, :test_neg_elbo]
+    trace_other = [
+        PlutoPlotly.scatter(
+            y=cpu(getfield(loss_history, label)),
+            mode="lines",
+            name=string(label),
+            line=attr(color=colors_other[i], width=2.5)
+        ) for (i, label) in enumerate(other_labels)
+    ]
+
+    # Common layout settings
+    common_layout = attr(
+        width=600,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        showgrid=true,
+        gridcolor="rgba(128,128,128,0.2)",
+        gridwidth=1,
+        showline=true,
+        linewidth=1.5,
+        linecolor="black",
+        mirror=true
+    )
+
+    # MSE subplot layout (log scale)
+    layout_mse = Layout(
+        title=attr(text="MSE Loss", font=attr(size=23, family="Computer Modern, Latin Modern Math, serif")),
+        height=600,
+        width=400,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        legend=attr(
+            x=0.98, y=0.98,
+            xanchor="right", yanchor="top",
+            font=attr(size=18, family="Computer Modern, Latin Modern Math, serif"),
+            bgcolor="rgba(255,255,255,0.8)",
+            bordercolor="rgba(0,0,0,0.2)",
+            borderwidth=1
+        ),
+        xaxis=merge(common_layout, attr(
+            title=attr(text="Epoch", font=attr(size=20, family="Computer Modern, Latin Modern Math, serif")),
+            tickfont=attr(size=18, family="Computer Modern, Latin Modern Math, serif")
+        )),
+        yaxis=merge(common_layout, attr(
+            title=attr(text="MSE", font=attr(size=20, family="Computer Modern, Latin Modern Math, serif")),
+            type="log",
+            tickfont=attr(size=18, family="Computer Modern, Latin Modern Math, serif")
+        )),
+        margin=attr(l=80, r=40, t=60, b=70)
+    )
+
+    # Other losses subplot layout (linear scale)
+    layout_other = Layout(
+        title=attr(text="Other Losses", font=attr(size=23, family="Computer Modern, Latin Modern Math, serif")),
+        height=600,
+        width=400,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        legend=attr(
+            x=0.98, y=0.98,
+            xanchor="right", yanchor="top",
+            font=attr(size=18, family="Computer Modern, Latin Modern Math, serif"),
+            bgcolor="rgba(255,255,255,0.8)",
+            bordercolor="rgba(0,0,0,0.2)",
+            borderwidth=1
+        ),
+        xaxis=merge(common_layout, attr(
+            title=attr(text="Epoch", font=attr(size=20, family="Computer Modern, Latin Modern Math, serif")),
+            tickfont=attr(size=18, family="Computer Modern, Latin Modern Math, serif")
+        )),
+        yaxis=merge(common_layout, attr(
+            title=attr(text="Loss", font=attr(size=20, family="Computer Modern, Latin Modern Math, serif")),
+            tickfont=attr(size=18, family="Computer Modern, Latin Modern Math, serif")
+        )),
+        margin=attr(l=80, r=40, t=60, b=70)
+    )
+
+    # Create subplots side by side
+    p1 = PlutoPlotly.plot(trace_mse, layout_mse)
+    p2 = PlutoPlotly.plot(trace_other, layout_other)
+
+    # Combine plots
+    p = [p1; p2]
+
+    # Add overall title if provided
+    if !isempty(title)
+        relayout!(p, title_text=title,
+            title_font=attr(size=27, family="Computer Modern, Latin Modern Math, serif"))
+    end
+
+    return p
+end
+
+# ╔═╡ 1a8619c6-4c19-4f55-a968-d18a4f1016e7
+function taper(x)
+    w = (cat(tukey(size(x, 1), 0.1), dims=ndims(x)))
+    return w .* x
+end
+
+# ╔═╡ 80f77b52-84e0-4664-8aa0-3d79fded40de
+"""
+Instead of cat(x, dims=3)
+"""
+add_dim3_reshape(::Nothing) = nothing
+
+# ╔═╡ 6ba143e2-50df-441a-8f38-3ea8d9edd4d8
+function add_dim3_reshape(x)
+	x === nothing && return nothing
+	nd = ndims(x)
+    if nd == 3
+        return x
+    elseif nd == 2
+        return reshape(x, size(x,1), size(x,2), 1)
+    elseif nd == 1
+        return reshape(x, size(x,1), 1, 1)
+    else
+        error("Input has more than 3 dimensions")
+    end
+end
+
+# ╔═╡ 96aebf7d-2112-4a4d-9993-6f53f40ffca5
+function generate_dense_chain(
+    nt,
+    p,
+    nlayers,
+    output_activation,
+    flat_flag=false,
+    ;
+    nt_hidden=nt,
+)
+    if (flat_flag)
+        lp = fill(nt_hidden, nlayers + 1)
+    else
+        lp = floor.(Int, LinRange(nt, p, nlayers + 1))
+    end
+    layers = []
+
+    # make input 3D
+    push!(layers, x -> add_dim3_reshape(x))
+
+    # Add input layer
+    push!(layers, Dense(nt, lp[2], activation))
+
+    # Add hidden layers
+    for il = 2:nlayers-1
+        push!(layers, Dense(lp[il], lp[il+1], activation))
+    end
+
+    # Add output layer
+    push!(layers, Dense(lp[nlayers], p, output_activation))
+
+    return layers
+end
+
+# ╔═╡ 0dd8d418-a664-4ecd-ac90-bab97861f9f0
+function get_symae(t::DenseAE, nt, p, q, k, condition_embed_dim=0)
+    P = p * k
+    nt_enc = nt + condition_embed_dim
+    senc =
+        Chain(
+            generate_dense_chain(
+                nt_enc,
+                P,
+                t.nlayers,
+                activation,
+                t.flat_flag,
+                nt_hidden=t.nt_hidden,
+            )...,
+        ) |> xpu
+
+    # instance means
+    senc_μ = Chain(Dense(P, P)) |> xpu
+
+    # inverse variances
+    senc_loginvvar = Chain(Dense(P, P)) |> xpu
+    senc_λlogits = xpu(Chain(Dense(P + condition_embed_dim, P, activation), Dense(P, 2 * P, activation), Dense(2 * P, 2 * P, activation), Dense(2 * P, k))) # only used when k>1
+
+    nenc =
+        Chain(
+            generate_dense_chain(
+                nt_enc,
+                q,
+                t.nlayers,
+                activation,
+                t.flat_flag,
+                nt_hidden=t.nt_hidden,
+            )...,
+        ) |> xpu
+
+    # produce logσ for the nuisance encoder
+    nenc_μ = Chain(Dense(q, q)) |> xpu
+    nenc_logσ = Chain(Dense(q, q)) |> xpu
+
+    dec =
+        Chain(
+            generate_dense_chain(
+                p + q + condition_embed_dim,
+                nt,
+                t.nlayers,
+                identity,
+                t.flat_flag,
+                nt_hidden=t.nt_hidden,
+            )...,
+        ) |> xpu
+
+    dec_logvar = xpu(cat(1.0f0, dims=3))
+
+    return (; senc, senc_μ, senc_loginvvar, senc_λlogits, nenc, nenc_μ, nenc_logσ, dec, dec_logvar)
+end
+
+# ╔═╡ 32baae21-b5fa-4391-9066-23436a5a2b1d
+begin
+    struct Conv1DChain
+        chain::Chain
+    end
+    Flux.@layer Conv1DChain trainable = (chain)
+    (m::Conv1DChain)(::Nothing) = nothing
+    function (m::Conv1DChain)(x)
+        x = add_dim3_reshape(x)
+        n1, n2, n3 = size(x)
+        X = reshape(x, :, 1, n2 * n3)
+        X = m.chain(X)
+        X = reshape(X, :, n2, n3)
+        return X
+    end
+end
+
+# ╔═╡ 237ad98e-75db-41fc-b378-b895facdd8d9
+begin
+    struct BroadcastDec{T1,T2}
+        chain::T1
+        logvar::T2
+    end
+    Flux.@layer BroadcastDec trainable = (chain, logvar)
+    function (m::BroadcastDec)(x, cond_embedding=nothing)
+        Xμ = _maybe_forward(m.chain, x, cond_embedding)
+        return Xμ, m.logvar
+    end
+
+    struct NoConditionProjector end
+    Flux.@layer NoConditionProjector
+    (m::NoConditionProjector)(::Any) = nothing
+
+    function _get_condition_embedding(cond_proj, condition_dim::Int, x, condition)
+        if (condition_dim <= 0) || (x === nothing)
+            return nothing
+        end
+        batch_size = size(x, ndims(x))
+        cond = if (condition === nothing)
+            zeros(Float32, condition_dim, batch_size)
+        elseif (ndims(condition) == 1)
+            reshape(Float32.(condition), :, 1)
+        else
+            Float32.(condition)
+        end
+        if (size(cond, 2) == 1) && (batch_size > 1)
+            cond = reshape(Flux.stack(fill(cond, batch_size), dims=2), size(cond, 1), batch_size)
+        end
+        @assert size(cond, 1) == condition_dim "Condition feature size mismatch. Expected $condition_dim, got $(size(cond, 1))."
+        @assert size(cond, 2) == batch_size "Condition batch size mismatch. Expected $batch_size, got $(size(cond, 2))."
+        return cond_proj(xpu(cond))
+    end
+
+    function _expand_condition_for_decoder(cond_embedding, target_shape)
+        if (cond_embedding === nothing)
+            return nothing
+        end
+        ntau = size(target_shape, ndims(target_shape) - 1)
+        return Flux.stack(fill(cond_embedding, ntau), dims=2)
+    end
+
+    function _expand_condition_for_encoder(cond_embedding, x)
+        if (cond_embedding === nothing)
+            return nothing
+        end
+        x3 = add_dim3_reshape(x)
+        ntau = size(x3, 2)
+        return Flux.stack(fill(cond_embedding, ntau), dims=2)
+    end
+
+    function _augment_encoder_input(x, cond_embedding)
+        x3 = add_dim3_reshape(x)
+        cenc = _expand_condition_for_encoder(cond_embedding, x3)
+        if (cenc === nothing)
+            return x3
+        end
+        return cat(x3, cenc, dims=1)
+    end
+end
+
+# ╔═╡ a5302fa2-4f67-4ed6-96ce-dda78a160ffe
+begin
+    abstract type AbstractParallel end
+
+    _maybe_forward(layer::AbstractParallel, x, ys...) = layer(x, ys...)
+    _maybe_forward(layer::Parallel, x, ys...) = layer(x, ys...)
+    _maybe_forward(layer, x, ys...) = layer(x)
+
+    struct ConditionalChain{T<:Union{Tuple,NamedTuple}} <: AbstractParallel
+        layers::T
+    end
+    Flux.@layer ConditionalChain
+
+    ConditionalChain(xs...) = ConditionalChain(xs)
+    function ConditionalChain(; kw...)
+        :layers in keys(kw) && throw(ArgumentError("a ConditionalChain cannot have a named layer called `layers`"))
+        isempty(kw) && return ConditionalChain(())
+        ConditionalChain(values(kw))
+    end
+
+    Flux.@forward ConditionalChain.layers Base.getindex, Base.length, Base.first, Base.last,
+    Base.iterate, Base.lastindex, Base.keys, Base.firstindex
+
+    Base.getindex(c::ConditionalChain, i::AbstractArray) = ConditionalChain(c.layers[i]...)
+
+    function (c::ConditionalChain)(x, ys...)
+        for layer in c.layers
+            x = _maybe_forward(layer, x, ys...)
+        end
+        return x
+    end
+
+    struct ConditionConcat <: AbstractParallel end
+    Flux.@layer ConditionConcat
+    (m::ConditionConcat)(x, cond_embedding=nothing) = _augment_encoder_input(x, cond_embedding)
+
+end
+
+# ╔═╡ 461f0505-2230-4b84-b6c6-1a9730808437
+md"""# Symmetric Variational Autoencoders"""
 
 # ╔═╡ 3983e7d0-9ad0-11f0-0a96-7d2d98772fd2
 md"""
@@ -383,6 +1499,14 @@ md"""
 - `spatial_transformer_gamma`::Float32 = 0.5f0
 """
 
+# ╔═╡ 8fefefd8-b63a-4be7-92e3-8ed7c3f88865
+function infer_condition_dim(conditioning::Union{Nothing,GroupConditioning})
+    if !has_conditioning(conditioning)
+        return 0
+    end
+    return length(get_group_condition_vector(conditioning, 1))
+end
+
 # ╔═╡ 29d41554-3a0a-4972-a9e5-54c998429acd
 md"""## Data Generator for Group-Based Training
 
@@ -404,144 +1528,128 @@ The SymVAE training process relies on organizing waveforms into **groups** (also
 5. **Nuisance Learning**: Model learns instance-specific variations within each group
 """
 
-# ╔═╡ fc228dea-21fc-4fcd-82a9-7ac3bc7ee722
-"""
-**Group-Based Batch View Generator**
-
-Creates BatchView objects for each waveform group after shuffling instances and organizing them 
-for sampling `ntau` waveforms at a time.
-
-## Purpose in Group Training:
-- Prepares each group for efficient random sampling during training
-- Maintains group structure while enabling stochastic waveform selection
-- Essential for coherent information learning within groups
-
-## Arguments:
-- `dvec`: Vector of waveform groups [group1, group2, ..., groupN]  
-- `ntau`: Number of waveforms to sample per group (default: 20)
-
-## Returns:
-- Vector of BatchView objects, one per input group
-- Each BatchView enables efficient sampling of `ntau` waveforms from its group
-
-## Usage in Training Pipeline:
-```julia
-# Prepare data for group-based training
-waveform_groups = [recordings_site1, recordings_site2, recordings_site3]
-batch_views = get_batchviews(waveform_groups, ntau=20)
-training_samples = get_sample(batch_views, batchsize=32)
-```
-"""
-function get_batchviews(dvec, ntau=20)
-    X = map(dvec) do d
-        BatchView(shuffleobs(ObsView(d)), batchsize=ntau, partial=false)
-    end
-    return X
-end
-
-# ╔═╡ 7c39a024-bf46-4024-b0da-a4d6092e864d
-"""
-X is generated using get_batchviews, use this method to sample a datapoint of a given batch-size from X.
-"""
-function get_sample(X, batchsize)
-    stack(map(1:batchsize) do i
-            randobs(randobs(X))
-        end, dims=3)
-end
-
-# ╔═╡ 139490d1-5931-4a18-9f74-c391064a3383
-"""
-**Primary Data Iterator for Group-Based SymVAE Training**
-
-Creates a data iterator where each datapoint consists of `ntau` waveforms randomly sampled 
-from a single group. This is the core function that enables the group-based training paradigm
-essential for coherent information extraction.
-
-## Critical Training Principle:
-During training, it is **essential** to mix instances from different groups in each batch. 
-Small batch sizes (e.g., batchsize=1) prevent proper disentanglement of coherent from nuisance 
-information. **Always use the largest possible batch size** within memory constraints.
-
-## Group-Based Training Logic:
-1. **Within-Group Coherence**: Each datapoint contains `ntau` waveforms from the same group
-2. **Cross-Group Learning**: Multiple datapoints (from different groups) in each batch
-3. **Coherent Extraction**: Model learns shared features across the `ntau` waveforms
-4. **Nuisance Learning**: Model learns instance-specific variations within each group
-
-## Arguments:
-* `dvec`: Vector of waveform groups, where `dvec[i]` contains all instances for group i
-* `nsteps`: Number of training steps per epoch  
-* `ntau`: Number of waveform instances per datapoint (typically 20)
-  - Higher values improve coherent learning but require more GPU memory
-  - Must be ≤ minimum group size across all groups in `dvec`
-* `batchsize`: Number of datapoints per training batch
-  - **Critical**: Must be > 1 for proper disentanglement
-  - Recommended: 32-256 depending on memory constraints
-
-## Returns:
-DataLoader object that yields batches of shape (nt, ntau, batchsize) where:
-- nt: time samples per waveform
-- ntau: waveforms per group sample  
-- batchsize: group samples per batch
-
-## Training Data Flow:
-```
-Group 1: [w₁₁, w₁₂, ..., w₁ₘ] → Sample ntau → Datapoint 1
-Group 2: [w₂₁, w₂₂, ..., w₂ₙ] → Sample ntau → Datapoint 2
-   ⋮           ⋮                     ⋮            ⋮
-Group G: [wG₁, wG₂, ..., wGₖ] → Sample ntau → Datapoint G
-
-Batch = [Datapoint_i, Datapoint_j, ..., Datapoint_batchsize]
-```
-
-## Example Usage:
-```julia
-# Multiple recording sites (groups)
-site_recordings = [site1_waveforms, site2_waveforms, site3_waveforms]
-
-# Create training iterator
-train_data = get_data_iterator(
-    site_recordings,
-    nsteps=1000,     # 1000 steps per epoch
-    batchsize=64,    # 64 group samples per batch
-    ntau=20          # 20 waveforms per group sample
-)
-
-# Each batch contains waveforms from 64 different group samples
-for batch in train_data
-    # batch shape: (time_samples, 20, 64)
-    # 20 waveforms × 64 group samples = 1280 waveforms total
-    loss = compute_symvae_loss(model, batch)
-end
-```
-"""
-function get_data_iterator(dvec; nsteps=1000, batchsize=256, ntau=20)
-    drepeat = Flux.stack([randobs(randobs(dvec), ntau) for i = 1:nsteps*batchsize], dims=3)
-    return DataLoader(drepeat, shuffle=true, batchsize=batchsize, partial=false, buffer=true, parallel=true)
-end
-
-# ╔═╡ 7c59cbf9-38d5-45fb-bf7d-9af8f241ccf6
-"""
-Same as above but also gives class labels
-"""
-function get_data_iterator_with_class_labels(dvec; nsteps=1000, batchsize=256, ntau=20)
-    D = map(1:nsteps*batchsize) do i
-        d = randobs((dvec, 1:length(dvec)))
-        d1 = randobs(first(d), ntau)
-        dlabel = fill(last(d), 1, ntau)
-        (d1, dlabel)
-    end
-    drepeat = Flux.stack(first.(D), dims=3)
-    labelrepeat = Flux.stack(last.(D), dims=3)
-    return DataLoader((drepeat, labelrepeat), shuffle=true, batchsize=batchsize, partial=false, buffer=true, parallel=true)
-end
-
 # ╔═╡ ce690827-fa3f-48bc-bc09-1df5ee15f683
 md"## Architecture"
 
-# ╔═╡ a5302fa2-4f67-4ed6-96ce-dda78a160ffe
-# activation = gelu
-activation = x -> leakyrelu(x, 0.1)
+# ╔═╡ 2df712f5-6969-4ceb-98c5-82415718b740
+begin
+	
+	    # ── FiLMWithMLP: Non-linear condition projection via MLP ────────────────
+	    # Two-layer MLP: cond_dim → hidden_dim (nonlinear) → 2*nchannels (linear)
+	    # Enables richer condition-to-parameter mapping while maintaining near-identity init
+	    struct FiLMWithMLP{T1,T2} <: AbstractParallel
+	        hidden_layer::T1  # Dense(cond_dim → hidden_dim, activation)
+	        output_layer::T2  # Dense(hidden_dim → 2*nchannels, no activation)
+	    end
+	    Flux.@layer FiLMWithMLP
+
+	    function FiLMWithMLP(cond_dim::Int, nchannels::Int; hidden_dim::Int=max(cond_dim, nchannels))
+	        # Hidden layer: cond_dim → hidden_dim with nonlinearity
+	        hidden = Dense(cond_dim, hidden_dim, activation)
+	        
+	        # Output layer: hidden_dim → 2*nchannels, near-identity init
+	        W_out = zeros(Float32, 2 * nchannels, hidden_dim)
+	        b_out = Float32[ones(nchannels); zeros(nchannels)]  # γ-bias=1, β-bias=0
+	        output = Dense(W_out, b_out)
+	        
+	        return FiLMWithMLP(hidden, output)
+	    end
+
+	    function (m::FiLMWithMLP)(x, cond_embedding=nothing)
+	        cond_embedding === nothing && return x
+	        # x has shape: (nt, nc, batch)
+	        nc = size(x, 2)
+	        h = m.hidden_layer(cond_embedding)   # (hidden_dim, batch)
+	        γβ = reshape(m.output_layer(h), nc, 2, :)  # (nc, 2, batch)
+	        γ_raw, β_raw = chunk(γβ, 2, dims=2)
+	        γ = reshape(γ_raw, 1, nc, :)                    # (1, nc, batch)
+	        β = reshape(β_raw, 1, nc, :)                    # (1, nc, batch)
+	        return γ .* x .+ β
+	    end
+end
+
+# ╔═╡ d86a890f-942f-4e3a-8405-709507450903
+begin
+	    # FiLM-conditioned decoder chain:
+	    # 1) concat condition then latent Dense projection, 2) ConvTranspose stages each followed by FiLM.
+	    struct FiLMConvDecoder1DChain{T1,S,F,A} <: AbstractParallel
+	        proj::T1
+	        stages::S
+	        films::F
+	        apply_activation::A
+	        bottleneck_len::Int
+	        bottleneck_channels::Int
+	    end
+	    Flux.@layer FiLMConvDecoder1DChain
+	
+	    function (m::FiLMConvDecoder1DChain)(x, cond_embedding=nothing)
+	        x = add_dim3_reshape(x)
+	        n1, n2, n3 = size(x)
+	        Z = reshape(x, n1, n2 * n3)
+            cond_exp = if cond_embedding === nothing
+                nothing
+            elseif size(cond_embedding, 2) == n2 * n3
+                cond_embedding
+            elseif size(cond_embedding, 2) == n3
+                reshape(Flux.stack(fill(cond_embedding, n2), dims=2), size(cond_embedding, 1), n2 * n3)
+            else
+                throw(DimensionMismatch("Condition batch mismatch in FiLMConvDecoder1DChain: cond has $(size(cond_embedding, 2)) columns, expected $n3 or $(n2 * n3)."))
+            end
+	        @assert cond_exp !== nothing "FiLMConvDecoder1DChain requires conditioning when cond_dim > 0"
+	
+	        H = m.proj(cat(Z, cond_exp, dims=1))
+	        X = reshape(H, m.bottleneck_len, m.bottleneck_channels, :)
+	
+	        for (stage, film, do_activation) in zip(m.stages, m.films, m.apply_activation)
+	            X = stage(X)
+	            X = film(X, cond_exp)
+	            if do_activation
+	                X = activation(X)
+	            end
+	        end
+	
+	        return reshape(X, :, n2, n3)
+	    end
+end
+
+# ╔═╡ 5a047afc-ec40-4541-ad50-0518beba3f2e
+begin
+	    # ── FiLMConv1DChain ───────────────────────────────────────────────────────
+	    # Mirrors Conv1DChain but accepts an optional conditioning vector and applies
+	    # a FiLM layer after every convolutional stage.
+	    struct FiLMConv1DChain{S,F,A,T} <: AbstractParallel
+	        stages::S   # Tuple of per-stage Chain (Conv + optional BN)
+	        films::F    # Tuple of FiLM layers, one per stage
+	        apply_activation::A
+	        tail::T     # Chain: flatten [→ Dense]
+	    end
+	    Flux.@layer FiLMConv1DChain
+	
+	    function (m::FiLMConv1DChain)(x, cond_embedding=nothing)
+	        x  = add_dim3_reshape(x)
+	        n1, n2, n3 = size(x)
+	        X  = reshape(x, n1, 1, n2 * n3)
+	        # Expand cond from (d, batch) → (d, ntau*batch) matching the reshape above
+            cond_exp = if cond_embedding === nothing
+                nothing
+            elseif size(cond_embedding, 2) == n2 * n3
+                cond_embedding
+            elseif size(cond_embedding, 2) == n3
+                reshape(Flux.stack(fill(cond_embedding, n2), dims=2), size(cond_embedding, 1), n2 * n3)
+            else
+                throw(DimensionMismatch("Condition batch mismatch in FiLMConv1DChain: cond has $(size(cond_embedding, 2)) columns, expected $n3 or $(n2 * n3)."))
+            end
+	        for (stage, film, do_activation) in zip(m.stages, m.films, m.apply_activation)
+	            X = stage(X)
+	            X = film(X, cond_exp)
+	            if do_activation
+	                X = activation(X)
+	            end
+	        end
+	        X = m.tail(X)
+	        return reshape(X, :, n2, n3)
+	    end
+end
 
 # ╔═╡ ae96f920-5828-4c5f-b69f-48d8c4fee378
 md"## Dense Networks"
@@ -549,174 +1657,168 @@ md"## Dense Networks"
 # ╔═╡ ea372a8f-212f-425d-947c-b57bba6b5574
 md"## Conv & ViT Networks"
 
-# ╔═╡ 5847ea08-43ca-4c6d-a694-0017d7396f60
-# function get_conv_decoder(nt, pq)
-#     @assert nt % 16 == 0 "Output length nt must be divisible by 16 for DCGAN generator."
-#     latent_length = div(nt, 16)
-# 	nc0 = 256
-#     return Conv1DChain(Chain(
-#         Dense(pq, latent_length * nc0, activation),
-# 		x->reshape(x, latent_length, nc0, :),
-#         ConvTranspose((4,), nc0 => div(nc0, 2); stride=2, pad=1),
-# 		BatchNorm(div(nc0, 2)),
-# 		activation,
-# 		ConvTranspose((4,), div(nc0, 2) => div(nc0, 4); stride=2, pad=1),
-# 		BatchNorm(div(nc0, 4)),
-# 		activation,
-# 		ConvTranspose((4,), div(nc0, 4) => div(nc0, 8); stride=2, pad=1),
-# 		BatchNorm(div(nc0, 8)),
-# 		activation,
-# 		ConvTranspose((4,), div(nc0, 8) => 1; stride=2, pad=1),
-#     ))
-# end
+# ╔═╡ 89599b3f-8c20-46c5-8f5c-ccbb71b26b36
+function get_conv_encoder(nt, p=nothing; kernels=[32, 16, 8, 4], filters=[8, 16, 32, 64], strides=[2, 2, 2, 2], use_bn::Bool=true, cond_dim::Int=0)
+    @assert length(kernels) == length(filters) "kernels and filters must align"
+
+    if cond_dim > 0
+        # ── FiLM path: one stage per conv layer, one FiLM per stage ──────────
+        stages     = Any[]
+        film_layers = Any[]
+        stage_activation = Bool[]
+        nin = 1
+        for (i, k) in enumerate(kernels)
+            nout = filters[i]
+            s    = i <= length(strides) ? strides[i] : 1
+            stage_layers = Any[Conv((k,), nin => nout; pad=SamePad(), stride=s)]
+            if use_bn && i < length(kernels)
+                push!(stage_layers, BatchNorm(nout))
+            end
+            push!(stages,      Chain(stage_layers...))
+            push!(film_layers, FiLMWithMLP(cond_dim, nout))
+            push!(stage_activation, true)
+            nin = nout
+        end
+        trunk      = Chain([l for ch in stages for l in ch.layers]...)
+        outsize    = Flux.outputsize(trunk, (nt, 1); padbatch=true)
+        flat_len   = prod(outsize)
+        tail_layers = Any[Flux.flatten]
+        output_length = flat_len
+        if p !== nothing
+            push!(tail_layers, Dense(flat_len => p, activation))
+            output_length = p
+        end
+        return FiLMConv1DChain(Tuple(stages), Tuple(film_layers), Tuple(stage_activation), Chain(tail_layers...)), output_length
+    else
+        # ── Original path: flat Conv1DChain, condition concatenated at input ──
+        layers = Any[]
+        nin = 1
+        for (i, k) in enumerate(kernels)
+            nout = filters[i]
+            s    = i <= length(strides) ? strides[i] : 1
+            push!(layers, Conv((k,), nin => nout, activation; pad=SamePad(), stride=s))
+            if use_bn && i < length(kernels)
+                push!(layers, BatchNorm(nout))
+            end
+            nin = nout
+        end
+        trunk      = Chain(layers...)
+        conv_outsize = Flux.outputsize(trunk, (nt, 1); padbatch=true)
+        last_layer, output_length = if p === nothing
+            identity, prod(conv_outsize)
+        else
+            Dense(prod(conv_outsize) => p, activation), p
+        end
+        return Conv1DChain(Chain(trunk..., Flux.flatten, last_layer)), output_length
+    end
+end
+
+# ╔═╡ 64430447-c267-4eec-8d38-63ccf91d82c4
+function get_conv_decoder(nt, pq; kernels=[4, 8, 16], filters=[64, 48, 16, 1], upstrides=[2, 2, 1], use_bn=false, cond_dim::Int=0)
+    @assert length(kernels) == length(upstrides) "kernels and upstrides must align"
+    @assert length(filters) == length(kernels) + 1 "filters length should be stages+1 (bottleneck..final)"
+
+    total_stride = prod(upstrides)
+    @assert nt % total_stride == 0 "nt must be divisible by product(upstrides)"
+    bottleneck_len = div(nt, total_stride)
+
+    if cond_dim > 0
+        proj = Dense(pq + cond_dim, bottleneck_len * filters[1], activation)
+
+        stages = Any[]
+        film_layers = Any[]
+        stage_activation = Bool[]
+        nin = filters[1]
+        for i in 1:length(kernels)
+            nout = filters[i + 1]
+            k = kernels[i]
+            s = upstrides[i]
+            stage_layers = if i == length(kernels)
+                Any[ConvTranspose((k,), nin => nout; stride=s, pad=SamePad())]
+            else
+                local tmp = Any[ConvTranspose((k,), nin => nout; stride=s, pad=SamePad())]
+                if use_bn
+                    push!(tmp, BatchNorm(nout))
+                end
+                tmp
+            end
+            push!(stages, Chain(stage_layers...))
+            push!(film_layers, FiLMWithMLP(cond_dim, nout))
+            push!(stage_activation, i != length(kernels))
+            nin = nout
+        end
+
+        return FiLMConvDecoder1DChain(proj, Tuple(stages), Tuple(film_layers), Tuple(stage_activation), bottleneck_len, filters[1])
+    else
+        layers = Any[]
+        # project latent PQ -> (bottleneck_len × filters[1]) feature map
+        push!(layers, Dense(pq, bottleneck_len * filters[1], activation))
+
+        btl = bottleneck_len
+        f1 = filters[1]
+        push!(layers, x -> reshape(x, btl, f1, :))
+
+        nin = filters[1]
+        for i in 1:length(kernels)
+            nout = filters[i+1]
+            k = kernels[i]
+            s = upstrides[i]
+            # ConvTranspose upsamples by stride s
+            if i == length(kernels)
+                # final convtranspose -> single-channel linear output (no activation)
+                push!(layers, ConvTranspose((k,), nin => nout; stride=s, pad=SamePad()))
+            else
+                push!(layers, ConvTranspose((k,), nin => nout, activation; stride=s, pad=SamePad()))
+                if (use_bn)
+                    push!(layers, BatchNorm(nout))
+                end
+            end
+            nin = nout
+        end
+
+        return Conv1DChain(Chain(layers...))
+    end
+end
+
+# ╔═╡ 190c8221-c5c7-48f9-b016-36c27fd4528c
+function get_symae(t::ConvAE, nt, p, q, k, condition_embed_dim=0)
+    P = p * k
+    dec_logvar = xpu(cat(1.0f0, dims=3))
+    if (condition_embed_dim > 0)
+        # ── FiLM conditioning for all encoder/decoder conv blocks and decoder FC ──
+        senc, Pout = xpu(get_conv_encoder(nt, nothing; kernels=t.enc_kernels, filters=t.enc_filters, strides=t.enc_strides, use_bn=t.use_bn, cond_dim=condition_embed_dim))
+        nenc, qout = xpu(get_conv_encoder(nt, nothing; kernels=t.enc_kernels, filters=t.enc_filters, strides=t.enc_strides, use_bn=t.use_bn, cond_dim=condition_embed_dim))
+        senc_λlogits = xpu(Chain(Dense(Pout + condition_embed_dim, div(Pout, 2), activation), Dense(div(Pout, 2), k)))
+        senc_μ        = xpu(Dense(Pout, P))
+        senc_loginvvar = xpu(Dense(Pout, P))
+        nenc_μ   = xpu(Dense(qout, q))
+        nenc_logσ = xpu(Dense(qout, q))
+        dec = xpu(get_conv_decoder(nt, p + q; kernels=t.dec_kernels, filters=t.dec_filters, upstrides=t.dec_upstrides, use_bn=t.use_bn, cond_dim=condition_embed_dim))
+    else
+        # ── Unconditioned ConvAE path ──────────────────────────────────────────
+        senc, Pout = xpu(get_conv_encoder(nt, nothing; kernels=t.enc_kernels, filters=t.enc_filters, strides=t.enc_strides, use_bn=t.use_bn))
+        nenc, qout = xpu(get_conv_encoder(nt, nothing; kernels=t.enc_kernels, filters=t.enc_filters, strides=t.enc_strides, use_bn=t.use_bn))
+        senc_λlogits = xpu(Chain(Dense(Pout, div(Pout, 2), activation), Dense(div(Pout, 2), k)))
+        senc_μ        = xpu(Dense(Pout, P))
+        senc_loginvvar = xpu(Dense(Pout, P))
+        nenc_μ   = xpu(Dense(qout, q))
+        nenc_logσ = xpu(Dense(qout, q))
+        dec = xpu(get_conv_decoder(nt, p + q; kernels=t.dec_kernels, filters=t.dec_filters, upstrides=t.dec_upstrides, use_bn=t.use_bn))
+    end
+    return (; senc, senc_μ, senc_loginvvar, senc_λlogits, nenc, nenc_μ, nenc_logσ, dec, dec_logvar)
+end
 
 # ╔═╡ 747680b0-3469-426c-8b9e-4ab8ca04a6de
 md"## Convolutional SymAE"
 
-# ╔═╡ bf31f347-bc9a-4bf8-a086-99dba2f6fea0
-begin
-    Base.@kwdef struct ConvAE
-        # Encoder parameters
-        enc_kernels::Vector{Int} = [64, 32, 16, 4]
-        enc_filters::Vector{Int} = [8, 16, 32, 64]
-        enc_strides::Vector{Int} = [2, 2, 2, 2]
-        use_bn::Bool = false
-
-        # Decoder parameters
-        dec_kernels::Vector{Int} = [8, 16, 32]
-        dec_filters::Vector{Int} = [64, 48, 16, 1]
-        dec_upstrides::Vector{Int} = [2, 2, 1]
-    end
-end
-
-# ╔═╡ 6db97fc1-8f11-42df-bffe-f86b8619a399
-Base.@kwdef struct SymAE_Para
-    nt::Int
-    p::Int
-    k::Int = 1
-    q::Int
-    network_type = ConvAE()
-    transformer::Symbol = :null
-	transformer_k::Int = 1
-    seed = nothing
-end
-
 # ╔═╡ 62681bba-5486-4957-8433-4258657399b8
 md"## Dense SymAE"
 
-# ╔═╡ 0fbf59a9-74bc-479f-879c-3f72f7c76489
-begin
-    struct DenseAE
-        flat_flag::Bool # linear decrease the width of dense layers, or not?
-        nt_hidden::Int # used in the case of flat flag
-        nlayers::Int # depth
-    end
-    function DenseAE()
-        return DenseAE(false, 256, 4)
-    end
-end
-
 # ╔═╡ facd01fe-b288-437f-96dd-a8a4d9afd8fe
-md"## Dense-Conv SymAE"
-
-# ╔═╡ 06a8d9e2-495c-4a25-8c23-527ba1b8e089
-begin
-    struct DenseConvAE
-        flat_flag::Bool # linear decrease the width of dense layers, or not?
-        nt_hidden::Int # used in the case of flat flag
-        nlayers::Int # depth
-    end
-    function DenseConvAE()
-        return DenseConvAE(false, 256, 4)
-    end
-end
-
-# ╔═╡ e00065be-8bbc-41b2-b62b-3c8ad56a5bd8
-begin
-    struct ViTConvAE
-        config::Symbol
-        ntoutput::Int
-    end
-    function ViTConvAE()
-        return ViTConvAE(:tiny, 128)
-    end
-end
-
-# ╔═╡ a08bfd70-e464-4c5e-b1a3-860fa8cd438a
-md"## ViTConv SymAE"
-
-# ╔═╡ eac9b092-b778-4c32-a0c5-de2eb4aa1b83
-md"## AlexNet"
-
-# ╔═╡ 06134111-d442-4195-9c6a-43443babed8e
-"""
-See
-https://github.com/FluxML/Metalhead.jl/blob/e662a6b307eeb77ed5004bd9a5e0232868ea85ab/src/convnets/alexnet.jl
-"""
-function alexnet1D(; dropout_prob=0.0, inchannels::Integer=1, nclasses::Integer=10)
-    backbone = Chain(Conv((11,), inchannels => 64, activation; stride=4, pad=2),
-        MaxPool((3,); stride=2),
-        Conv((5,), 64 => 192, activation; pad=2),
-        MaxPool((3,); stride=2),
-        Conv((3,), 192 => 384, activation; pad=1),
-        Conv((3,), 384 => 256, activation; pad=1),
-        Conv((3,), 256 => 256, activation; pad=1),
-        MaxPool((3,); stride=2))
-    classifier = Chain(AdaptiveMeanPool((6,)), MLUtils.flatten,
-        Dropout(dropout_prob),
-        Dense(256 * 6, 1024, activation),
-        Dropout(dropout_prob),
-        Dense(1024, 1024, activation),
-        Dense(1024, nclasses))
-    return Chain(backbone, classifier)
-end
-
-# ╔═╡ 81b79f2f-9567-40c3-964e-b5a4ee96a317
-function get_alex_networks(nt, p, q)
-    senc =
-        Chain(
-            x -> reshape(x, size(x, 1), 1, size(x, 2)),
-            alexnet1D(nclasses=p)) |> xpu
-
-    # instance means
-    senc_μ = Chain(Dense(p, p)) |> xpu
-
-    # inverse variances
-    senc_loginvvar = Chain(Dense(p, p)) |> xpu
-
-    nenc =
-        Chain(
-            x -> reshape(x, size(x, 1), 1, size(x, 2)),
-            alexnet1D(nclasses=q)) |> xpu
-
-    # produce logσ for the nuisance encoder
-    nenc_μ = Chain(Dense(q, q)) |> xpu
-    nenc_logσ = Chain(Dense(q, q)) |> xpu
-
-    dec =
-        Chain(
-            Dense(p + q, nt, activation),
-            Dense(nt, nt, activation),
-            x -> reshape(x, nt, 1, size(x, 2)),
-            alexnet1D(nclasses=nt)
-        ) |> xpu
-
-    dec_logvar = xpu(cat(1.0f0, dims=3))
-
-    return (; senc, senc_μ, senc_loginvvar, nenc, nenc_μ, nenc_logσ, dec, dec_logvar)
-end
+md"## Removed Architectures"
 
 # ╔═╡ 66bddc43-ca9f-43cd-85a3-d33b11a6c033
 md"## Coherent Encoder"
-
-# ╔═╡ b65ae9dc-dd50-4007-9894-cadef28e0552
-function accumulate_Gaussians(μ, loginvvar)
-    invvar = exp.(loginvvar)
-    invvarG = sum(invvar, dims=ndims(μ) - 1)
-    cμ = sum(μ .* invvar, dims=ndims(μ) - 1) ./ invvarG
-    logσ = @. -0.5f0 * log(invvarG)
-    return (; μ=cμ, logσ)
-end
 
 # ╔═╡ 8684c192-d1b9-4821-a02e-2c7300af9b3c
 begin
@@ -732,6 +1834,13 @@ begin
         loginvvar = m.loginvvar(X)
         return accumulate_Gaussians(μ, loginvvar)
     end
+	function (m::BroadcastCoherentEnc)(x, cond)
+        X = _maybe_forward(m.chain, x, cond)
+        μ = m.μ(X)
+        loginvvar = m.loginvvar(X)
+        return accumulate_Gaussians(μ, loginvvar)
+    end
+
 end
 
 # ╔═╡ e9efedc1-8287-4676-ba64-a4abc77da18d
@@ -750,26 +1859,69 @@ begin
         λlogits = m.λlogits(X)
         return merge(accumulate_Gaussians(μ, loginvvar), (; λlogits))
     end
+	 function (m::BroadcastCoherentEncCategorical)(x, cond)
+        X = _maybe_forward(m.chain, x, cond)
+        μ = m.μ(X)
+        loginvvar = m.loginvvar(X)
+        # Concatenate condition embedding to encoder output for λlogits
+        # X can be (Pout, ntau, ngroups) [3D] or (Pout, batch) [2D]
+        # cond is (cembed, batch_or_ngroups)
+        Xc = if cond === nothing
+            X
+        elseif ndims(X) == 3 && ndims(cond) == 2
+            # Reshape cond to (cembed, 1, batch) then expand to (cembed, ntau, batch)
+            # matching X = (Pout, ntau, ngroups) where ngroups = size(X,3)
+            ngroups = size(X, 3)
+            ntau = size(X, 2)
+            # cond may already be expanded to ntau*ngroups or just ngroups
+            cond3 = if size(cond, 2) == ngroups
+                reshape(Flux.stack(fill(cond, ntau), dims=2), size(cond, 1), ntau, ngroups)
+            elseif size(cond, 2) == ntau * ngroups
+                reshape(cond, size(cond, 1), ntau, ngroups)
+            else
+                error("cond batch $(size(cond,2)) incompatible with X shape $(size(X))")
+            end
+            cat(X, cond3, dims=1)
+        else
+            cat(X, cond, dims=1)
+        end
+        λlogits = m.λlogits(Xc)
+        return merge(accumulate_Gaussians(μ, loginvvar), (; λlogits))
+    end
+
 end
 
 # ╔═╡ 06286e75-6fdd-41a3-b80b-0f0ffa4ec603
-"""
-Select waveforms in D that belong to the coherent class kopt with high probability.
-"""
-function filter_mode(D::AbstractVector, model, kopt; p=0.9)
-    X = map(D) do d
-        dnew, indices = filter_mode(d, model, kopt; p=p)
-        (; dnew, indices)
-    end
-    return first.(X), last.(X)
+begin
+	"""
+	Select waveforms in D that belong to the coherent class kopt with high probability.
+	"""
+	function filter_mode(D::AbstractVector, model, kopt; p=0.9)
+	    X = map(D) do d
+	        dnew, indices = filter_mode(d, model, kopt; p=p, condition=nothing)
+	        (; dnew, indices)
+	    end
+	    return first.(X), last.(X)
+	end
+	
+	function filter_mode(D::AbstractVector, model, kopt, condition; p=0.9)
+	    cond = Float32.(condition)
+	    @assert ndims(cond) == 2 "Vector conditioning must be a matrix with shape (condition_dim, ngroups)."
+	    @assert size(cond, 2) == length(D) "Condition group count mismatch. Expected $(length(D)), got $(size(cond, 2))."
+	    X = map(enumerate(D)) do (i, d)
+	        dnew, indices = filter_mode(d, model, kopt; p=p, condition=reshape(cond[:, i], :, 1))
+	        (; dnew, indices)
+	    end
+	    return first.(X), last.(X)
+	end
 end
 
 # ╔═╡ 6e3d3148-fc73-4538-b077-2abe1d1721d4
 """
 Select waveforms in D that belong to the coherent class kopt with high probability.
 """
-function filter_mode(d::AbstractMatrix, model, kopt; p=0.9)
-    coherent_code = model(d, Val(:coherent))
+function filter_mode(d::AbstractMatrix, model, kopt; p=0.9, condition=nothing)
+    coherent_code = model(d, Val(:coherent); condition=condition)
     dnew, indices = if (:λlogits in keys(coherent_code))
         λp = cpu(softmax(coherent_code.λlogits, dims=1))
         Ic = findall(x -> x[kopt] >= p, eachcol(dropdims(λp, dims=3)))
@@ -780,44 +1932,56 @@ function filter_mode(d::AbstractMatrix, model, kopt; p=0.9)
     return dnew, indices
 end
 
-# ╔═╡ 8c54f11c-51b2-4500-9923-d3d38aa91e9b
-"""
-Weighted averaging without probabilty thresold
-"""
-function get_cluster_averages(model, D_to_get_prob; D_to_avg=D_to_get_prob)
-    A = cat(map(D_to_get_prob, D_to_avg) do d, da
-            λp = (softmax(model(d, Val(:coherent)).λlogits))
-            cat(map(eachslice(λp, dims=1)) do l
-                    mean(reshape(l, 1, :) .* da, dims=2)
-                end..., dims=2)
-        end..., dims=3)
-    return A
-end
-
 # ╔═╡ 41e788f4-2e25-4968-8bf4-dcd2f38d24e7
 """
 Averaging for samples with probability thresold
 """
-function get_cluster_averages_with_high_probability(model, D_to_get_prob, K; D_to_avg=D_to_get_prob, p=0.9)
-    cat(map(D_to_get_prob, D_to_avg) do d, da
-            cat(map(1:K) do k
-                    _, indices = filter_mode(gpu(collect(d)), model, k, p=p)
-                    mean(cpu(da[:, indices]), dims=2)
-                end..., dims=2)
+function get_cluster_averages_with_high_probability(model, D_to_get_prob, K; D_to_avg=D_to_get_prob, p=0.9, condition=nothing)
+    if condition === nothing
+    return cat(map(D_to_get_prob, D_to_avg) do d, da
+        cat(map(1:K) do k
+            _, indices = filter_mode(gpu(collect(d)), model, k; p=p, condition=nothing)
+            mean(cpu(da[:, indices]), dims=2)
+            end..., dims=2)
         end..., dims=3)
+    end
+
+    cond = Float32.(condition)
+    @assert ndims(cond) == 2 "Vector conditioning must be a matrix with shape (condition_dim, ngroups)."
+    @assert size(cond, 2) == length(D_to_get_prob) "Condition group count mismatch. Expected $(length(D_to_get_prob)), got $(size(cond, 2))."
+    return cat(map(enumerate(zip(D_to_get_prob, D_to_avg))) do (i, (d, da))
+        cond_i = reshape(cond[:, i], :, 1)
+        cat(map(1:K) do k
+            _, indices = filter_mode(gpu(collect(d)), model, k; p=p, condition=cond_i)
+            mean(cpu(da[:, indices]), dims=2)
+        end..., dims=2)
+    end..., dims=3)
 end
 
 # ╔═╡ f1eddb54-7d90-4a14-9943-053248665e78
 """
 Averaging for samples with probability thresold
 """
-function get_cluster_percentages_with_high_probability(model, D_to_get_prob, K; p=0.9)
-    cat(map(D_to_get_prob) do d
-            cat(map(1:K) do k
-                    _, indices = filter_mode(gpu(collect(d)), model, k, p=p)
-                    length(indices) / size(d, 2) * 100.0
-                end..., dims=1)
+function get_cluster_percentages_with_high_probability(model, D_to_get_prob, K; p=0.9, condition=nothing)
+    if condition === nothing
+    return cat(map(D_to_get_prob) do d
+        cat(map(1:K) do k
+            _, indices = filter_mode(gpu(collect(d)), model, k; p=p, condition=nothing)
+            length(indices) / size(d, 2) * 100.0
+            end..., dims=1)
         end..., dims=2)
+    end
+
+    cond = Float32.(condition)
+    @assert ndims(cond) == 2 "Vector conditioning must be a matrix with shape (condition_dim, ngroups)."
+    @assert size(cond, 2) == length(D_to_get_prob) "Condition group count mismatch. Expected $(length(D_to_get_prob)), got $(size(cond, 2))."
+    return cat(map(enumerate(D_to_get_prob)) do (i, d)
+        cond_i = reshape(cond[:, i], :, 1)
+        cat(map(1:K) do k
+            _, indices = filter_mode(gpu(collect(d)), model, k; p=p, condition=cond_i)
+            length(indices) / size(d, 2) * 100.0
+        end..., dims=1)
+    end..., dims=2)
 end
 
 # ╔═╡ 52dc9696-3e0b-42c7-b6cf-7a07ca3cb4dd
@@ -831,29 +1995,24 @@ begin
         logσ::T3
     end
     Flux.@layer BroadcastNuisanceEnc trainable = (chain, μ, logσ)
+    (m::BroadcastNuisanceEnc)(::Nothing) = nothing
     function (m::BroadcastNuisanceEnc)(x)
         X = m.chain(x)
         μ = m.μ(X)
         logσ = m.logσ(X)
         return (; μ, logσ)
     end
+	 function (m::BroadcastNuisanceEnc)(x, cond)
+        X = _maybe_forward(m.chain, x, cond)
+        μ = m.μ(X)
+        logσ = m.logσ(X)
+        return (; μ, logσ)
+    end
+    (m::BroadcastNuisanceEnc)(::Nothing, cond) = nothing
 end
 
 # ╔═╡ eafab001-87a7-423f-917f-1fbd46699186
 md"## Decoder"
-
-# ╔═╡ 237ad98e-75db-41fc-b378-b895facdd8d9
-begin
-    struct BroadcastDec{T1,T2}
-        chain::T1
-        logvar::T2
-    end
-    Flux.@layer BroadcastDec trainable = (chain, logvar)
-    function (m::BroadcastDec)(x)
-        Xμ = m.chain(x)
-        return Xμ, m.logvar
-    end
-end
 
 # ╔═╡ 5ed89ee8-325b-4757-b348-e6c1a3d277ad
 md"## SymVAE Model"
@@ -866,29 +2025,6 @@ Both coherent and nuisance encoders have a common _trunk_
 # ╔═╡ fe87efed-9c40-4869-bdf3-cc60eb5b6436
 md"### Sample Posterior and Decode"
 
-# ╔═╡ 76c4f167-11b5-48a3-b3b3-4fe8fd9646c1
-"""
-Coherent code is distributed across all the wavefield instances
-"""
-function sample_q_decode(cμ, clogσ, nμ, nlogσ, nnoise, cnoise, decoder, temperature)
-    if (cnoise)
-        cx = cμ + xpu(randn(Float32, size(clogσ))) .* exp.(clogσ)
-    else
-        cx = cμ
-    end
-    cx = dropdims(cx, dims=ndims(cμ) - 1)
-    cx = Flux.stack(fill(cx, size(nμ, ndims(nμ) - 1)), dims=ndims(nμ) - 1)
-
-    if (nnoise)
-        nx = nμ + xpu(randn(Float32, size(nlogσ))) .* exp.(nlogσ)
-    else
-        nx = nμ
-    end
-
-    xhat, xhat_logvar = decoder(cat(cx, nx, dims=1))
-    return xhat, xhat_logvar
-end
-
 # ╔═╡ 78e16b27-85c3-4d4a-9238-3ec2a33c9c88
 """
 Coherent code will be divided into K chunks
@@ -896,7 +2032,7 @@ Coherent code will be divided into K chunks
 * τ is the temperature: non-negative scalar As τ→0, the softmax becomes an argmax and the Gumbel-Softmax distribution becomes the categorical distribution. During training, we let τ>0 to allow gradients past the sample, then gradually anneal the temperature τ (but not completely to 0, as the gradients would blow up).
 * if nnoise is false, then the returned λx will be one-hot (used after training)
 """
-function sample_q_decode(cμ, clogσ, λlogits, nμ, nlogσ, nnoise, cnoise, decoder, temperature)
+function sample_q_decode(cμ, clogσ, λlogits, nμ, nlogσ, nnoise, cnoise, decoder, temperature; cond_embedding=nothing)
     if (cnoise)
         cx = cμ + xpu(randn(Float32, size(clogσ))) .* exp.(clogσ)
     else
@@ -926,172 +2062,13 @@ function sample_q_decode(cμ, clogσ, λlogits, nμ, nlogσ, nnoise, cnoise, dec
         c .* l
     end)
 
-    xhat, xhat_logvar = decoder(cat(cx, nx, dims=1))
+    latent = cat(cx, nx, dims=1)
+    xhat, xhat_logvar = decoder(latent, cond_embedding)
     return xhat, xhat_logvar
-end
-
-# ╔═╡ 04f9b328-edc8-4b1e-9a7c-79a215b1cf5f
-begin
-    struct SymVAE{T1,T2,T3}
-        sencb::T1
-        nencb::T2
-        decb::T3
-    end
-    function SymVAE(NN, k=1)
-        sencb = if (k > 1)
-            BroadcastCoherentEncCategorical(NN.senc, NN.senc_μ, NN.senc_loginvvar, NN.senc_λlogits)
-        else
-            BroadcastCoherentEnc(NN.senc, NN.senc_μ, NN.senc_loginvvar)
-        end
-        nencb = BroadcastNuisanceEnc(NN.nenc, NN.nenc_μ, NN.nenc_logσ)
-        decb = BroadcastDec(NN.dec, NN.dec_logvar)
-        model = SymVAE(sencb, nencb, decb)
-    end
-    function (m::SymVAE)(x, nnoise, cnoise, temperature)
-        C = m.sencb(x)
-        N = m.nencb(x)
-        xhat, xhat_logvar = sample_q_decode(C..., N..., nnoise, cnoise, m.decb, temperature)
-        return (;
-            Z=(; N, C),
-            X=(; xhat, xhat_logvar),
-            shifts=[0f0]
-        )
-    end
-    function (m::SymVAE)(xc, xn, nnoise, cnoise, temperature)
-        C = m.sencb(xc)
-        N = m.nencb(xn)
-        xhat, xhat_logvar = sample_q_decode(C..., N..., nnoise, cnoise, m.decb, temperature)
-        return (;
-            Z=(; N, C),
-            X=(; xhat, xhat_logvar),
-            shifts=[0f0]
-        )
-    end
-    # get coherent code for each element of D
-    function (m::SymVAE)(D::Vector{T}, ::Val{:coherent}; args...) where {T}
-        return map(D) do d
-            m.sencb(d)
-        end
-    end
-    # get nuisance code for each element of D
-    function (m::SymVAE)(D::Vector{T}, ::Val{:nuisance}; args...) where {T}
-        return map(D) do d
-            m.nencb(d)
-        end
-    end
-    # get coherent code for d
-    function (m::SymVAE)(d, ::Val{:coherent}; args...)
-        return m.sencb(d)
-    end
-    # get nuisance code for d
-    function (m::SymVAE)(d, ::Val{:nuisance}; args...)
-        return m.nencb(d)
-    end
-    function (m::SymVAE)(d, ::Val{:transform})
-        return d
-    end
-    Flux.@layer SymVAE trainable = (sencb, nencb, decb)
-end
-
-# ╔═╡ 186713a3-c357-427c-9af4-6739de2d33c5
-begin
-    struct SymVAETrunk{T1,T2,T3,T4}
-        tencb::T1
-        sencb::T2
-        nencb::T3
-        decb::T4
-    end
-    function SymVAETrunk(NN, k=1)
-        tencb = NN.tencb
-        sencb = if (k > 1)
-            BroadcastCoherentEncCategorical(NN.senc, NN.senc_μ, NN.senc_loginvvar, NN.senc_λlogits)
-        else
-            BroadcastCoherentEnc(NN.senc, NN.senc_μ, NN.senc_loginvvar)
-        end
-        sencb = BroadcastCoherentEnc(NN.senc, NN.senc_μ, NN.senc_loginvvar)
-        nencb = BroadcastNuisanceEnc(NN.nenc, NN.nenc_μ, NN.nenc_logσ)
-        decb = BroadcastDec(NN.dec, NN.dec_logvar)
-        model = SymVAETrunk(tencb, sencb, nencb, decb)
-    end
-    function (m::SymVAETrunk)(x, nnoise, cnoise, temperature)
-        xt = m.tencb(x)
-        C = m.sencb(xt)
-        N = m.nencb(xt)
-        xhat, xhat_logvar = sample_q_decode(C..., N..., nnoise, cnoise, m.decb, temperature)
-        return (;
-            Z=(; N, C),
-            X=(; xhat, xhat_logvar),
-            shifts=[0f0]
-        )
-    end
-    function (m::SymVAETrunk)(xc, xn, nnoise, cnoise, temperature)
-        C = m.sencb(m.tencb(xc))
-        N = m.nencb(m.tencb(xn))
-        xhat, xhat_logvar = sample_q_decode(C..., N..., nnoise, cnoise, m.decb, temperature)
-        return (;
-            Z=(; N, C),
-            X=(; xhat, xhat_logvar),
-            shifts=[0f0]
-        )
-    end
-    # get coherent code for each element of D
-    function (m::SymVAETrunk)(D::Vector{T}, ::Val{:coherent}; args...) where {T}
-        return map(D) do d
-            m.sencb(m.tencb(d))
-        end
-    end
-    # get nuisance code for each element of D
-    function (m::SymVAETrunk)(D::Vector{T}, ::Val{:nuisance}; args...) where {T}
-        return map(D) do d
-            m.nencb(m.tencb(d))
-        end
-    end
-    # get coherent code for d
-    function (m::SymVAETrunk)(d, ::Val{:coherent}; args...)
-        return m.sencb(m.tencb(d))
-    end
-    # get nuisance code for d
-    function (m::SymVAETrunk)(d, ::Val{:nuisance}; args...)
-        return m.nencb(m.tencb(d))
-    end
-    function (m::SymVAETrunk)(::Any, ::Val{:transform})
-        return nothing
-    end
-    Flux.@layer SymVAETrunk trainable = (tencb, sencb, nencb, decb)
 end
 
 # ╔═╡ efde2571-4e1d-4626-9081-86d513707f5e
 md"## Deterministic SymAE with Dropout"
-
-# ╔═╡ d74b7838-98c4-4356-8a0d-1a2388369788
-# begin
-#     # NOT USED
-#     struct Model_Dropout{T1,T2,T3}
-#         sencb::T1
-#         nencb::T2
-#         decb::T3
-#     end
-#     function (m::Model_Dropout)(x, nnoise, cnoise)
-#         cx, cμ, clogσ = m.sencb(x)
-
-#         nμ, nlogσ = m.nencb(x)
-
-#         if (nnoise)
-#             nx = dropout(nμ, 0.8)
-#         else
-#             nx = nμ
-#         end
-#         cx = dropdims(cx, dims=ndims(cμ) - 1)
-#         cx = Flux.stack(fill(cx, size(nx, ndims(nx) - 1)), dims=ndims(nx) - 1)
-#         xhat, xhat_logvar = m.decb(cat(cx, nx, dims=1))
-
-#         return (;
-#             Z=(; N=(; μ=nμ, logσ=nlogσ), C=(; μ=cμ, logσ=clogσ)),
-#             X=(; xhat, xhat_logvar),
-#         )
-#     end
-#     Flux.@layer Model_Dropout trainable = (sencb, nencb, decb)
-# end
 
 # ╔═╡ 95660df0-088b-49f3-b875-fca19a82d024
 md"""## Spatial Transformer Model
@@ -1106,69 +2083,6 @@ Wrap any SymVAE model with a spatial transformer
 md"""
 ### SpatialTransformer
 """
-
-# ╔═╡ e80dd767-72ef-410b-b7a2-38e0545a5df3
-function get_dense_transformer(nt; nt_out=1, nt_hidden=nt)
-    transformer =
-        Chain(
-            Dense(nt, nt_hidden, activation),
-            Dense(nt_hidden, nt_hidden, activation),
-            Dense(nt_hidden, nt_out, init=zeros),
-        ) |> xpu
-    return transformer
-end
-
-# ╔═╡ 1f139691-e19f-41e5-8113-3cc00e8fe2b8
-#===
-        code for full spatial transformer (commented for now, as only Fourier shifts is used)
-              #         shifts = cat(
-              #             cat(
-              #                 xpu(ones(Float32, 1, 1, 1, n2 * n3)),
-              #                 reshape(shifts1, 1, 1, 1, n2 * n3),
-              #                 dims = 2,
-              #             ),
-              #             xpu(zeros(Float32, 1, 2, 1, n2 * n3)),
-              #             dims = 1,
-              #         )
-
-              #         inv_shifts = cat(
-              #             cat(
-              #                 xpu(ones(Float32, 1, 1, 1, n2 * n3)),
-              #                 -1.0f0 * reshape(shifts1, 1, 1, 1, n2 * n3),
-              #                 dims = 2,
-              #             ),
-              #             xpu(zeros(Float32, 1, 2, 1, n2 * n3)),
-              #             dims = 1,
-              #         )
-              # return (; shifts, inv_shifts, shiftsμ = sμ)
-        ===#
-
-# ╔═╡ 825dda0d-6472-405c-b149-5c4d2202963f
-# """
-# code for spatial transformer (commented for now, as only Fourier shifts is used)
-# shift traces with localization net
-# - input_traces have size (nt, nr)
-# - localization_net returns the time shifts (nr)
-# - uses global variable sampling_grid
-# """
-# function shift_traces_grid_sample(input_traces, shifts, sampling_grid)
-#     S = Flux.stack(fill(sampling_grid, size(shifts, 4)), dims=4)
-#     grids = batched_mul(shifts, S)
-#     input_traces1 =
-#         reshape(input_traces, size(input_traces, 1), 1, 1, prod(size(input_traces)[2:end]))
-#     output_traces = grid_sample(input_traces1, grids; padding_mode=:zeros)
-#     return reshape(output_traces, size(input_traces))
-# end
-
-# ╔═╡ 84d56fa3-50de-48ad-8e07-dfaecc1cfdf3
-function fouriertransform1D(𝐱::AbstractArray)
-    return fft(𝐱, 1) # perform fft along first dimension
-end
-
-# ╔═╡ 86a120ae-8865-4e99-a028-f567f3c1bbad
-function inversefouriertransform1D(𝐱_fft::AbstractArray)
-    return real(ifft(𝐱_fft, 1)) # perform ifft along first dimension
-end
 
 # ╔═╡ 8abc3a6d-d2f5-4527-a828-793364706fa5
 
@@ -1193,18 +2107,24 @@ begin
         sampling_grid::T3
     end
     function (m::Spatial_Transformer)(x, nnoise::Bool, cnoise::Bool, temperature)
+        return m(x, nothing, nnoise, cnoise, temperature)
+    end
+    function (m::Spatial_Transformer)(x, condition, nnoise::Bool, cnoise::Bool, temperature)
         S = m.transformerb(x)
         xt = shift_traces_Fourier(x, S.shifts, m.sampling_grid)
-        output = m.symvae(xt, nnoise, cnoise, temperature)
+        output = m.symvae(xt, condition, nnoise, cnoise, temperature)
         xhat = shift_traces_Fourier(output.X.xhat, S.inv_shifts, m.sampling_grid)
-        return (; X=(; xhat, xshifted=xt, xhat_logvar=output.X.xhat_logvar), Z=output.Z, shifts=S.shifts)
+        return (; X=(; xhat, xshifted=xt, xshifted_reconstructed=output.X.xhat, xhat_logvar=output.X.xhat_logvar), Z=output.Z, shifts=S.shifts)
     end
     function (m::Spatial_Transformer)(xc, xn, nnoise::Bool, cnoise::Bool, temperature)
+        return m(xc, xn, nothing, nnoise, cnoise, temperature)
+    end
+    function (m::Spatial_Transformer)(xc, xn, condition, nnoise::Bool, cnoise::Bool, temperature)
         Sc = m.transformerb(xc)
         Sn = m.transformerb(xn)
         xct = shift_traces_Fourier(xc, Sc.shifts, m.sampling_grid)
         xnt = shift_traces_Fourier(xn, Sn.shifts, m.sampling_grid)
-        output = m.symvae(xct, xnt, nnoise, cnoise, temperature)
+        output = m.symvae(xct, xnt, condition, nnoise, cnoise, temperature)
         xhat = shift_traces_Fourier(output.X.xhat, Sn.inv_shifts, m.sampling_grid)
         return (; X=(; xhat, xshifted=xt, xhat_logvar=output.X.xhat_logvar), Z=output.Z, shifts=S.shifts)
     end
@@ -1269,21 +2189,34 @@ begin
         sampling_grid::T3
     end
     function (m::MultiSpatial_Transformer)(x, nnoise::Bool, cnoise::Bool, temperature)
+        return m(x, nothing, nnoise, cnoise, temperature)
+    end
+    function (m::MultiSpatial_Transformer)(x, condition, nnoise::Bool, cnoise::Bool, temperature)
         S = m.transformerb(x)
-        xt = shift_traces_Fourier(x, S.shifts, m.sampling_grid)
-        output = m.symvae(xt, nnoise, cnoise, temperature)
-        xhat = shift_traces_Fourier(output.X.xhat, S.inv_shifts, m.sampling_grid)
-        return (; X=(; xhat, xshifted=xt, xhat_logvar=output.X.xhat_logvar), Z=output.Z, shifts=S.shifts)
+		Shifts = chunk(S.shifts, size(S.shifts, 1), dims=1)
+		inv_Shifts = chunk(S.inv_shifts, size(S.inv_shifts, 1), dims=1)
+		Xt = map(Shifts) do s
+			shift_traces_Fourier(x, s, m.sampling_grid)
+		end
+        xt = cat(Xt..., dims=3)
+        output = m.symvae(xt, condition, nnoise, cnoise, temperature)
+
+		Xhat = chunk(output.X.xhat, size(S.shifts, 1), dims=3)
+		Xhat_inv_shifted = map(Xhat, inv_Shifts) do x, s
+			shift_traces_Fourier(x, s, m.sampling_grid)
+		end
+        xhat = mean(Xhat_inv_shifted)
+        return (; X=(; xhat, xshifted=xt, xdecomposed=Xhat, xhat_logvar=output.X.xhat_logvar), Z=output.Z, shifts=S.shifts)
     end
-    function (m::MultiSpatial_Transformer)(xc, xn, nnoise::Bool, cnoise::Bool, temperature)
-        Sc = m.transformerb(xc)
-        Sn = m.transformerb(xn)
-        xct = shift_traces_Fourier(xc, Sc.shifts, m.sampling_grid)
-        xnt = shift_traces_Fourier(xn, Sn.shifts, m.sampling_grid)
-        output = m.symvae(xct, xnt, nnoise, cnoise, temperature)
-        xhat = shift_traces_Fourier(output.X.xhat, Sn.inv_shifts, m.sampling_grid)
-        return (; X=(; xhat, xshifted=xt, xhat_logvar=output.X.xhat_logvar), Z=output.Z, shifts=S.shifts)
-    end
+    # function (m::MultiSpatial_Transformer)(xc, xn, nnoise::Bool, cnoise::Bool, temperature)
+    #     Sc = m.transformerb(xc)
+    #     Sn = m.transformerb(xn)
+    #     xct = shift_traces_Fourier(xc, Sc.shifts, m.sampling_grid)
+    #     xnt = shift_traces_Fourier(xn, Sn.shifts, m.sampling_grid)
+    #     output = m.symvae(xct, xnt, nnoise, cnoise, temperature)
+    #     xhat = shift_traces_Fourier(output.X.xhat, Sn.inv_shifts, m.sampling_grid)
+    #     return (; X=(; xhat, xshifted=xt, xhat_logvar=output.X.xhat_logvar), Z=output.Z, shifts=S.shifts)
+    # end
     # estimate either coherent or nuisance code after applying transformer, for each element of D
     function (m::MultiSpatial_Transformer)(D::Vector{T}, code_type::Union{Val{:coherent},Val{:nuisance}}; apply_transformer=true) where {T}
         Dshifted = if (apply_transformer)
@@ -1304,23 +2237,41 @@ begin
     end
     function (m::MultiSpatial_Transformer)(D::Vector{T}, ::Val{:transform}) where {T}
         return map(D) do d
-            S = m.transformerb(d)
-            d = shift_traces_Fourier(d, S.shifts, m.sampling_grid)
+			S = m.transformerb(d)
+			Shifts = chunk(S.shifts, size(S.shifts, 1), dims=1)
+			Xt = map(Shifts) do s
+			shift_traces_Fourier(d, s, m.sampling_grid)
+			end
+        	dt = cat(Xt..., dims=3)
         end
     end
     function (m::MultiSpatial_Transformer)(d, ::Val{:transform})
         S = m.transformerb(d)
-        return shift_traces_Fourier(d, S.shifts, m.sampling_grid)
+			Shifts = chunk(S.shifts, size(S.shifts, 1), dims=1)
+			Xt = map(Shifts) do s
+			shift_traces_Fourier(d, s, m.sampling_grid)
+			end
+        dt = cat(Xt..., dims=3)
+        return dt
     end
     function (m::MultiSpatial_Transformer)(D::Vector{T}, ::Val{:inv_transform}) where {T}
-        return map(D) do d
-            S = m.transformerb(d)
-            d = shift_traces_Fourier(d, S.inv_shifts, m.sampling_grid)
+       return map(D) do d
+			S = m.transformerb(d)
+			Shifts = chunk(S.inv_shifts, size(S.shifts, 1), dims=1)
+			Xt = map(Shifts) do s
+			shift_traces_Fourier(d, s, m.sampling_grid)
+			end
+        	dt = cat(Xt..., dims=3)
         end
     end
     function (m::MultiSpatial_Transformer)(d, ::Val{:inv_transform})
-        S = m.transformerb(d)
-        return shift_traces_Fourier(d, S.inv_shifts, m.sampling_grid)
+       S = m.transformerb(d)
+			Shifts = chunk(S.inv_shifts, size(S.shifts, 1), dims=1)
+			Xt = map(Shifts) do s
+			shift_traces_Fourier(d, s, m.sampling_grid)
+			end
+        dt = cat(Xt..., dims=3)
+        return dt
     end
     # sampling grid is not trainable
     Flux.@layer MultiSpatial_Transformer trainable = (symvae, transformerb)
@@ -1337,362 +2288,40 @@ end
 # ╔═╡ f4238f8e-3596-4c98-a64e-477c3aa2b054
 md"## Nuisance Optimization Model"
 
-# ╔═╡ a48d23b6-86d6-4232-a1b9-300e65b264ff
-begin
-    """
-    Select only μ and logσ from coherent codes
-    Depending on kopt, select respective chunk of the coherent code
-    """
-    function batch_coherent_codes(vec::Vector{<:NamedTuple})
-        merged = (; μ=(getfield.(vec, :μ)..., dims=3), logσ=cat(getfield.(vec, :logσ)..., dims=3))
-        return merged
-    end
-    function batch_coherent_codes(v::NamedTuple)
-        return (; μ=getfield(v, :μ), logσ=getfield(v, :logσ))
-    end
-    function apply_λlogits_cond(vec::Vector{<:NamedTuple}, λlogits_cond)
-        merged = batch_coherent_codes(vec)
-        # select kopt chunk
-        return map(merged) do m
-            m_chunks = chunk(m, size(λlogits_cond, 1), dims=1)
-            λ_chunks = chunk(λlogits_cond, size(λlogits_cond, 1), dims=1)
-            cx = sum(map(m_chunks, λ_chunks) do c, l
-                c .* l
-            end)
-            return cx
-        end
-    end
-    function apply_λlogits_cond(C::NamedTuple, λlogits_cond)
-        merged = (; μ=C.μ, logσ=C.logσ)
-        # select kopt chunk
-        return map(merged) do m
-            m_chunks = chunk(m, size(λlogits_cond, 1), dims=1)
-            λ_chunks = chunk(λlogits_cond, size(λlogits_cond, 1), dims=1)
-            cx = sum(map(m_chunks, λ_chunks) do c, l
-                c .* l
-            end)
-            return cx
-        end
-    end
-end
-
-# ╔═╡ a85b6958-d894-45cc-86c6-933fba757e1c
-# function loss_kl_Qc_accumulated(nuisance_codes, optimal_nuisance_model, C, alpha)
-#     copyto!(optimal_nuisance_model.nuisance_codes, nuisance_codes)
-#     return loss_kl_Qc_accumulated(optimal_nuisance_model, C, alpha)
-# end
-
-# ╔═╡ 74c8e79f-b1c8-484b-86bf-65c2a2831b53
-# """
-# """
-# function optimize_nuisance_code_black_box_optim(d, para, model; MaxTime=10.0)
-#     coherent_codes = model(d, Val(:coherent))
-#     optimal_nuisance_model = get_Model_Optimal_Nuisance(para, model, init=randobs(d))
-#     loss(x) = Float64(
-#         loss_kl_Qc_accumulated(
-#             x,
-#             optimal_nuisance_model,
-#             coherent_codes
-#         )[1],
-#     )
-#     result = bboptimize(
-#         loss;
-#         NumDimensions=para.q,
-#         SearchRange=(-10.0, 10.0),
-#         MaxTime=MaxTime,
-#         MaxSteps=-1,
-#         TraceMode=:silent,
-#         #inDeltaFitnessTolerance = 0.01
-#     )
-#     return optimal_nuisance_model(
-#         best_candidate(result),
-#         coherent_codes.cμ,
-#         coherent_codes.clogσ,
-#     )[1],
-#     result
-# end
-
-# ╔═╡ 073c77d1-7598-45d3-858d-9222f2e4c590
-# """
-# """
-# function optimize_nuisance_code_metaheuristics(d, para, model; MaxTime=10)
-#     coherent_codes = model([d], Val())[1]
-
-#     _, _, ideal_seismogram_ids = kl_Qc_accumulated(para, model, [d], 255, 1)
-#     ideal_seismograms = mapreduce(hcat, ideal_seismogram_ids) do ideal_seismogram_id
-#         d[:, ideal_seismogram_id]
-#     end
-
-#     optimal_nuisance_model =
-#         get_Model_Optimal_Nuisance(para, model, init=ideal_seismograms)
-#     function loss(X)
-#         if (ndims(X) == 2)
-#             x = permutedims(X, (2, 1))
-#         elseif (ndims(X) == 3)
-#             x = permutedims(X, (2, 1, 3))
-#         else
-#             x = X
-#         end
-#         L = loss_kl_Qc_accumulated(
-#             x,
-#             optimal_nuisance_model,
-#             coherent_codes
-#         )[2]
-#         if (ndims(X) == 1)
-#             return Float64(L[1])
-#         else
-#             return Float64.(L[1:size(X, 1)])
-#         end
-#     end
-#     options = Options(
-#         f_calls_limit=0,
-#         time_limit=MaxTime,
-#         parallel_evaluation=true,
-#         iterations=1000,
-#     )
-#     bounds = boxconstraints(lb=-Inf * ones(para.q), ub=Inf * ones(para.q))
-#     algo = GA(
-#         options=options,
-#         mutation=Metaheuristics.PolynomialMutation(; bounds),
-#         crossover=SBX(; bounds),
-#         environmental_selection=GenerationalReplacement(),
-#     )
-#     # algo = ECA(options = options)
-
-#     initial_nuisances =
-#         Float64.(
-#             cpu(
-#                 dropdims(
-#                     permutedims(optimal_nuisance_model.nuisance_codes, (2, 1, 3)),
-#                     dims=3,
-#                 ),
-#             )
-#         )
-#     set_user_solutions!(algo, initial_nuisances[1:100, :], loss)
-#     result = optimize(loss, bounds, algo)
-
-#     return optimal_nuisance_model(
-#         minimizer(result),
-#         coherent_codes.cμ,
-#         coherent_codes.clogσ,
-#     )[1],
-#     result
-# end
-
 # ╔═╡ ab3f0de4-3e7e-4d5f-aa1a-25fe24a52b38
 md"## Losses"
+
+# ╔═╡ a636c206-8ded-4f13-b010-9a33dd99f80e
+function _split_batch_condition(batch)
+    if !(batch isa Tuple)
+        return batch, nothing
+    end
+    x = batch[1]
+    if length(batch) == 2
+        second = batch[2]
+        # Distinguish (x, condition) from (x, class_labels) safely.
+        if second === nothing
+            return x, nothing
+        elseif (second isa AbstractArray) && (ndims(second) <= 2)
+            return x, second
+        else
+            return x, nothing
+        end
+    elseif length(batch) >= 3
+        return x, batch[3]
+    end
+    return x, nothing
+end
 
 # ╔═╡ 6d34151a-b539-4eda-995a-b7f873719a4c
 """
 Reconstruction Loss (like deterministic AE)
 """
 function loss_mse(model, x)
-    result = model(x, false, false, 0f0)
-    return Flux.mse(result.X.xhat, x)
+    xb, condition = _split_batch_condition(x)
+    result = model(xb, condition, false, false, 0f0)
+    return Flux.mse(result.X.xhat, xb)
 end
-
-# ╔═╡ 4ec8578c-a202-4a3d-9425-60bf623a3a02
-"""
-    # x: point where log-pdf is evaluated (vector)
-    # mean: mean vector of the Gaussian
-    # log_std: log of standard deviations (vector)
-"""
-function neg_logpdf_gaussian(x, mean, log_std)
-    log_det = sum(log_std, dims=1)
-    squared_term = sum(((x .- mean) ./ exp.(log_std)) .^ 2, dims=1)
-
-    neg_log_pdf = @. log_det + 0.5 * squared_term
-    return neg_log_pdf
-end
-
-# ╔═╡ 41b5d143-6a0f-4f4c-8e62-8483d9e0d5f6
-"""
-KL divergence between two categorical distributions
-# Arguments
-- `logits`: logits unnormalized
-- `prior`: prior 
-"""
-function kl_divergence_categorial_distributions(logits, prior)
-    λ = Flux.softmax(logits; dims=1)
-    λ = clamp.(λ, 0.0001f0, 1.0f0) # avoid log(0) in posterior
-    prior = clamp.(prior, 0.0001f0, 1.0f0)  # avoid log(0) in posterior
-    kl = @. (λ * (log(λ) - log(prior)))
-    return sum(kl)
-end
-
-# ╔═╡ e57556e8-b287-4bc5-9ea1-4f68948eccf2
-"""
-    kl_divergence_multivariate_gaussians(mean1, log_std1, mean2, log_std2)
-
-Compute the Kullback-Leibler (KL) divergence between two multivariate Gaussian distributions.
-
-# Arguments
-- `mean1`: The mean of the first Gaussian distribution.
-- `log_std1`: The log standard deviation of the first Gaussian distribution.
-- `mean2`: The mean of the second Gaussian distribution.
-- `log_std2`: The log standard deviation of the second Gaussian distribution.
-
-# Returns
-The KL divergence between the two Gaussian distributions.
-"""
-function kl_divergence_multivariate_gaussians(mean1, log_std1, mean2, log_std2)
-    kl1 = @. (exp(2.0f0 * log_std1) / exp(2.0f0 * log_std2) + abs2(mean1 - mean2) / exp(2.0f0 * log_std2) - 1.0f0 - 2.0f0 * log_std1 + 2.0f0 * log_std2)
-    kl = 0.5f0 .* sum(kl1, dims=1)
-    return kl
-end
-
-# ╔═╡ e46630eb-5e29-4c5e-b792-0f7ca0af0ff0
-"""
-    hellinger_distance_multivariate_gaussians(mean1, log_sigma1, mean2, log_sigma2)
-The Hellinger distance between two multivariate Gaussian distributions
-"""
-function hellinger_distance_multivariate_gaussians(meanX, logσ1, meanY, logσ2)
-    σ1 = exp.(2.0f0 * logσ1)
-    σ2 = exp.(2.0f0 * logσ2)
-
-    detX = prod(σ1)
-    detY = prod(σ2)
-    covXY = (σ1 .+ σ2) / 2.0f0
-    detXY = prod(covXY)
-
-    # Compute the exponent term
-    diff = meanX .- meanY
-    covXY_inverted = 1 ./ covXY  # Since covXY is diagonal, inversion is element-wise
-    exponent_term = exp(-0.125 * sum((diff .^ 2) .* covXY_inverted))
-
-    # Compute the Hellinger distance
-    dist = 1.0 - (fourthroot(detX) * fourthroot(detY) / sqrt(detXY)) * exponent_term
-
-    return dist
-end
-
-# ╔═╡ 361ead1b-3fe3-4ae2-b018-2c6904d0f889
-"""
-    kl_divergence_multivariate_gaussian(mean1, log_std1)
-
-Compute the Kullback-Leibler (KL) divergence between two multivariate Gaussian distributions.
-
-# Arguments
-- `mean1`: The mean of the first Gaussian distribution.
-- `log_std1`: The log standard deviation of the first Gaussian distribution.
-
-# Returns
-The KL divergence between the two Gaussian distributions.
-"""
-function kl_divergence_multivariate_gaussian(mean1, log_std1)
-    return 0.5f0 * sum(@. (exp(2.0f0 * log_std1) + abs2(mean1) - 1.0f0 - 2.0f0 * log_std1))
-end
-
-# ╔═╡ d966211f-012e-45f2-b9ae-abf599666edf
-begin
-    function get_kl(μ, logσ, beta)
-        return beta * kl_divergence_multivariate_gaussian(μ, logσ)
-    end
-    function get_kl(μ, logσ, beta, betadummy)
-        return get_kl(μ, logσ, beta)
-    end
-end
-
-# ╔═╡ 6556c7c7-9934-49be-8f8a-423a0d16e57e
-function kl_divergence_multivariate_gaussians(mean1, log_std1, mean2)
-    # std2 = 1.0  →  log_std2 = 0.0
-    # exp(2*log_std2) = 1
-
-    # σ1^2
-    var1 = @. exp(2f0 * log_std1)
-
-    # (μ1 − μ2)^2
-    diff2 = @. abs2(mean1 - mean2)
-
-    # KL per dimension
-    kl1 = @. var1 + diff2 - 1f0 - 2f0*log_std1
-
-    # Sum over dimensions, keep batch dimension intact
-    return 0.5f0 .* sum(kl1)
-end
-
-# ╔═╡ afb6c675-0ef8-445c-a204-795e300c8589
-"""
-Return KL divergence between accumulated coherent information and coherent information in the instances generated using optimal nuisance model
-"""
-function loss_kl_Qc_accumulated(optimal_nuisance_model, coherent_codes::Vector{T}, alpha; p=1, Bref=1f0, Cref=1f0) where {T}
-
-    virtualdata, cμ_all, clogσ_all, = optimal_nuisance_model(coherent_codes)
-    coherent_codes_batched = apply_λlogits_cond(batch_coherent_codes(coherent_codes), optimal_nuisance_model.λlogits_cond)
-    C_all_logits = apply_λlogits_cond((; μ=cμ_all, logσ=clogσ_all), optimal_nuisance_model.λlogits_cond)
-
-    cμ_in = coherent_codes_batched.μ
-    cμ_in = dropdims(cμ_in, dims=ndims(cμ_in) - 1)
-    cμ_in = Flux.stack(fill(cμ_in, size(cμ_all, ndims(cμ_all) - 1)), dims=ndims(cμ_all) - 1)
-
-    clogσ_in = coherent_codes_batched.logσ
-    clogσ_in = dropdims(clogσ_in, dims=ndims(clogσ_in) - 1)
-    clogσ_in = Flux.stack(fill(clogσ_in, size(clogσ_all, ndims(clogσ_all) - 1)), dims=ndims(clogσ_all) - 1)
-
-    B = kl_divergence_multivariate_gaussians(cμ_in, clogσ_in, C_all_logits.μ, C_all_logits.logσ)
-    # B = neg_logpdf_gaussian(cμ_in, cμ_all, clogσ_all)
-    # virtualdata1 = normalise(virtualdata, dims=1)
-    virtualdata1 = virtualdata
-    return (; loss=sum(B) / Bref + alpha * norm(virtualdata1, p) / Cref, kl=B, L=norm(virtualdata1, p), virtualdata)
-end
-
-# ╔═╡ 6e7c70c8-cffe-4b30-85b4-5942fbb60da8
-"""
-    js_divergence_multivariate_gaussians(mean1, log_std1, mean2, log_std2)
-
-Compute the Jensen-Shannon (JS) divergence between two multivariate Gaussian distributions.
-
-# Arguments
-- `mean1`: The mean of the first Gaussian distribution.
-- `log_std1`: The log standard deviation of the first Gaussian distribution.
-- `mean2`: The mean of the second Gaussian distribution.
-- `log_std2`: The log standard deviation of the second Gaussian distribution.
-
-# Returns
-The JS divergence between the two Gaussian distributions.
-"""
-function js_divergence_multivariate_gaussians(mean1, log_std1, mean2, log_std2)
-    js =
-        0.5 * (
-            kl_divergence_multivariate_gaussians(mean1, log_std1, mean2, log_std2) +
-            kl_divergence_multivariate_gaussians(mean2, log_std2, mean1, log_std1)
-        )
-    return js
-end
-
-# ╔═╡ 4e527961-5734-4294-9f3c-e2aa8314eef6
-"""
-Compute the Bhattacharyya distance between two Gaussian distributions.
-
-Parameters:
-- mean1: The mean of the first Gaussian distribution.
-- log_std1: The log standard deviation of the first Gaussian distribution.
-- mean2: The mean of the second Gaussian distribution.
-- log_std2: The log standard deviation of the second Gaussian distribution.
-
-Returns:
-- bd: The Bhattacharyya distance between the two Gaussian distributions.
-"""
-function bhattacharyya_distance(cμ1, clogσ1, cμ2, clogσ2)
-    # Bhattacharya Distance
-    cvar1 = @. exp(2.0f0 * clogσ1)
-    cvar2 = @. exp(2.0f0 * clogσ2)
-    Dvar = 0.5f0 * (sum(@. 2.0f0 * clogσ1) + sum(@. 2.0f0 * clogσ2))
-    cvarmean = @. 0.5f0 * (cvar1 + cvar2)
-    Nvar = sum(@. log.(cvarmean))
-    return sum(@. abs2(cμ1 - cμ2) / cvarmean) / 8.0f0 + 0.5f0 * (Nvar - Dvar)
-
-    # # Convert log standard deviations to standard deviations
-    # std1 = exp.(log_std1)
-    # std2 = exp.(log_std2)
-
-    # # Compute the Bhattacharyya distance
-    # bd = 0.5 * sum(@. ((mean1 - mean2)^2 / (std1^2 + std2^2) + log((std1 * std2) / sqrt(std1^2 + std2^2))))
-    # return bd
-end
-
-# ╔═╡ 234d7462-e4bd-4a7c-9ed4-7160a6a9ffb9
-
 
 # ╔═╡ 26aafe3d-e783-4591-959d-910b9c050301
 begin
@@ -1789,60 +2418,14 @@ function update_nuisance_codes(
     return (; xsave, xnew, loss_history)
 end
 
-# ╔═╡ c5d5be4d-882e-4c34-ae8f-1a40aa4cf215
-begin
-    Xv = xpu([randn(100, 10), randn(100, 10)])
-    ref = xpu(randn(100))
-    ref2 = xpu(randn(100, 2))
-    ref3 = xpu(randn(100, 10, 2))
-
-end
-
 # ╔═╡ 0f292b15-bc79-4424-b5ae-fded09eb16f0
+#=╠═╡
 begin
     @time average_column_correlation(Xv[1], ref)
     @time average_column_correlation(Xv, ref2)
     @time average_column_correlation(xpu(Xv), xpu(ref3))
 end
-
-# ╔═╡ b9b5f42d-4ec1-43b5-9484-d3ec47dea61a
-"""
-    average_leave_one_out_correlation(X::AbstractMatrix)
-
-Compute the average Pearson correlation between each column of `X` and the mean of the remaining columns.
-
-# Arguments
-- `X`: A matrix of shape (m, n), where columns represent features or signals.
-
-# Returns
-- The average Pearson correlation coefficient.
-"""
-function average_leave_one_out_correlation(X::AbstractMatrix)
-    n = size(X, 2)
-    colsum = sum(X, dims=2)
-    total_corr = 0.0
-
-    for (i, xi) in enumerate(eachcol(X))
-        mean_rest = (colsum .- xi) ./ (n - 1)
-
-        a = vec(xi)
-        b = vec(mean_rest)
-
-        ma, mb = mean(a), mean(b)
-        numerator = sum((a .- ma) .* (b .- mb))
-        denominator = sqrt(sum((a .- ma) .^ 2) * sum((b .- mb) .^ 2))
-        total_corr += numerator / denominator
-    end
-
-    return total_corr / n
-end
-
-# ╔═╡ ae75eee7-ed34-4a2a-8aa3-08a06f504d36
-function average_leave_one_out_correlation(X::Vector)
-    return map(X) do x
-        average_leave_one_out_correlation(x)
-    end
-end
+  ╠═╡ =#
 
 # ╔═╡ 7931ce6a-a062-4c7f-bb04-82b822e04eab
 md"""
@@ -1858,506 +2441,232 @@ md"""
 - initial_learning_rate:
 """
 
-# ╔═╡ eafe181e-19e9-409e-ad1d-ce859cf0e672
-Base.@kwdef struct Training_Para
-    ntau::Int = 20
-    beta = (; N=[1f0], C=[1f0, 1f0])
-    gamma::Float32 = 1f2
-    temperature::Float32 = 1f0
-    batchsize::Int = 32
-    nsteps::Int = 100
-    nprint::Int = 1
-    nepoch::Int = 10
-    initial_learning_rate::Float64 = 0.001
-end
-
 # ╔═╡ 61fbbf84-1b2b-4de9-8763-800f76c851e0
 md"## Redatuming"
-
-# ╔═╡ 0f0fe0e8-a239-474b-b9af-54507cb968aa
-"""
-use virtual data where source is used from x and nuisance from xaug
-"""
-function generate_virtual_data(x, xaug, nnoise, cnoise, model)
-    output = model(x, xaug, nnoise, cnoise)
-    return output.X.xhat
-end
-
-# ╔═╡ 7531c2eb-5505-4ad2-9f79-111bed3bef74
-"""
-    redatum(d1, d2, model, nnoise=false, cnoise=false)
-
-Redatum two input data `d1` and `d2` using the given `model`. The `model` should be a function that takes input data and returns the redatumed output.
-
-## Arguments
-- `d1`: The first input data.
-- `d2`: The second input data.
-- `model`: symae model
-- `nnoise`: A boolean indicating whether to sample Q(n|x) or use its mean
-- `cnoise`: A boolean indicating whether to sample Q(c|x) or use its mean
-
-## Returns
-A named tuple containing the redatumed data `d1hat`, `d2hat`, `d12hat`, and `d21hat`.
-"""
-function redatum(d1, d2, model, nnoise=false, cnoise=false)
-    d1hat = model(d1, nnoise, cnoise).X.xhat
-    d2hat = model(d2, nnoise, cnoise).X.xhat
-    d12hat = model(d1, d2, nnoise, cnoise).X.xhat
-    d21hat = model(d2, d1, nnoise, cnoise).X.xhat
-    return map(cpu, (; d1=d1, d2=d2, d1hat, d2hat, d12hat, d21hat))
-end
 
 # ╔═╡ 5d25db74-dcc2-49d6-b62a-39f612089e9f
 md"## Plots"
 
-# ╔═╡ c9f4b3e6-6691-4e7f-86c7-dcacdde924a5
-"""
-Plot training and test loss history with publication-quality styling.
-
-Arguments:
-- loss_history: struct containing loss arrays
-- title: main plot title (default: "")
-
-Returns: PlutoPlotly plot with MSE and other losses in subplots
-"""
-function plot_loss_history(loss_history; title="")
-    # Publication-quality color palette
-    colors_mse = ["#E74C3C", "#3498DB"]
-    colors_other = ["#2ECC71", "#F39C12", "#9B59B6", "#1ABC9C", "#E67E22", "#95A5A6"]
-
-    # MSE traces
-    trace_mse = [
-        PlutoPlotly.scatter(
-            y=cpu(getfield(loss_history, label)),
-            mode="lines",
-            name=string(label),
-            line=attr(color=colors_mse[i], width=2.5)
-        ) for (i, label) in enumerate([:train_mse, :test_mse])
-    ]
-
-    # Other loss traces
-    other_labels = [:train_neg_llh, :test_neg_llh, :train_kl, :test_kl, :train_neg_elbo, :test_neg_elbo]
-    trace_other = [
-        PlutoPlotly.scatter(
-            y=cpu(getfield(loss_history, label)),
-            mode="lines",
-            name=string(label),
-            line=attr(color=colors_other[i], width=2.5)
-        ) for (i, label) in enumerate(other_labels)
-    ]
-
-    # Common layout settings
-    common_layout = attr(
-        width=600,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        showgrid=true,
-        gridcolor="rgba(128,128,128,0.2)",
-        gridwidth=1,
-        showline=true,
-        linewidth=1.5,
-        linecolor="black",
-        mirror=true
-    )
-
-    # MSE subplot layout (log scale)
-    layout_mse = Layout(
-        title=attr(text="MSE Loss", font=attr(size=23, family="Computer Modern, Latin Modern Math, serif")),
-        height=600,
-        width=400,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        legend=attr(
-            x=0.98, y=0.98,
-            xanchor="right", yanchor="top",
-            font=attr(size=18, family="Computer Modern, Latin Modern Math, serif"),
-            bgcolor="rgba(255,255,255,0.8)",
-            bordercolor="rgba(0,0,0,0.2)",
-            borderwidth=1
-        ),
-        xaxis=merge(common_layout, attr(
-            title=attr(text="Epoch", font=attr(size=20, family="Computer Modern, Latin Modern Math, serif")),
-            tickfont=attr(size=18, family="Computer Modern, Latin Modern Math, serif")
-        )),
-        yaxis=merge(common_layout, attr(
-            title=attr(text="MSE", font=attr(size=20, family="Computer Modern, Latin Modern Math, serif")),
-            type="log",
-            tickfont=attr(size=18, family="Computer Modern, Latin Modern Math, serif")
-        )),
-        margin=attr(l=80, r=40, t=60, b=70)
-    )
-
-    # Other losses subplot layout (linear scale)
-    layout_other = Layout(
-        title=attr(text="Other Losses", font=attr(size=23, family="Computer Modern, Latin Modern Math, serif")),
-        height=600,
-        width=400,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        legend=attr(
-            x=0.98, y=0.98,
-            xanchor="right", yanchor="top",
-            font=attr(size=18, family="Computer Modern, Latin Modern Math, serif"),
-            bgcolor="rgba(255,255,255,0.8)",
-            bordercolor="rgba(0,0,0,0.2)",
-            borderwidth=1
-        ),
-        xaxis=merge(common_layout, attr(
-            title=attr(text="Epoch", font=attr(size=20, family="Computer Modern, Latin Modern Math, serif")),
-            tickfont=attr(size=18, family="Computer Modern, Latin Modern Math, serif")
-        )),
-        yaxis=merge(common_layout, attr(
-            title=attr(text="Loss", font=attr(size=20, family="Computer Modern, Latin Modern Math, serif")),
-            tickfont=attr(size=18, family="Computer Modern, Latin Modern Math, serif")
-        )),
-        margin=attr(l=80, r=40, t=60, b=70)
-    )
-
-    # Create subplots side by side
-    p1 = PlutoPlotly.plot(trace_mse, layout_mse)
-    p2 = PlutoPlotly.plot(trace_other, layout_other)
-
-    # Combine plots
-    p = [p1; p2]
-
-    # Add overall title if provided
-    if !isempty(title)
-        relayout!(p, title_text=title,
-            title_font=attr(size=27, family="Computer Modern, Latin Modern Math, serif"))
-    end
-
-    return p
-end
-
 # ╔═╡ 0a2fb24a-3c7a-46ed-ad54-d35fb72f8031
 md"## Misc"
 
-# ╔═╡ 1a8619c6-4c19-4f55-a968-d18a4f1016e7
-function taper(x)
-    w = (cat(tukey(size(x, 1), 0.1), dims=ndims(x)))
-    return w .* x
-end
-
-# ╔═╡ cb409e47-7ece-4456-a15b-773631f372f2
-"""
-Instead of cat(x, dims=3)
-"""
-function add_dim3_reshape(x)
-	nd = ndims(x)
-    if nd == 3
-        return x
-    elseif nd == 2
-        return reshape(x, size(x,1), size(x,2), 1)
-    elseif nd == 1
-        return reshape(x, size(x,1), 1, 1)
-    else
-        error("Input has more than 3 dimensions")
-    end
-end
-
-# ╔═╡ 96aebf7d-2112-4a4d-9993-6f53f40ffca5
-function generate_dense_chain(
-    nt,
-    p,
-    nlayers,
-    output_activation,
-    flat_flag=false,
-    ;
-    nt_hidden=nt,
-)
-    if (flat_flag)
-        lp = fill(nt_hidden, nlayers + 1)
-    else
-        lp = floor.(Int, LinRange(nt, p, nlayers + 1))
-    end
-    layers = []
-
-    # make input 3D
-    push!(layers, x -> add_dim3_reshape(x))
-
-    # Add input layer
-    push!(layers, Dense(nt, lp[2], activation))
-
-    # Add hidden layers
-    for il = 2:nlayers-1
-        push!(layers, Dense(lp[il], lp[il+1], activation))
-    end
-
-    # Add output layer
-    push!(layers, Dense(lp[nlayers], p, output_activation))
-
-    return layers
-end
-
-# ╔═╡ 0dd8d418-a664-4ecd-ac90-bab97861f9f0
-function get_symae(t::DenseAE, nt, p, q, k)
-    P = p * k
-    senc =
-        Chain(
-            generate_dense_chain(
-                nt,
-                P,
-                t.nlayers,
-                activation,
-                t.flat_flag,
-                nt_hidden=t.nt_hidden,
-            )...,
-        ) |> xpu
-
-    # instance means
-    senc_μ = Chain(Dense(P, P)) |> xpu
-
-    # inverse variances
-    senc_loginvvar = Chain(Dense(P, P)) |> xpu
-    senc_λlogits = xpu(Chain(Dense(P, P, activation), Dense(P, 2 * P, activation), Dense(2 * P, 2 * P, activation), Dense(2 * P, k))) # only used when k>1 # only used when k>1
-
-    nenc =
-        Chain(
-            generate_dense_chain(
-                nt,
-                q,
-                t.nlayers,
-                activation,
-                t.flat_flag,
-                nt_hidden=t.nt_hidden,
-            )...,
-        ) |> xpu
-
-    # produce logσ for the nuisance encoder
-    nenc_μ = Chain(Dense(q, q)) |> xpu
-    nenc_logσ = Chain(Dense(q, q)) |> xpu
-
-    dec =
-        Chain(
-            generate_dense_chain(
-                p + q,
-                nt,
-                t.nlayers,
-                identity,
-                t.flat_flag,
-                nt_hidden=t.nt_hidden,
-            )...,
-        ) |> xpu
-
-    dec_logvar = xpu(cat(1.0f0, dims=3))
-
-    return (; senc, senc_μ, senc_loginvvar, senc_λlogits, nenc, nenc_μ, nenc_logσ, dec, dec_logvar)
-end
-
-# ╔═╡ 32baae21-b5fa-4391-9066-23436a5a2b1d
+# ╔═╡ 04f9b328-edc8-4b1e-9a7c-79a215b1cf5f
 begin
-    struct Conv1DChain
-        chain::Chain
+    struct SymVAE{T1,T2,T3,T4}
+        sencb::T1
+        nencb::T2
+        decb::T3
+        cond_proj::T4
+        condition_dim::Int
     end
-    Flux.@layer Conv1DChain trainable = (chain)
-    function (m::Conv1DChain)(x)
-        x = add_dim3_reshape(x)
-        n1, n2, n3 = size(x)
-        X = reshape(x, :, 1, n2 * n3)
-        X = m.chain(X)
-        X = reshape(X, :, n2, n3)
-        return X
-    end
-end
-
-# ╔═╡ 89599b3f-8c20-46c5-8f5c-ccbb71b26b36
-function get_conv_encoder(nt, p=nothing; kernels=[32, 16, 8, 4], filters=[8, 16, 32, 64], strides=[2, 2, 2, 2], use_bn::Bool=true)
-    @assert length(kernels) == length(filters) "kernels and filters must align"
-    layers = Any[]
-    nin = 1
-    for (i, k) in enumerate(kernels)
-        nout = filters[i]
-        s = i <= length(strides) ? strides[i] : 1
-        push!(layers, Conv((k,), nin => nout, activation; pad=SamePad(), stride=s))
-        if use_bn && i < length(kernels)
-            push!(layers, BatchNorm(nout))
-        end
-        nin = nout
-    end
-
-    trunk = Chain(layers...)
-    conv_outsize = Flux.outputsize(trunk, (nt, 1); padbatch=true)
-	last_layer, output_length = if(p===nothing)
-		identity, prod(conv_outsize)
-	else
-		Dense(prod(conv_outsize) => p, activation), p
-	end
-    return Conv1DChain(Chain(trunk..., Flux.flatten, last_layer)), output_length
-end
-
-# ╔═╡ 64430447-c267-4eec-8d38-63ccf91d82c4
-function get_conv_decoder(nt, pq; kernels=[4, 8, 16], filters=[64, 48, 16, 1], upstrides=[2, 2, 1], use_bn=false)
-    @assert length(kernels) == length(upstrides) "kernels and upstrides must align"
-    @assert length(filters) == length(kernels) + 1 "filters length should be stages+1 (bottleneck..final)"
-
-    total_stride = prod(upstrides)
-    @assert nt % total_stride == 0 "nt must be divisible by product(upstrides)"
-    bottleneck_len = div(nt, total_stride)
-
-    layers = Any[]
-    # project latent PQ -> (bottleneck_len × filters[1]) feature map
-    push!(layers, Dense(pq, bottleneck_len * filters[1], activation))
-    
-    # Reshape without scalar indexing: use a function that captures dimensions
-    btl = bottleneck_len
-    f1 = filters[1]
-    push!(layers, x -> begin
-        # x is (bottleneck_len*filters[1], batchsize)
-        n = size(x, 1)  # should equal btl*f1 (known statically)
-        b = div(n, btl * f1)  # avoid direct size(x,2) which triggers scalar indexing
-        # Actually we need batchsize; compute it from total elements
-        # x has shape (btl*f1, batch), so batch = size(x,2) but that's scalar indexing!
-        # Better: reshape directly using known structure
-        reshape(x, btl, f1, :)  # let : infer batch from total size
-    end)
-
-    nin = filters[1]
-    for i in 1:length(kernels)
-        nout = filters[i+1]
-        k = kernels[i]
-        s = upstrides[i]
-        # ConvTranspose upsamples by stride s
-        if i == length(kernels)
-            # final convtranspose -> single-channel linear output (no activation)
-            push!(layers, ConvTranspose((k,), nin => nout; stride=s, pad=SamePad()))
+    function SymVAE(NN, k=1; condition_dim::Int=0, condition_embed_dim::Int=0)
+        senc_core = if (k > 1)
+            BroadcastCoherentEncCategorical(NN.senc, NN.senc_μ, NN.senc_loginvvar, NN.senc_λlogits)
         else
-            push!(layers, ConvTranspose((k,), nin => nout, activation; stride=s, pad=SamePad()))
-			if(use_bn)
-            	push!(layers, BatchNorm(nout))
-			end
+            BroadcastCoherentEnc(NN.senc, NN.senc_μ, NN.senc_loginvvar)
         end
-        nin = nout
+        nenc_core = BroadcastNuisanceEnc(NN.nenc, NN.nenc_μ, NN.nenc_logσ)
+        # FiLM path: encoder chain is FiLMConv1DChain → pass cond directly via 2-arg callable
+        # Concat path: wrap with ConditionConcat so cond is prepended to input
+        if (condition_dim <= 0)
+            sencb = senc_core
+            nencb = nenc_core
+        else
+            sencb = (senc_core.chain isa FiLMConv1DChain) ? senc_core : ConditionalChain(ConditionConcat(), senc_core)
+            nencb = (nenc_core.chain isa FiLMConv1DChain) ? nenc_core : ConditionalChain(ConditionConcat(), nenc_core)
+        end
+        decb = BroadcastDec(NN.dec, NN.dec_logvar)
+        cond_proj = if (condition_dim > 0)
+            cembed = condition_embed_dim > 0 ? condition_embed_dim : condition_dim
+            xpu(Chain(Dense(condition_dim, cembed, activation), Flux.LayerNorm(cembed)))
+        else
+            xpu(Chain())
+        end
+
+        model = SymVAE(sencb, nencb, decb, cond_proj, condition_dim)
     end
+    function (m::SymVAE)(x, nnoise, cnoise, temperature)
+        return m(x, nothing, nnoise, cnoise, temperature)
+    end
+    function (m::SymVAE)(x, condition, nnoise, cnoise, temperature)
+        cond_embedding = _get_condition_embedding(m.cond_proj, m.condition_dim, x, condition)
+        C = m.sencb(x, cond_embedding)
+        N = m.nencb(x, cond_embedding)
+        xhat, xhat_logvar = sample_q_decode(C..., N..., nnoise, cnoise, m.decb, temperature; cond_embedding)
+        return (;
+            Z=(; N, C),
+            X=(; xhat, xhat_logvar),
+            shifts=[0f0]
+        )
+    end
+    function (m::SymVAE)(xc, xn, condition, nnoise, cnoise, temperature)
+        xn_eff = xn === nothing ? xc : xn
+        cond_embedding = _get_condition_embedding(m.cond_proj, m.condition_dim, xn_eff, condition)
+        C = m.sencb(xc, cond_embedding)
+        N = m.nencb(xn_eff, cond_embedding)
+        xhat, xhat_logvar = sample_q_decode(C..., N..., nnoise, cnoise, m.decb, temperature; cond_embedding)
+        return (;
+            Z=(; N, C),
+            X=(; xhat, xhat_logvar),
+            shifts=[0f0]
+        )
+    end
+    # get coherent code for each element of D
+    function (m::SymVAE)(D::Vector{T}, ::Val{:coherent}; condition=nothing, args...) where {T}
+        if (condition === nothing)
+            return map(D) do d
+                m(d, Val(:coherent); condition=nothing, args...)
+            end
+        end
 
-    return Conv1DChain(Chain(layers...))
+        cond = Float32.(condition)
+        @assert ndims(cond) == 2 "Vector conditioning must be a matrix with shape (condition_dim, ngroups)."
+        @assert size(cond, 2) == length(D) "Condition group count mismatch. Expected $(length(D)), got $(size(cond, 2))."
+        return map(enumerate(D)) do (i, d)
+            m(d, Val(:coherent); condition=reshape(cond[:, i], :, 1), args...)
+        end
+    end
+    # get nuisance code for each element of D
+    function (m::SymVAE)(D::Vector{T}, ::Val{:nuisance}; condition=nothing, args...) where {T}
+        if (condition === nothing)
+            return map(D) do d
+                m(d, Val(:nuisance); condition=nothing, args...)
+            end
+        end
+
+        cond = Float32.(condition)
+        @assert ndims(cond) == 2 "Vector conditioning must be a matrix with shape (condition_dim, ngroups)."
+        @assert size(cond, 2) == length(D) "Condition group count mismatch. Expected $(length(D)), got $(size(cond, 2))."
+        return map(enumerate(D)) do (i, d)
+            m(d, Val(:nuisance); condition=reshape(cond[:, i], :, 1), args...)
+        end
+    end
+    # get coherent code for d
+    function (m::SymVAE)(d, ::Val{:coherent}; condition=nothing, args...)
+        cond_embedding = _get_condition_embedding(m.cond_proj, m.condition_dim, d, condition)
+        return m.sencb(d, cond_embedding)
+    end
+    # get nuisance code for d
+    function (m::SymVAE)(d, ::Val{:nuisance}; condition=nothing, args...)
+        cond_embedding = _get_condition_embedding(m.cond_proj, m.condition_dim, d, condition)
+        return m.nencb(d, cond_embedding)
+    end
+    function (m::SymVAE)(d, ::Val{:transform})
+        return d
+    end
+    Flux.@layer SymVAE trainable = (sencb, nencb, decb, cond_proj)
 end
 
-# ╔═╡ 190c8221-c5c7-48f9-b016-36c27fd4528c
-function get_symae(t::ConvAE, nt, p, q, k)
-    P = p * k
-    dec_logvar = xpu(cat(1.0f0, dims=3))
-    senc, Pout = xpu(get_conv_encoder(nt, nothing; kernels=t.enc_kernels, filters=t.enc_filters, strides=t.enc_strides, use_bn=t.use_bn))
-    nenc, qout = xpu(get_conv_encoder(nt, nothing; kernels=t.enc_kernels, filters=t.enc_filters, strides=t.enc_strides, use_bn=t.use_bn))
-    senc_λlogits = xpu(Chain(Dense(Pout, div(Pout, 2), activation), Dense(div(Pout, 2), k))) # only used when k>1
-    senc_μ = xpu(Dense(Pout, P))
-    senc_loginvvar = xpu(Dense(Pout, P))
-    nenc_μ = xpu(Dense(qout, q))
-    nenc_logσ = xpu(Dense(qout, q))
-    dec = xpu(get_conv_decoder(nt, p + q; kernels=t.dec_kernels, filters=t.dec_filters, upstrides=t.dec_upstrides, use_bn=t.use_bn))
-    return (; senc, senc_μ, senc_loginvvar, senc_λlogits, nenc, nenc_μ, nenc_logσ, dec, dec_logvar)
-end
-
-# ╔═╡ 4cc4fea4-2a3b-11ee-1341-d7fa7529b14a
-function get_symae(t::DenseConvAE, nt, p, q, k)
-    P = p * k
-    senc = senc = xpu(get_conv_encoder(nt, P))
-    # Chain(
-    #     generate_dense_chain(
-    #         nt,
-    #         P,
-    #         t.nlayers,
-    #         activation,
-    #         t.flat_flag,
-    #         nt_hidden=t.nt_hidden,
-    #     )...,
-    # ) |> xpu
-
-    # instance means
-    senc_μ = Chain(Dense(P, P)) |> xpu
-
-    # inverse variances
-    senc_loginvvar = Chain(Dense(P, P)) |> xpu
-    # only used when k>1
-    senc_λlogits = xpu(Chain(Dense(P, P, activation), Dense(P, 2 * P, activation), Dense(2 * P, 2 * P, activation), Dense(2 * P, k))) # only used when k>1 # only used when k>1
-
-    nenc =
-        Chain(
-            generate_dense_chain(
-                nt,
-                q,
-                t.nlayers,
-                activation,
-                t.flat_flag,
-                nt_hidden=t.nt_hidden,
-            )...,
-        ) |> xpu
-
-    # produce logσ for the nuisance encoder
-    nenc_μ = Chain(Dense(q, q)) |> xpu
-    nenc_logσ = Chain(Dense(q, q)) |> xpu
-
-    dec = xpu(get_conv_decoder(nt, p + q))
-
-    dec_logvar = xpu(cat(1.0f0, dims=3))
-
-    return (; senc, senc_μ, senc_loginvvar, senc_λlogits, nenc, nenc_μ, nenc_logσ, dec, dec_logvar)
-end
-
-# ╔═╡ 4fb77fae-61bb-4484-b733-82e1d1002371
+# ╔═╡ 186713a3-c357-427c-9af4-6739de2d33c5
 begin
-    struct ViT1DChain{T}
-        chain::T
+    struct SymVAETrunk{T1,T2,T3,T4,T5}
+        tencb::T1
+        sencb::T2
+        nencb::T3
+        decb::T4
+        cond_proj::T5
+        condition_dim::Int
     end
-    Flux.@layer ViT1DChain trainable = (chain)
-    function (m::ViT1DChain)(x)
-        x = add_dim3_reshape(x)
-        n1, n2, n3 = size(x)
-        X = reshape(x, :, 1, 1, n2 * n3)
-        X = m.chain(X)
-        X = Flux.flatten(X)
-        X = reshape(X, :, n2, n3)
-        return X
+    function SymVAETrunk(NN, k=1; condition_dim::Int=0, condition_embed_dim::Int=0)
+        tencb = NN.tencb
+        senc_core = if (k > 1)
+            BroadcastCoherentEncCategorical(NN.senc, NN.senc_μ, NN.senc_loginvvar, NN.senc_λlogits)
+        else
+            BroadcastCoherentEnc(NN.senc, NN.senc_μ, NN.senc_loginvvar)
+        end
+        nenc_core = BroadcastNuisanceEnc(NN.nenc, NN.nenc_μ, NN.nenc_logσ)
+        if (condition_dim <= 0)
+            sencb = senc_core
+            nencb = nenc_core
+        else
+            sencb = (senc_core.chain isa FiLMConv1DChain) ? senc_core : ConditionalChain(ConditionConcat(), senc_core)
+            nencb = (nenc_core.chain isa FiLMConv1DChain) ? nenc_core : ConditionalChain(ConditionConcat(), nenc_core)
+        end
+        decb = BroadcastDec(NN.dec, NN.dec_logvar)
+        cond_proj = if (condition_dim > 0)
+            cembed = condition_embed_dim > 0 ? condition_embed_dim : condition_dim
+            xpu(Chain(Dense(condition_dim, cembed, activation), Flux.LayerNorm(cembed)))
+        else
+            xpu(Chain())
+        end
+
+        model = SymVAETrunk(tencb, sencb, nencb, decb, cond_proj, condition_dim)
     end
-end
+    function (m::SymVAETrunk)(x, nnoise, cnoise, temperature)
+        return m(x, nothing, nnoise, cnoise, temperature)
+    end
+    function (m::SymVAETrunk)(x, condition, nnoise, cnoise, temperature)
+        cond_embedding = _get_condition_embedding(m.cond_proj, m.condition_dim, x, condition)
+        xt = m.tencb(x)
+        C = m.sencb(xt, cond_embedding)
+        N = m.nencb(xt, cond_embedding)
+        xhat, xhat_logvar = sample_q_decode(C..., N..., nnoise, cnoise, m.decb, temperature; cond_embedding)
+        return (;
+            Z=(; N, C),
+            X=(; xhat, xhat_logvar),
+            shifts=[0f0]
+        )
+    end
+    function (m::SymVAETrunk)(xc, xn, condition, nnoise, cnoise, temperature)
+        xn_eff = xn === nothing ? xc : xn
+        cond_embedding = _get_condition_embedding(m.cond_proj, m.condition_dim, xn_eff, condition)
+        xtc = m.tencb(xc)
+        xtn = m.tencb(xn_eff)
+        C = m.sencb(xtc, cond_embedding)
+        N = m.nencb(xtn, cond_embedding)
+        xhat, xhat_logvar = sample_q_decode(C..., N..., nnoise, cnoise, m.decb, temperature; cond_embedding)
+        return (;
+            Z=(; N, C),
+            X=(; xhat, xhat_logvar),
+            shifts=[0f0]
+        )
+    end
+    # get coherent code for each element of D
+    function (m::SymVAETrunk)(D::Vector{T}, ::Val{:coherent}; condition=nothing, args...) where {T}
+        if (condition === nothing)
+            return map(D) do d
+                m(d, Val(:coherent); condition=nothing, args...)
+            end
+        end
 
-# ╔═╡ aeb16356-9cbb-4d07-9623-25df66e94378
-function get_vit_encoder(nt, p, config=:tiny)
-    vit_layers = Metalhead.vit((nt, 1); inchannels=1, pool=:mean, patch_size=(32, 1), nclasses=p, Metalhead.VIT_CONFIGS[config]...)
-    return ViT1DChain(Metalhead.ViT(vit_layers))
-end
+        cond = Float32.(condition)
+        @assert ndims(cond) == 2 "Vector conditioning must be a matrix with shape (condition_dim, ngroups)."
+        @assert size(cond, 2) == length(D) "Condition group count mismatch. Expected $(length(D)), got $(size(cond, 2))."
+        return map(enumerate(D)) do (i, d)
+            m(d, Val(:coherent); condition=reshape(cond[:, i], :, 1), args...)
+        end
+    end
+    # get nuisance code for each element of D
+    function (m::SymVAETrunk)(D::Vector{T}, ::Val{:nuisance}; condition=nothing, args...) where {T}
+        if (condition === nothing)
+            return map(D) do d
+                m(d, Val(:nuisance); condition=nothing, args...)
+            end
+        end
 
-# ╔═╡ 99e35014-80dc-49c6-939e-26fa0e2d7c6f
-function get_symae(t::ViTConvAE, nt, p, q, k)
-    P = p * k
-    tencb = xpu(get_vit_encoder(nt, t.ntoutput, t.config))
-    senc =
-        Chain(
-            generate_dense_chain(
-                t.ntoutput,
-                P,
-                3,
-                activation,
-                false,
-            )...,
-        ) |> xpu
-
-    # instance means
-    senc_μ = Chain(Dense(P, P)) |> xpu
-
-    # inverse variances
-    senc_loginvvar = Chain(Dense(P, P)) |> xpu
-
-    # only used when k>1
-    senc_λlogits = xpu(Chain(Dense(P, P, activation), Dense(P, 2 * P, activation), Dense(2 * P, 2 * P, activation), Dense(2 * P, k))) # only used when k>1 # only used when k>1
-    nenc =
-        Chain(
-            generate_dense_chain(
-                t.ntoutput,
-                q,
-                3,
-                activation,
-                false,
-            )...,
-        ) |> xpu
-
-    # produce logσ for the nuisance encoder
-    nenc_μ = Chain(Dense(q, q)) |> xpu
-    nenc_logσ = Chain(Dense(q, q)) |> xpu
-
-    dec = xpu(get_conv_decoder(nt, p + q))
-    dec_logvar = xpu(cat(1.0f0, dims=3))
-
-    return (; tencb, senc, senc_μ, senc_loginvvar, senc_λlogits, nenc, nenc_μ, nenc_logσ, dec, dec_logvar)
+        cond = Float32.(condition)
+        @assert ndims(cond) == 2 "Vector conditioning must be a matrix with shape (condition_dim, ngroups)."
+        @assert size(cond, 2) == length(D) "Condition group count mismatch. Expected $(length(D)), got $(size(cond, 2))."
+        return map(enumerate(D)) do (i, d)
+            m(d, Val(:nuisance); condition=reshape(cond[:, i], :, 1), args...)
+        end
+    end
+    # get coherent code for d
+    function (m::SymVAETrunk)(d, ::Val{:coherent}; condition=nothing, args...)
+        xt = m.tencb(d)
+        cond_embedding = _get_condition_embedding(m.cond_proj, m.condition_dim, d, condition)
+        return m.sencb(xt, cond_embedding)
+    end
+    # get nuisance code for d
+    function (m::SymVAETrunk)(d, ::Val{:nuisance}; condition=nothing, args...)
+        xt = m.tencb(d)
+        cond_embedding = _get_condition_embedding(m.cond_proj, m.condition_dim, d, condition)
+        return m.nencb(xt, cond_embedding)
+    end
+    function (m::SymVAETrunk)(::Any, ::Val{:transform})
+        return nothing
+    end
+    Flux.@layer SymVAETrunk trainable = (tencb, sencb, nencb, decb, cond_proj)
 end
 
 # ╔═╡ 56055fa2-8f96-4b43-b1eb-2cd5a9cbadeb
@@ -2402,11 +2711,31 @@ get symae
 function get_symae(para)
     Random.seed!(para.seed)
 
-    model =
-        if (typeof(para.network_type) == ViTConvAE)
-            SymVAETrunk(get_symae(para.network_type, para.nt, para.p, para.q, para.k), para.k)
+    condition_embed_dim = if (para.condition_dim > 0)
+        if (para.condition_embed_dim > 0)
+            para.condition_embed_dim
         else
-            SymVAE(get_symae(para.network_type, para.nt, para.p, para.q, para.k), para.k)
+            para.condition_dim
+        end
+    else
+        0
+    end
+
+    model =
+        if (typeof(para.network_type) == ConvAE)
+            SymVAE(
+                get_symae(para.network_type, para.nt, para.p, para.q, para.k, condition_embed_dim),
+                para.k;
+                condition_dim=para.condition_dim,
+                condition_embed_dim=condition_embed_dim,
+            )
+        else
+            SymVAE(
+                get_symae(para.network_type, para.nt, para.p, para.q, para.k, condition_embed_dim),
+                para.k;
+                condition_dim=para.condition_dim,
+                condition_embed_dim=condition_embed_dim,
+            )
         end
     # commented if we want to use full transformer, not just time shift transformer (later)
     # 		sampling_grid =
@@ -2803,7 +3132,7 @@ function focused_categorical_prior(K::Int, sharpness=2.0)
 end
 
 
-# ╔═╡ 97b37ee3-e87b-4942-9d9a-22cffc88ab9d
+# ╔═╡ e29c0103-ab96-413f-a739-cd0f97ff3288
 function get_kl(μ, logσ, λlogits, betac, betaλ)
     prior = focused_categorical_prior(size(λlogits, 1), 0.0)
 	# @show div(size(μ, 1), size(λlogits, 1)), size(λlogits, 1)
@@ -2817,8 +3146,9 @@ end
 Loss for Variational SymAE
 """
 function loss_sym_vae(model, x, beta, gamma, temperature)
-    result = model(x, true, true, temperature)
-	neg_llh = 0.5f0 * sum(@. abs2(result.X.xhat - x) * exp(-result.X.xhat_logvar) + result.X.xhat_logvar)
+    xb, condition = _split_batch_condition(x)
+    result = model(xb, condition, true, true, temperature)
+	neg_llh = 0.5f0 * sum(@. abs2(result.X.xhat - xb) * exp(-result.X.xhat_logvar) + result.X.xhat_logvar)
     kl = sum(map(result.Z, beta) do z, b
         get_kl(z..., b...)
     end)
@@ -2827,155 +3157,20 @@ function loss_sym_vae(model, x, beta, gamma, temperature)
     return (; neg_elbo=neg_elbo, neg_llh, kl, spatial_transformer_norm, gamma)
 end
 
-# ╔═╡ 7f8094da-d6a6-4b3d-b16c-cb0d7e928b9d
-"""
-train SymAE model using `get_data_iterator`
-"""
-function update(model, loss_history, data_train, data_test, training_para=SymAE_Training_Para())
-    lr_s = Exp(start=training_para.initial_learning_rate, decay=0.99)
-    opt_state = Optimisers.setup(Optimisers.AdamW(eta=training_para.initial_learning_rate), model)
-    ntau = min(training_para.ntau, minimum(getindex.(size.(data_train), 2)))
-    ntau_test = min(training_para.ntau, minimum(getindex.(size.(data_test), 2)))
-    dup_model = Enzyme.Duplicated(model)
-    @progress name = "training" for epoch = 1:training_para.nepoch
-
-        Xtrain = get_data_iterator(
-            data_train;
-            ntau=ntau,
-            batchsize=training_para.batchsize,
-            nsteps=training_para.nsteps,
-        )
-        Xtest = get_data_iterator(
-            data_test,
-            ntau=ntau_test,
-            batchsize=training_para.batchsize,
-            nsteps=training_para.nsteps,
-        )
-
-        # compute losses per epoch for a sample
-        xtrain = first(Xtrain)
-        xtest = first(Xtest)
-        push!(loss_history.train_mse, loss_mse(model, xtrain))
-        push!(loss_history.test_mse, loss_mse(model, xtest))
-        train_loss = loss_sym_vae(model, xtrain, training_para.beta, training_para.gamma, training_para.temperature)
-        test_loss = loss_sym_vae(model, xtest, training_para.beta, training_para.gamma, training_para.temperature)
-        push!(loss_history.train_neg_llh, train_loss.neg_llh)
-        push!(loss_history.test_neg_llh, test_loss.neg_llh)
-        push!(loss_history.train_kl, train_loss.kl)
-        push!(loss_history.test_kl, test_loss.kl)
-        push!(loss_history.train_neg_elbo, train_loss.neg_elbo)
-        push!(loss_history.test_neg_elbo, test_loss.neg_elbo)
-
-        # learning rate depending on how many epochs we have already run
-        Optimisers.adjust!(opt_state, lr_s(epoch))
-
-        loss(model, data) = loss_sym_vae(model, data, training_para.beta, training_para.gamma, training_para.temperature).neg_elbo
-
-        for x in Xtrain
-            # g = Flux.gradient(loss, dup_model, Const(x))[1]
-            g = Flux.gradient(loss, model, x)[1]
-            Optimisers.update!(opt_state, model, g)
-        end
-
-
-        # print output every 10 epochs
-        if (mod(epoch, training_para.nprint) == 0)
-            @info merge((; epoch=epoch), map(last, loss_history))
-        end
-    end
-    return nothing
-end
-
-# ╔═╡ 7e3a8840-ed33-4d7c-a3b0-f6f458e2a72d
-"""
-alternate training between (encoder, decoder) and (transformer) of SymAE
-"""
-function update_alternating_transformer(model, loss_history, data_train, data_test, training_para=SymAE_Training_Para())
-    lr_s = Exp(start=training_para.initial_learning_rate, decay=0.99)
-    opt_state = Optimisers.setup(Optimisers.AdamW(eta=training_para.initial_learning_rate), model)
-    loss(model, data) = loss_sym_vae(model, data, training_para.beta, training_para.gamma, training_para.temperature).neg_elbo
-    ntau = min(training_para.ntau, minimum(getindex.(size.(data_train), 2)))
-    ntau_test = min(training_para.ntau, minimum(getindex.(size.(data_test), 2)))
-    # dup_model = Enzyme.Duplicated(model)
-    @progress name = "training" for epoch = 1:training_para.nepoch
-        Xtrain = get_data_iterator(
-            data_train;
-            ntau=ntau,
-            batchsize=training_para.batchsize,
-            nsteps=training_para.nsteps,
-        )
-        Xtest = get_data_iterator(
-            data_test,
-            ntau=ntau_test,
-            batchsize=training_para.batchsize,
-            nsteps=training_para.nsteps,
-        )
-
-        # compute losses per epoch for a sample
-        xtrain = first(Xtrain)
-        xtest = first(Xtest)
-        push!(loss_history.train_mse, loss_mse(model, xtrain))
-        push!(loss_history.test_mse, loss_mse(model, xtest))
-        train_loss = loss_sym_vae(model, xtrain, training_para.beta, training_para.gamma, training_para.temperature)
-        test_loss = loss_sym_vae(model, xtest, training_para.beta, training_para.gamma, training_para.temperature)
-        push!(loss_history.train_neg_llh, train_loss.neg_llh)
-        push!(loss_history.test_neg_llh, test_loss.neg_llh)
-        push!(loss_history.train_kl, train_loss.kl)
-        push!(loss_history.test_kl, test_loss.kl)
-        push!(loss_history.train_neg_elbo, train_loss.neg_elbo)
-        push!(loss_history.test_neg_elbo, test_loss.neg_elbo)
-
-
-        # learning rate depending on how many epochs (from loss_history) we have already run
-        Optimisers.adjust!(opt_state, lr_s(epoch))
-
-
-        N = 2 # N epochs before alternating
-        # only update encoder and decoders
-        Optimisers.freeze!(opt_state.transformerb)
-        for i in 1:N
-            for x in Xtrain
-                # g = Flux.gradient(loss, dup_model, Const(x))[1]
-                g = Flux.gradient(loss, model, x)[1]
-                Optimisers.update!(opt_state, model, g)
-            end
-        end
-        Optimisers.thaw!(opt_state.transformerb)
-
-
-        # only update transformer parameter
-        Optimisers.freeze!(opt_state.sencb)
-        Optimisers.freeze!(opt_state.nencb)
-        Optimisers.freeze!(opt_state.decb)
-        for i in 1:N
-            for x in Xtrain
-                # g = Flux.gradient(loss, dup_model, Const(x))[1]
-                g = Flux.gradient(loss, model, x)[1]
-                Optimisers.update!(opt_state, model, g)
-            end
-        end
-        Optimisers.thaw!(opt_state.sencb)
-        Optimisers.thaw!(opt_state.nencb)
-        Optimisers.thaw!(opt_state.decb)
-
-
-
-        # print output every 10 epochs
-        if (mod(epoch, training_para.nprint) == 0)
-            @info merge((; epoch=epoch), map(last, loss_history))
-        end
-    end
-    return nothing
-end
-
 # ╔═╡ 0541d3c6-24cf-46b1-95a1-39f3341aec4f
 """
 alternate training between (encoder, decoder) and (transformer) of SymAE
 """
-function update_alternating_transformer_batchviews(model, loss_history, data_train, data_test, training_para=SymAE_Training_Para())
+function update_alternating_transformer_batchviews(model, loss_history, data_train, data_test, training_para=Training_Para())
     lr_s = Exp(start=training_para.initial_learning_rate, decay=0.99)
     opt_state = Optimisers.setup(Optimisers.AdamW(eta=training_para.initial_learning_rate), model)
-    loss(model, data) = loss_sym_vae(model, data, training_para.beta, training_para.gamma, training_para.temperature).neg_elbo
+    loss(model, data) = loss_sym_vae(
+        model,
+        data,
+        training_para.beta,
+        training_para.gamma,
+        training_para.temperature,
+    ).neg_elbo
     ntau = min(training_para.ntau, minimum(getindex.(size.(data_train), 2)))
     ntau_test = min(training_para.ntau, minimum(getindex.(size.(data_test), 2)))
     # dup_model = Enzyme.Duplicated(model)
@@ -3046,9 +3241,15 @@ end
 """
 train SymAE model using `get_batchviews`
 """
-function update_with_batchviews(model, loss_history, data_train, data_test, para, training_para=SymAE_Training_Para())
+function update_with_batchviews(model, loss_history, data_train, data_test, para, training_para=Training_Para())
     opt_state = Optimisers.setup(Optimisers.AdamW(para.learning_rate), model)
-    loss(model, data) = loss_sym_vae(model, data, training_para.beta).neg_elbo
+    loss(model, data) = loss_sym_vae(
+        model,
+        data,
+        training_para.beta,
+        training_para.gamma,
+        training_para.temperature,
+    ).neg_elbo
     ntau = min(training_para.ntau, minimum(getindex.(size.(data_train), 2)))
     ntau_test = min(training_para.ntau, minimum(getindex.(size.(data_test), 2)))
 
@@ -3084,6 +3285,262 @@ function update_with_batchviews(model, loss_history, data_train, data_test, para
     return nothing
 end
 
+# ╔═╡ 6f6de313-cd2c-4ed4-beca-7302c4bd7a91
+function conditioning_to_matrix_for_lazy(conditioning::Union{Nothing, GroupConditioning}, ngroups::Int)
+    if !has_conditioning(conditioning)
+        return nothing
+    end
+
+    cond_cols = Vector{Vector{Float32}}(undef, ngroups)
+    for i in 1:ngroups
+        cond_cols[i] = get_group_condition_vector(conditioning, i)
+    end
+
+    cond_dim = length(cond_cols[1])
+    cond_mat = Matrix{Float32}(undef, cond_dim, ngroups)
+    for i in 1:ngroups
+        @assert length(cond_cols[i]) == cond_dim "conditioning vectors must have equal length"
+        @views cond_mat[:, i] .= cond_cols[i]
+    end
+    return cond_mat
+end
+
+# ╔═╡ 139490d1-5931-4a18-9f74-c391064a3383
+"""
+**Primary Data Iterator for Group-Based SymVAE Training**
+
+Creates a data iterator where each datapoint consists of `ntau` waveforms randomly sampled 
+from a single group. This is the core function that enables the group-based training paradigm
+essential for coherent information extraction.
+
+## Critical Training Principle:
+During training, it is **essential** to mix instances from different groups in each batch. 
+Small batch sizes (e.g., batchsize=1) prevent proper disentanglement of coherent from nuisance 
+information. **Always use the largest possible batch size** within memory constraints.
+
+## Group-Based Training Logic:
+1. **Within-Group Coherence**: Each datapoint contains `ntau` waveforms from the same group
+2. **Cross-Group Learning**: Multiple datapoints (from different groups) in each batch
+3. **Coherent Extraction**: Model learns shared features across the `ntau` waveforms
+4. **Nuisance Learning**: Model learns instance-specific variations within each group
+
+## Arguments:
+* `dvec`: Vector of waveform groups, where `dvec[i]` contains all instances for group i
+* `nsteps`: Number of training steps per epoch  
+* `ntau`: Number of waveform instances per datapoint (typically 20)
+  - Higher values improve coherent learning but require more GPU memory
+  - Must be ≤ minimum group size across all groups in `dvec`
+* `batchsize`: Number of datapoints per training batch
+  - **Critical**: Must be > 1 for proper disentanglement
+  - Recommended: 32-256 depending on memory constraints
+
+## Returns:
+DataLoader object that yields batches of shape (nt, ntau, batchsize) where:
+- nt: time samples per waveform
+- ntau: waveforms per group sample  
+- batchsize: group samples per batch
+
+## Training Data Flow:
+```
+Group 1: [w₁₁, w₁₂, ..., w₁ₘ] → Sample ntau → Datapoint 1
+Group 2: [w₂₁, w₂₂, ..., w₂ₙ] → Sample ntau → Datapoint 2
+   ⋮           ⋮                     ⋮            ⋮
+Group G: [wG₁, wG₂, ..., wGₖ] → Sample ntau → Datapoint G
+
+Batch = [Datapoint_i, Datapoint_j, ..., Datapoint_batchsize]
+```
+
+## Example Usage:
+```julia
+# Multiple recording sites (groups)
+site_recordings = [site1_waveforms, site2_waveforms, site3_waveforms]
+
+# Create training iterator
+train_data = get_data_iterator(
+    site_recordings,
+    nsteps=1000,     # 1000 steps per epoch
+    batchsize=64,    # 64 group samples per batch
+    ntau=20          # 20 waveforms per group sample
+)
+
+# Each batch contains waveforms from 64 different group samples
+for batch in train_data
+    # batch shape: (time_samples, 20, 64)
+    # 20 waveforms × 64 group samples = 1280 waveforms total
+    loss = compute_symvae_loss(model, batch)
+end
+```
+"""
+function get_data_iterator(dvec; nsteps=1000, batchsize=256, ntau=20, conditioning=nothing)
+    nd = length(dvec)
+    conditioning_mat = conditioning_to_matrix_for_lazy(conditioning, nd)
+    return DG.get_data_iterator_lazy(
+        dvec;
+        nsteps=nsteps,
+        batchsize=batchsize,
+        ntau=ntau,
+        conditioning=conditioning_mat,
+    )
+end
+
+
+# ╔═╡ 7f8094da-d6a6-4b3d-b16c-cb0d7e928b9d
+"""
+train SymAE model using `get_data_iterator`
+"""
+function update(model, loss_history, data_train, data_test, training_para=Training_Para(); conditioning_train=nothing, conditioning_test=conditioning_train)
+    lr_s = Exp(start=training_para.initial_learning_rate, decay=0.99)
+    opt_state = Optimisers.setup(Optimisers.AdamW(eta=training_para.initial_learning_rate), model)
+    ntau = min(training_para.ntau, minimum(getindex.(size.(data_train), 2)))
+    ntau_test = min(training_para.ntau, minimum(getindex.(size.(data_test), 2)))
+    dup_model = Enzyme.Duplicated(model)
+    @progress name = "training" for epoch = 1:training_para.nepoch
+
+        Xtrain = get_data_iterator(
+            data_train;
+            ntau=ntau,
+            batchsize=training_para.batchsize,
+            nsteps=training_para.nsteps,
+            conditioning=conditioning_train,
+        )
+        Xtest = get_data_iterator(
+            data_test,
+            ntau=ntau_test,
+            batchsize=training_para.batchsize,
+            nsteps=training_para.nsteps,
+            conditioning=conditioning_test,
+        )
+
+        # compute losses per epoch for a sample
+        xtrain = first(Xtrain)
+        xtest = first(Xtest)
+        push!(loss_history.train_mse, loss_mse(model, xtrain))
+        push!(loss_history.test_mse, loss_mse(model, xtest))
+        train_loss = loss_sym_vae(model, xtrain, training_para.beta, training_para.gamma, training_para.temperature)
+        test_loss = loss_sym_vae(model, xtest, training_para.beta, training_para.gamma, training_para.temperature)
+        push!(loss_history.train_neg_llh, train_loss.neg_llh)
+        push!(loss_history.test_neg_llh, test_loss.neg_llh)
+        push!(loss_history.train_kl, train_loss.kl)
+        push!(loss_history.test_kl, test_loss.kl)
+        push!(loss_history.train_neg_elbo, train_loss.neg_elbo)
+        push!(loss_history.test_neg_elbo, test_loss.neg_elbo)
+
+        # learning rate depending on how many epochs we have already run
+        Optimisers.adjust!(opt_state, lr_s(epoch))
+
+        loss(model, data) = loss_sym_vae(
+            model,
+            data,
+            training_para.beta,
+            training_para.gamma,
+            training_para.temperature,
+        ).neg_elbo
+
+        for x in Xtrain
+            # g = Flux.gradient(loss, dup_model, Const(x))[1]
+            g = Flux.gradient(loss, model, x)[1]
+            Optimisers.update!(opt_state, model, g)
+        end
+
+
+        # print output every 10 epochs
+        if (mod(epoch, training_para.nprint) == 0)
+            @info merge((; epoch=epoch), map(last, loss_history))
+        end
+    end
+    return nothing
+end
+
+# ╔═╡ 7e3a8840-ed33-4d7c-a3b0-f6f458e2a72d
+"""
+alternate training between (encoder, decoder) and (transformer) of SymAE
+"""
+function update_alternating_transformer(model, loss_history, data_train, data_test, training_para=Training_Para(); conditioning_train=nothing, conditioning_test=conditioning_train)
+    lr_s = Exp(start=training_para.initial_learning_rate, decay=0.99)
+    opt_state = Optimisers.setup(Optimisers.AdamW(eta=training_para.initial_learning_rate), model)
+    loss(model, data) = loss_sym_vae(
+        model,
+        data,
+        training_para.beta,
+        training_para.gamma,
+        training_para.temperature,
+    ).neg_elbo
+    ntau = min(training_para.ntau, minimum(getindex.(size.(data_train), 2)))
+    ntau_test = min(training_para.ntau, minimum(getindex.(size.(data_test), 2)))
+    # dup_model = Enzyme.Duplicated(model)
+    @progress name = "training" for epoch = 1:training_para.nepoch
+        Xtrain = get_data_iterator(
+            data_train;
+            ntau=ntau,
+            batchsize=training_para.batchsize,
+            nsteps=training_para.nsteps,
+            conditioning=conditioning_train,
+        )
+        Xtest = get_data_iterator(
+            data_test,
+            ntau=ntau_test,
+            batchsize=training_para.batchsize,
+            nsteps=training_para.nsteps,
+            conditioning=conditioning_test,
+        )
+
+        # compute losses per epoch for a sample
+        xtrain = first(Xtrain)
+        xtest = first(Xtest)
+        push!(loss_history.train_mse, loss_mse(model, xtrain))
+        push!(loss_history.test_mse, loss_mse(model, xtest))
+        train_loss = loss_sym_vae(model, xtrain, training_para.beta, training_para.gamma, training_para.temperature)
+        test_loss = loss_sym_vae(model, xtest, training_para.beta, training_para.gamma, training_para.temperature)
+        push!(loss_history.train_neg_llh, train_loss.neg_llh)
+        push!(loss_history.test_neg_llh, test_loss.neg_llh)
+        push!(loss_history.train_kl, train_loss.kl)
+        push!(loss_history.test_kl, test_loss.kl)
+        push!(loss_history.train_neg_elbo, train_loss.neg_elbo)
+        push!(loss_history.test_neg_elbo, test_loss.neg_elbo)
+
+
+        # learning rate depending on how many epochs (from loss_history) we have already run
+        Optimisers.adjust!(opt_state, lr_s(epoch))
+
+
+        N = 2 # N epochs before alternating
+        # only update encoder and decoders
+        Optimisers.freeze!(opt_state.transformerb)
+        for i in 1:N
+            for x in Xtrain
+                # g = Flux.gradient(loss, dup_model, Const(x))[1]
+                g = Flux.gradient(loss, model, x)[1]
+                Optimisers.update!(opt_state, model, g)
+            end
+        end
+        Optimisers.thaw!(opt_state.transformerb)
+
+
+        # only update transformer parameter
+        Optimisers.freeze!(opt_state.sencb)
+        Optimisers.freeze!(opt_state.nencb)
+        Optimisers.freeze!(opt_state.decb)
+        for i in 1:N
+            for x in Xtrain
+                # g = Flux.gradient(loss, dup_model, Const(x))[1]
+                g = Flux.gradient(loss, model, x)[1]
+                Optimisers.update!(opt_state, model, g)
+            end
+        end
+        Optimisers.thaw!(opt_state.sencb)
+        Optimisers.thaw!(opt_state.nencb)
+        Optimisers.thaw!(opt_state.decb)
+
+
+
+        # print output every 10 epochs
+        if (mod(epoch, training_para.nprint) == 0)
+            @info merge((; epoch=epoch), map(last, loss_history))
+        end
+    end
+    return nothing
+end
+
 # ╔═╡ 63f7880d-9353-4857-b751-36b6f5f45d68
 md"""
 # JUNK
@@ -3092,50 +3549,56 @@ md"""
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
 [deps]
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 BlackBoxOptim = "a134a8b2-14d6-55f6-9291-3336d3ab0209"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+Functors = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 MLUtils = "f1d291b0-491e-4a28-83b9-f70985020b54"
 Metaheuristics = "bcdb8e00-2c21-11e9-3065-2b553b22f898"
 Metalhead = "dbeba491-748d-5e0e-a39e-b530a07fa0cc"
 Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
 ParameterSchedulers = "d7d3b36b-41b8-4d0d-a2bf-768c6151755e"
+PlutoHooks = "0ff47ea0-7a50-410d-8455-4348d5de0774"
+PlutoLinks = "0ff47ea0-7a50-410d-8455-4348d5de0420"
 PlutoPlotly = "8e989ff0-3d88-8e9f-f020-2b208a939ff0"
 PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
 ProgressLogging = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
-cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
 [compat]
+BenchmarkTools = "~1.6.3"
 BlackBoxOptim = "~0.6.3"
-CUDA = "~5.9.3"
+CUDA = "~5.9.5"
 DSP = "~0.8.4"
-Enzyme = "~0.13.103"
+Enzyme = "~0.13.109"
 FFTW = "~1.10.0"
-Flux = "~0.16.5"
+Flux = "~0.16.7"
+Functors = "~0.5.2"
 MLUtils = "~0.4.8"
 Metaheuristics = "~3.4.1"
 Metalhead = "~0.9.5"
 Optimisers = "~0.4.6"
 ParameterSchedulers = "~0.4.3"
+PlutoHooks = "~0.1.0"
+PlutoLinks = "~0.1.8"
 PlutoPlotly = "~0.6.5"
-PlutoUI = "~0.7.73"
-ProgressLogging = "~0.1.5"
-cuDNN = "~1.4.6"
+PlutoUI = "~0.7.75"
+ProgressLogging = "~0.1.6"
 """
 
 # ╔═╡ 00000000-0000-0000-0000-000000000002
 PLUTO_MANIFEST_TOML_CONTENTS = """
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.12.1"
+julia_version = "1.12.4"
 manifest_format = "2.0"
-project_hash = "288a9605b8de2fc2767a0e5359ea95bc8bb1ef50"
+project_hash = "6a1708cc8d296d8db13d1d0a1fa8a4eb5948278e"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -3156,9 +3619,9 @@ version = "1.3.2"
 
 [[deps.Accessors]]
 deps = ["CompositionsBase", "ConstructionBase", "Dates", "InverseFunctions", "MacroTools"]
-git-tree-sha1 = "3b86719127f50670efe356bc11073d84b4ed7a5d"
+git-tree-sha1 = "856ecd7cebb68e5fc87abecd2326ad59f0f911f3"
 uuid = "7d9f7c33-5ae7-4f3b-8dc6-eff91059b697"
-version = "0.1.42"
+version = "0.1.43"
 
     [deps.Accessors.extensions]
     AxisKeysExt = "AxisKeys"
@@ -3206,9 +3669,9 @@ version = "1.1.2"
 
 [[deps.ArrayLayouts]]
 deps = ["FillArrays", "LinearAlgebra", "StaticArrays"]
-git-tree-sha1 = "355ab2d61069927d4247cd69ad0e1f140b31e30d"
+git-tree-sha1 = "e0b47732a192dd59b9d079a06d04235e2f833963"
 uuid = "4c555306-a7a7-4459-81d9-ec55ddd5c99a"
-version = "1.12.0"
+version = "1.12.2"
 weakdeps = ["SparseArrays"]
 
     [deps.ArrayLayouts.extensions]
@@ -3278,6 +3741,12 @@ git-tree-sha1 = "aebf55e6d7795e02ca500a689d326ac979aaf89e"
 uuid = "9718e550-a3fa-408a-8086-8db961cd8217"
 version = "0.1.1"
 
+[[deps.BenchmarkTools]]
+deps = ["Compat", "JSON", "Logging", "Printf", "Profile", "Statistics", "UUIDs"]
+git-tree-sha1 = "7fecfb1123b8d0232218e2da0c213004ff15358d"
+uuid = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+version = "1.6.3"
+
 [[deps.Bessels]]
 git-tree-sha1 = "4435559dc39793d53a9e3d278e185e920b4619ef"
 uuid = "0e736298-9ec6-45e8-9647-e4fc86a2fe38"
@@ -3308,9 +3777,9 @@ version = "1.0.0"
 
 [[deps.CUDA]]
 deps = ["AbstractFFTs", "Adapt", "BFloat16s", "CEnum", "CUDA_Compiler_jll", "CUDA_Driver_jll", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "Crayons", "DataFrames", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelAbstractions", "LLVM", "LLVMLoopInfo", "LazyArtifacts", "Libdl", "LinearAlgebra", "Logging", "NVTX", "Preferences", "PrettyTables", "Printf", "Random", "Random123", "RandomNumbers", "Reexport", "Requires", "SparseArrays", "StaticArrays", "Statistics", "demumble_jll"]
-git-tree-sha1 = "756f031a1ef3137f497ee73ed595e4acf65d753f"
+git-tree-sha1 = "27d1cd229e3e1d5542352a63ad29268439f79fe9"
 uuid = "052768ef-5323-5732-b1bb-66c8b64840ba"
-version = "5.9.3"
+version = "5.9.5"
 
     [deps.CUDA.extensions]
     ChainRulesCoreExt = "ChainRulesCore"
@@ -3348,12 +3817,6 @@ git-tree-sha1 = "92cd84e2b760e471d647153ea5efc5789fc5e8b2"
 uuid = "76a88914-d11a-5bdc-97e0-2f5a05c973a2"
 version = "0.19.2+0"
 
-[[deps.CUDNN_jll]]
-deps = ["Artifacts", "CUDA_Runtime_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "cf92130f820a5c92607e2a333d2d86d9bf30a694"
-uuid = "62b44479-cb7b-5706-934f-f13b2eb2e645"
-version = "9.13.0+0"
-
 [[deps.ChainRules]]
 deps = ["Adapt", "ChainRulesCore", "Compat", "Distributed", "GPUArraysCore", "IrrationalConstants", "LinearAlgebra", "Random", "RealDot", "SparseArrays", "SparseInverseSubset", "Statistics", "StructArrays", "SuiteSparse"]
 git-tree-sha1 = "3b704353e517a957323bd3ac70fa7b669b5f48d4"
@@ -3369,6 +3832,12 @@ weakdeps = ["SparseArrays"]
 
     [deps.ChainRulesCore.extensions]
     ChainRulesCoreSparseArraysExt = "SparseArrays"
+
+[[deps.CodeTracking]]
+deps = ["InteractiveUtils", "UUIDs"]
+git-tree-sha1 = "b7231a755812695b8046e8471ddc34c8268cbad5"
+uuid = "da1fd8a2-8d9e-5ec2-8556-3022fb5608a2"
+version = "3.0.0"
 
 [[deps.ColorSchemes]]
 deps = ["ColorTypes", "ColorVectorSpace", "Colors", "FixedPointNumbers", "PrecompileTools", "Random"]
@@ -3422,6 +3891,11 @@ weakdeps = ["Dates", "LinearAlgebra"]
 
     [deps.Compat.extensions]
     CompatLinearAlgebraExt = "LinearAlgebra"
+
+[[deps.Compiler]]
+git-tree-sha1 = "382d79bfe72a406294faca39ef0c3cef6e6ce1f1"
+uuid = "807dbc54-b67e-4c79-8afb-eafe4df6f2e1"
+version = "0.1.1"
 
 [[deps.CompilerSupportLibraries_jll]]
 deps = ["Artifacts", "Libdl"]
@@ -3565,13 +4039,13 @@ version = "0.9.5"
 [[deps.Downloads]]
 deps = ["ArgTools", "FileWatching", "LibCURL", "NetworkOptions"]
 uuid = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
-version = "1.6.0"
+version = "1.7.0"
 
 [[deps.Enzyme]]
 deps = ["CEnum", "EnzymeCore", "Enzyme_jll", "GPUCompiler", "InteractiveUtils", "LLVM", "Libdl", "LinearAlgebra", "ObjectFile", "PrecompileTools", "Preferences", "Printf", "Random", "SparseArrays"]
-git-tree-sha1 = "65c0627b3b6372d2c892f338b63ad980a8dcd024"
+git-tree-sha1 = "73e9cb6bb34e537b0ef3bb5e51b1174160dcc5ec"
 uuid = "7da242da-08ed-463a-9acd-ee780be4f1d9"
-version = "0.13.103"
+version = "0.13.109"
 
     [deps.Enzyme.extensions]
     EnzymeBFloat16sExt = "BFloat16s"
@@ -3591,9 +4065,9 @@ version = "0.13.103"
     StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [[deps.EnzymeCore]]
-git-tree-sha1 = "c55ba9649c7dc0f6430a096e35391955d7fc6ecd"
+git-tree-sha1 = "820f06722a87d9544f42679182eb0850690f9b45"
 uuid = "f151be2c-9106-41f4-ab19-57ee4f262869"
-version = "0.8.16"
+version = "0.8.17"
 weakdeps = ["Adapt"]
 
     [deps.EnzymeCore.extensions]
@@ -3601,9 +4075,9 @@ weakdeps = ["Adapt"]
 
 [[deps.Enzyme_jll]]
 deps = ["Artifacts", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "0128465eca9cfc45cba9432ec9cfe0ceb72698ff"
+git-tree-sha1 = "b7a8c737c8ca2f5ca313e012f212effa1adcbf3a"
 uuid = "7cc45869-7501-5eee-bdea-0790c847d4ef"
-version = "0.0.213+0"
+version = "0.0.229+0"
 
 [[deps.ExprTools]]
 git-tree-sha1 = "27415f162e6028e81c72b82ef756bf321213b6ec"
@@ -3670,9 +4144,9 @@ version = "0.8.5"
 
 [[deps.Flux]]
 deps = ["Adapt", "ChainRulesCore", "Compat", "EnzymeCore", "Functors", "LinearAlgebra", "MLCore", "MLDataDevices", "MLUtils", "MacroTools", "NNlib", "OneHotArrays", "Optimisers", "Preferences", "ProgressLogging", "Random", "Reexport", "Setfield", "SparseArrays", "SpecialFunctions", "Statistics", "Zygote"]
-git-tree-sha1 = "d0751ca4c9762d9033534057274235dfef86aaf9"
+git-tree-sha1 = "efa66783e2ad06bfd4c148cb34648e24c99f7626"
 uuid = "587475ba-b771-5e3f-ad9e-33799f191a9c"
-version = "0.16.5"
+version = "0.16.7"
 
     [deps.Flux.extensions]
     FluxAMDGPUExt = "AMDGPU"
@@ -3712,10 +4186,10 @@ uuid = "9fa8497b-333b-5362-9e8d-4d0656e87820"
 version = "1.11.0"
 
 [[deps.GPUArrays]]
-deps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LLVM", "LinearAlgebra", "Printf", "Random", "Reexport", "ScopedValues", "Serialization", "Statistics"]
-git-tree-sha1 = "8ddb438e956891a63a5367d7fab61550fc720026"
+deps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LLVM", "LinearAlgebra", "Printf", "Random", "Reexport", "ScopedValues", "Serialization", "SparseArrays", "Statistics"]
+git-tree-sha1 = "18da8dd0b6aded0c47184e9d2a17573ae8257f36"
 uuid = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
-version = "11.2.6"
+version = "11.3.1"
 weakdeps = ["JLD2"]
 
     [deps.GPUArrays.extensions]
@@ -3729,9 +4203,9 @@ version = "0.2.0"
 
 [[deps.GPUCompiler]]
 deps = ["ExprTools", "InteractiveUtils", "LLVM", "Libdl", "Logging", "PrecompileTools", "Preferences", "Scratch", "Serialization", "TOML", "Tracy", "UUIDs"]
-git-tree-sha1 = "c55c2f564230f1af2a975d927a814bcb47a63a50"
+git-tree-sha1 = "6e5a25bc455da8e8d88b6b7377e341e9af1929f0"
 uuid = "61eb1bfa-7361-4325-ad38-22787b887f55"
-version = "1.7.3"
+version = "1.7.5"
 
 [[deps.GPUToolbox]]
 deps = ["LLVM"]
@@ -3876,6 +4350,12 @@ git-tree-sha1 = "31e996f0a15c7b280ba9f76636b3ff9e2ae58c9a"
 uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 version = "0.21.4"
 
+[[deps.JuliaInterpreter]]
+deps = ["CodeTracking", "InteractiveUtils", "Random", "UUIDs"]
+git-tree-sha1 = "3d3b79166e2a0afcf875df20db110af91ad3ab61"
+uuid = "aa1ae85d-cabe-5617-a682-6adf51b2e16a"
+version = "0.10.11"
+
 [[deps.JuliaNVTXCallbacks_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
 git-tree-sha1 = "af433a10f3942e882d3c671aacb203e006a5808f"
@@ -3954,7 +4434,7 @@ version = "0.6.4"
 [[deps.LibCURL_jll]]
 deps = ["Artifacts", "LibSSH2_jll", "Libdl", "OpenSSL_jll", "Zlib_jll", "nghttp2_jll"]
 uuid = "deac9b47-8bc7-5906-a0fe-35ac56dc84c0"
-version = "8.11.1+1"
+version = "8.15.0+0"
 
 [[deps.LibGit2]]
 deps = ["LibGit2_jll", "NetworkOptions", "Printf", "SHA"]
@@ -4006,6 +4486,12 @@ version = "0.3.29"
 uuid = "56ddb016-857b-54e1-b83d-db4d58db5568"
 version = "1.11.0"
 
+[[deps.LoweredCodeUtils]]
+deps = ["CodeTracking", "Compiler", "JuliaInterpreter"]
+git-tree-sha1 = "5d4278f755440f70648d80cc6225f51e78e94094"
+uuid = "6f1432cf-f94c-5a45-995e-cdbf5db27b0b"
+version = "3.5.1"
+
 [[deps.MIMEs]]
 git-tree-sha1 = "c64d943587f7187e751162b3b84445bbbd79f691"
 uuid = "6c6e2e6c-3030-632d-7369-2d6c69616d65"
@@ -4025,9 +4511,9 @@ version = "1.0.0"
 
 [[deps.MLDataDevices]]
 deps = ["Adapt", "Functors", "Preferences", "Random", "SciMLPublic"]
-git-tree-sha1 = "6326ed6481423cf4a0865de3b0ad8f50f2bfd227"
+git-tree-sha1 = "7268ed353d29d817427e57298a27972dbdd19045"
 uuid = "7e8f7934-dd98-4c1a-8fe8-92b47a384d40"
-version = "1.15.1"
+version = "1.15.3"
 
     [deps.MLDataDevices.extensions]
     MLDataDevicesAMDGPUExt = "AMDGPU"
@@ -4130,13 +4616,13 @@ version = "1.11.0"
 
 [[deps.MozillaCACerts_jll]]
 uuid = "14a3606d-f60d-562e-9121-12d972cd8159"
-version = "2025.5.20"
+version = "2025.11.4"
 
 [[deps.NNlib]]
 deps = ["Adapt", "Atomix", "ChainRulesCore", "GPUArraysCore", "KernelAbstractions", "LinearAlgebra", "Random", "ScopedValues", "Statistics"]
-git-tree-sha1 = "eb6eb10b675236cee09a81da369f94f16d77dc2f"
+git-tree-sha1 = "09701dc1df4281fa9212b269a69210dfa81ee52a"
 uuid = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
-version = "0.9.31"
+version = "0.9.32"
 
     [deps.NNlib.extensions]
     NNlibAMDGPUExt = "AMDGPU"
@@ -4145,6 +4631,7 @@ version = "0.9.31"
     NNlibEnzymeCoreExt = "EnzymeCore"
     NNlibFFTWExt = "FFTW"
     NNlibForwardDiffExt = "ForwardDiff"
+    NNlibMetalExt = "Metal"
     NNlibSpecialFunctionsExt = "SpecialFunctions"
 
     [deps.NNlib.weakdeps]
@@ -4153,6 +4640,7 @@ version = "0.9.31"
     EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
     FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
     ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+    Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
     SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
     cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
@@ -4209,7 +4697,7 @@ version = "0.8.7+0"
 [[deps.OpenSSL_jll]]
 deps = ["Artifacts", "Libdl"]
 uuid = "458c3c95-2e84-50aa-8efc-19380b2a3a95"
-version = "3.5.1+0"
+version = "3.5.4+0"
 
 [[deps.OpenSpecFun_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "Libdl"]
@@ -4275,7 +4763,7 @@ version = "1.2.1"
 [[deps.Pkg]]
 deps = ["Artifacts", "Dates", "Downloads", "FileWatching", "LibGit2", "Libdl", "Logging", "Markdown", "Printf", "Random", "SHA", "TOML", "Tar", "UUIDs", "p7zip_jll"]
 uuid = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
-version = "1.12.0"
+version = "1.12.1"
 weakdeps = ["REPL"]
 
     [deps.Pkg.extensions]
@@ -4283,9 +4771,9 @@ weakdeps = ["REPL"]
 
 [[deps.PlotlyBase]]
 deps = ["ColorSchemes", "Colors", "Dates", "DelimitedFiles", "DocStringExtensions", "JSON", "LaTeXStrings", "Logging", "Parameters", "Pkg", "REPL", "Requires", "Statistics", "UUIDs"]
-git-tree-sha1 = "28278bb0053da0fd73537be94afd1682cc5a0a83"
+git-tree-sha1 = "49c457ee4c9c6f5bdf2f6f1a69e66976aaecfcdb"
 uuid = "a03496cd-edff-5a9b-9e67-9cda94a718b5"
-version = "0.8.21"
+version = "0.8.22"
 
     [deps.PlotlyBase.extensions]
     DataFramesExt = "DataFrames"
@@ -4298,6 +4786,18 @@ version = "0.8.21"
     Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
     IJulia = "7073ff75-c697-5162-941a-fcdaad2a7d2a"
     JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+
+[[deps.PlutoHooks]]
+deps = ["InteractiveUtils", "Markdown", "UUIDs"]
+git-tree-sha1 = "844a829c8dc9fd0fe62eced22bc2d0dfd66a3f51"
+uuid = "0ff47ea0-7a50-410d-8455-4348d5de0774"
+version = "0.1.0"
+
+[[deps.PlutoLinks]]
+deps = ["FileWatching", "InteractiveUtils", "Markdown", "PlutoHooks", "Revise", "UUIDs"]
+git-tree-sha1 = "aea4eede5ab3ee188906d0cf3bbfa36eb543dccc"
+uuid = "0ff47ea0-7a50-410d-8455-4348d5de0420"
+version = "0.1.8"
 
 [[deps.PlutoPlotly]]
 deps = ["AbstractPlutoDingetjes", "Artifacts", "ColorSchemes", "Colors", "Dates", "Downloads", "HypertextLiteral", "InteractiveUtils", "LaTeXStrings", "Markdown", "Pkg", "PlotlyBase", "PrecompileTools", "Reexport", "ScopedValues", "Scratch", "TOML"]
@@ -4315,9 +4815,9 @@ version = "0.6.5"
 
 [[deps.PlutoUI]]
 deps = ["AbstractPlutoDingetjes", "Base64", "ColorTypes", "Dates", "Downloads", "FixedPointNumbers", "Hyperscript", "HypertextLiteral", "IOCapture", "InteractiveUtils", "JSON", "Logging", "MIMEs", "Markdown", "Random", "Reexport", "URIs", "UUIDs"]
-git-tree-sha1 = "3faff84e6f97a7f18e0dd24373daa229fd358db5"
+git-tree-sha1 = "db8a06ef983af758d285665a0398703eb5bc1d66"
 uuid = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
-version = "0.7.73"
+version = "0.7.75"
 
 [[deps.Polynomials]]
 deps = ["LinearAlgebra", "OrderedCollections", "RecipesBase", "Requires", "Setfield", "SparseArrays"]
@@ -4362,20 +4862,25 @@ version = "0.2.0"
 
 [[deps.PrettyTables]]
 deps = ["Crayons", "LaTeXStrings", "Markdown", "PrecompileTools", "Printf", "REPL", "Reexport", "StringManipulation", "Tables"]
-git-tree-sha1 = "6b8e2f0bae3f678811678065c09571c1619da219"
+git-tree-sha1 = "c5a07210bd060d6a8491b0ccdee2fa0235fc00bf"
 uuid = "08abe8d2-0d0c-5749-adfa-8a2ac140af0d"
-version = "3.1.0"
+version = "3.1.2"
 
 [[deps.Printf]]
 deps = ["Unicode"]
 uuid = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 version = "1.11.0"
 
+[[deps.Profile]]
+deps = ["StyledStrings"]
+uuid = "9abbd945-dff8-562f-b5e8-e1ebf5ef1b79"
+version = "1.11.0"
+
 [[deps.ProgressLogging]]
 deps = ["Logging", "SHA", "UUIDs"]
-git-tree-sha1 = "d95ed0324b0799843ac6f7a6a85e65fe4e5173f0"
+git-tree-sha1 = "f0803bc1171e455a04124affa9c21bba5ac4db32"
 uuid = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
-version = "0.1.5"
+version = "0.1.6"
 
 [[deps.PtrArrays]]
 git-tree-sha1 = "1d36ef11a9aaf1e8b74dacc6a731dd1de8fd493d"
@@ -4436,6 +4941,16 @@ deps = ["UUIDs"]
 git-tree-sha1 = "62389eeff14780bfe55195b7204c0d8738436d64"
 uuid = "ae029012-a4dd-5104-9daa-d747884805df"
 version = "1.3.1"
+
+[[deps.Revise]]
+deps = ["CodeTracking", "FileWatching", "InteractiveUtils", "JuliaInterpreter", "LibGit2", "LoweredCodeUtils", "OrderedCollections", "Preferences", "REPL", "UUIDs"]
+git-tree-sha1 = "d97d78d4fc5f858d8ce44f6b88bc972f2023f51d"
+uuid = "295af30f-e4ad-537b-8983-00126c2a3abe"
+version = "3.14.0"
+weakdeps = ["Distributed"]
+
+    [deps.Revise.extensions]
+    DistributedExt = "Distributed"
 
 [[deps.Rmath]]
 deps = ["Random", "Rmath_jll"]
@@ -4579,15 +5094,15 @@ weakdeps = ["SparseArrays"]
 
 [[deps.StatsAPI]]
 deps = ["LinearAlgebra"]
-git-tree-sha1 = "9d72a13a3f4dd3795a195ac5a44d7d6ff5f552ff"
+git-tree-sha1 = "178ed29fd5b2a2cfc3bd31c13375ae925623ff36"
 uuid = "82ae8749-77ed-4fe6-ae5f-f523153014b0"
-version = "1.7.1"
+version = "1.8.0"
 
 [[deps.StatsBase]]
 deps = ["AliasTables", "DataAPI", "DataStructures", "LinearAlgebra", "LogExpFunctions", "Missings", "Printf", "Random", "SortingAlgorithms", "SparseArrays", "Statistics", "StatsAPI"]
-git-tree-sha1 = "064b532283c97daae49e544bb9cb413c26511f8c"
+git-tree-sha1 = "be5733d4a2b03341bdcab91cea6caa7e31ced14b"
 uuid = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
-version = "0.34.8"
+version = "0.34.9"
 
 [[deps.StatsFuns]]
 deps = ["HypergeometricFunctions", "IrrationalConstants", "LogExpFunctions", "Reexport", "Rmath", "SpecialFunctions"]
@@ -4602,9 +5117,9 @@ weakdeps = ["ChainRulesCore", "InverseFunctions"]
 
 [[deps.StringManipulation]]
 deps = ["PrecompileTools"]
-git-tree-sha1 = "725421ae8e530ec29bcbdddbe91ff8053421d023"
+git-tree-sha1 = "a3c1536470bf8c5e02096ad4853606d7c8f62721"
 uuid = "892a3eda-7b42-436c-8928-eab12a02cf0e"
-version = "0.4.1"
+version = "0.4.2"
 
 [[deps.StructArrays]]
 deps = ["ConstructionBase", "DataAPI", "Tables"]
@@ -4772,12 +5287,6 @@ git-tree-sha1 = "434b3de333c75fc446aa0d19fc394edafd07ab08"
 uuid = "700de1a5-db45-46bc-99cf-38207098b444"
 version = "0.2.7"
 
-[[deps.cuDNN]]
-deps = ["CEnum", "CUDA", "CUDA_Runtime_Discovery", "CUDNN_jll"]
-git-tree-sha1 = "c1e756c5b075d06f19595ac0bc6388ab2973237a"
-uuid = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
-version = "1.4.6"
-
 [[deps.demumble_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
 git-tree-sha1 = "6498e3581023f8e530f34760d18f75a69e3a4ea8"
@@ -4801,27 +5310,39 @@ uuid = "1317d2d5-d96f-522e-a858-c73665f53c3e"
 version = "2022.0.0+1"
 
 [[deps.p7zip_jll]]
-deps = ["Artifacts", "Libdl"]
+deps = ["Artifacts", "CompilerSupportLibraries_jll", "Libdl"]
 uuid = "3f19e933-33d8-53b3-aaab-bd5110c3b7a0"
-version = "17.5.0+2"
+version = "17.7.0+0"
 """
 
 # ╔═╡ Cell order:
 # ╟─461f0505-2230-4b84-b6c6-1a9730808437
 # ╠═97ae4222-5a3e-4cbd-b4d1-aa028d3e4ca8
+# ╠═cc11647d-1c56-4ceb-9677-703aca03c9f4
 # ╠═d73472ff-9e09-45b0-8811-b7dd8d820358
+# ╠═76dbf599-a9b3-459f-992b-16ab2f7b74f1
+# ╠═4a95997e-5c12-4658-9b8e-a5065328e1c1
 # ╠═26fb86d5-c844-469a-aef5-ed3c2a9ba949
 # ╟─3983e7d0-9ad0-11f0-0a96-7d2d98772fd2
 # ╟─dc2cd512-9ad0-11f0-1dca-71ffa60b282a
 # ╟─a91e28fb-e769-418d-953f-0e0bb366d853
-# ╠═6db97fc1-8f11-42df-bffe-f86b8619a399
+# ╠═91a25156-e121-4d53-a5a1-422f1230d235
+# ╠═631e5584-c4c3-4320-9a2d-477b7945c684
+# ╠═96df0a0a-fd55-46b1-95af-067d02558380
+# ╠═8fefefd8-b63a-4be7-92e3-8ed7c3f88865
+# ╠═f49d0e70-57e6-44a0-8e46-4d801c4b3f85
+# ╠═065f859c-e7cf-4b42-bcc8-dfbf63104d26
+# ╠═17f60265-fac3-411c-b1dd-49b284d23597
+# ╠═10429267-5808-4840-8678-f9dbf5b453c5
 # ╟─29d41554-3a0a-4972-a9e5-54c998429acd
-# ╠═fc228dea-21fc-4fcd-82a9-7ac3bc7ee722
-# ╠═7c39a024-bf46-4024-b0da-a4d6092e864d
+# ╠═dc7e0a28-2739-44c2-9a44-c66079aaae17
 # ╠═139490d1-5931-4a18-9f74-c391064a3383
-# ╠═7c59cbf9-38d5-45fb-bf7d-9af8f241ccf6
 # ╟─ce690827-fa3f-48bc-bc09-1df5ee15f683
+# ╠═6affb3b3-9dc4-4bbc-a582-495fc1783a7a
 # ╠═a5302fa2-4f67-4ed6-96ce-dda78a160ffe
+# ╠═2df712f5-6969-4ceb-98c5-82415718b740
+# ╠═d86a890f-942f-4e3a-8405-709507450903
+# ╠═5a047afc-ec40-4541-ad50-0518beba3f2e
 # ╠═1121e34c-ca35-4f68-8283-eca514928654
 # ╟─ae96f920-5828-4c5f-b69f-48d8c4fee378
 # ╠═96aebf7d-2112-4a4d-9993-6f53f40ffca5
@@ -4831,7 +5352,6 @@ version = "17.5.0+2"
 # ╠═64430447-c267-4eec-8d38-63ccf91d82c4
 # ╠═5847ea08-43ca-4c6d-a694-0017d7396f60
 # ╠═4fb77fae-61bb-4484-b733-82e1d1002371
-# ╠═aeb16356-9cbb-4d07-9623-25df66e94378
 # ╟─747680b0-3469-426c-8b9e-4ab8ca04a6de
 # ╠═bf31f347-bc9a-4bf8-a086-99dba2f6fea0
 # ╠═190c8221-c5c7-48f9-b016-36c27fd4528c
@@ -4840,13 +5360,6 @@ version = "17.5.0+2"
 # ╠═0dd8d418-a664-4ecd-ac90-bab97861f9f0
 # ╟─facd01fe-b288-437f-96dd-a8a4d9afd8fe
 # ╠═06a8d9e2-495c-4a25-8c23-527ba1b8e089
-# ╠═4cc4fea4-2a3b-11ee-1341-d7fa7529b14a
-# ╠═e00065be-8bbc-41b2-b62b-3c8ad56a5bd8
-# ╟─a08bfd70-e464-4c5e-b1a3-860fa8cd438a
-# ╠═99e35014-80dc-49c6-939e-26fa0e2d7c6f
-# ╟─eac9b092-b778-4c32-a0c5-de2eb4aa1b83
-# ╠═81b79f2f-9567-40c3-964e-b5a4ee96a317
-# ╠═06134111-d442-4195-9c6a-43443babed8e
 # ╟─66bddc43-ca9f-43cd-85a3-d33b11a6c033
 # ╠═8684c192-d1b9-4821-a02e-2c7300af9b3c
 # ╠═e9efedc1-8287-4676-ba64-a4abc77da18d
@@ -4896,7 +5409,8 @@ version = "17.5.0+2"
 # ╟─ab3f0de4-3e7e-4d5f-aa1a-25fe24a52b38
 # ╠═f5e6cf15-1072-4037-9a96-91db93e730f0
 # ╠═d966211f-012e-45f2-b9ae-abf599666edf
-# ╠═97b37ee3-e87b-4942-9d9a-22cffc88ab9d
+# ╠═e29c0103-ab96-413f-a739-cd0f97ff3288
+# ╠═a636c206-8ded-4f13-b010-9a33dd99f80e
 # ╠═6d34151a-b539-4eda-995a-b7f873719a4c
 # ╠═4ec8578c-a202-4a3d-9425-60bf623a3a02
 # ╠═9b95b3b6-6c98-4c8b-abdc-bbc1410a0df1
@@ -4908,7 +5422,6 @@ version = "17.5.0+2"
 # ╠═361ead1b-3fe3-4ae2-b018-2c6904d0f889
 # ╠═6556c7c7-9934-49be-8f8a-423a0d16e57e
 # ╠═4e527961-5734-4294-9f3c-e2aa8314eef6
-# ╠═234d7462-e4bd-4a7c-9ed4-7160a6a9ffb9
 # ╠═26aafe3d-e783-4591-959d-910b9c050301
 # ╠═c5d5be4d-882e-4c34-ae8f-1a40aa4cf215
 # ╠═0f292b15-bc79-4424-b5ae-fded09eb16f0
@@ -4927,7 +5440,9 @@ version = "17.5.0+2"
 # ╠═c9f4b3e6-6691-4e7f-86c7-dcacdde924a5
 # ╟─0a2fb24a-3c7a-46ed-ad54-d35fb72f8031
 # ╠═1a8619c6-4c19-4f55-a968-d18a4f1016e7
-# ╠═cb409e47-7ece-4456-a15b-773631f372f2
+# ╠═80f77b52-84e0-4664-8aa0-3d79fded40de
+# ╠═6ba143e2-50df-441a-8f38-3ea8d9edd4d8
+# ╠═6f6de313-cd2c-4ed4-beca-7302c4bd7a91
 # ╟─63f7880d-9353-4857-b751-36b6f5f45d68
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
