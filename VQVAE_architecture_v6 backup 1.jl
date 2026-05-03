@@ -4,6 +4,18 @@
 using Markdown
 using InteractiveUtils
 
+# This Pluto notebook uses @bind for interactivity. When running this notebook outside of Pluto, the following 'mock version' of @bind gives bound variables a default value (instead of an error).
+macro bind(def, element)
+    #! format: off
+    return quote
+        local iv = try Base.loaded_modules[Base.PkgId(Base.UUID("6e696c72-6542-2067-7265-42206c756150"), "AbstractPlutoDingetjes")].Bonds.initial_value catch; b -> missing; end
+        local el = $(esc(element))
+        global $(esc(def)) = Core.applicable(Base.get, el) ? Base.get(el) : iv(el)
+        el
+    end
+    #! format: on
+end
+
 # ╔═╡ cc11647d-1c56-4ceb-9677-703aca03c9f4
 using Functors
 
@@ -246,46 +258,6 @@ function infer_dec_upstrides(enc_strides::AbstractVector{<:Integer}, n_dec_layer
     return vals
 end
 
-# ╔═╡ 8eb0be68-99e1-4df9-97bf-b29b99d8f759
-function auto_dec_upstrides_for_nt(nt::Int, latent_len::Int, d::Int;
-    dec_kernels::AbstractVector{<:Integer},
-    dec_filters::AbstractVector{<:Integer},
-    use_bn::Bool,
-    enc_strides::AbstractVector{<:Integer})
-    n_dec = length(dec_kernels)
-    base = infer_dec_upstrides(enc_strides, n_dec)
-
-    function outlen(strides::Vector{Int})
-        dec, _, _ = get_vq_conv_decoder(nt, d;
-            kernels=collect(dec_kernels), filters=collect(dec_filters),
-            upstrides=strides, use_bn=use_bn)
-        Flux.outputsize(dec.chain, (d,); padbatch=true)[1]
-    end
-
-    if outlen(base) == nt
-        return base
-    end
-
-    kmax = collect(Int, dec_kernels)
-    lo = max.(1, base .- 3)
-    hi = min.(kmax, base .+ 3)
-    best = copy(base)
-    best_err = abs(outlen(base) - nt)
-    ranges = [lo[i]:hi[i] for i in 1:n_dec]
-    for cand in Iterators.product(ranges...)
-        s = collect(Int, cand)
-        any(s .> kmax) && continue
-        olen = outlen(s)
-        err = abs(olen - nt)
-        if err < best_err
-            best = s
-            best_err = err
-        end
-        err == 0 && return s
-    end
-    return best
-end
-
 # ╔═╡ a0000005-0000-0000-0000-000000000001
 md"## Conv Decoder"
 
@@ -331,6 +303,46 @@ function get_vq_conv_decoder(nt, d_in; kernels=[4, 8, 16], filters=[64, 48, 16, 
     return Conv1DChain(Chain(layers...)), bottleneck_len, bottleneck_channels
 end
 
+# ╔═╡ 8eb0be68-99e1-4df9-97bf-b29b99d8f759
+function auto_dec_upstrides_for_nt(nt::Int, latent_len::Int, d::Int;
+    dec_kernels::AbstractVector{<:Integer},
+    dec_filters::AbstractVector{<:Integer},
+    use_bn::Bool,
+    enc_strides::AbstractVector{<:Integer})
+    n_dec = length(dec_kernels)
+    base = infer_dec_upstrides(enc_strides, n_dec)
+
+    function outlen(strides::Vector{Int})
+        dec, _, _ = get_vq_conv_decoder(nt, d;
+            kernels=collect(dec_kernels), filters=collect(dec_filters),
+            upstrides=strides, use_bn=use_bn)
+        Flux.outputsize(dec.chain, (d,); padbatch=true)[1]
+    end
+
+    if outlen(base) == nt
+        return base
+    end
+
+    kmax = collect(Int, dec_kernels)
+    lo = max.(1, base .- 3)
+    hi = min.(kmax, base .+ 3)
+    best = copy(base)
+    best_err = abs(outlen(base) - nt)
+    ranges = [lo[i]:hi[i] for i in 1:n_dec]
+    for cand in Iterators.product(ranges...)
+        s = collect(Int, cand)
+        any(s .> kmax) && continue
+        olen = outlen(s)
+        err = abs(olen - nt)
+        if err < best_err
+            best = s
+            best_err = err
+        end
+        err == 0 && return s
+    end
+    return best
+end
+
 # ╔═╡ a0000006-0000-0000-0000-000000000001
 md"""## Vector Quantizer (EMA)
 
@@ -339,6 +351,78 @@ Core VQ layer with:
 - **Dead entry reset**: re-initializes unused codebook entries from encoder outputs
 - **Straight-through estimator**: gradients pass directly from z_q to z_e
 """
+
+# ╔═╡ ee76dd74-feaa-4422-a9a8-5931eb817c24
+"""Quantize without training updates (inference)."""
+    function quantize_inference(vq, z_e::AbstractMatrix{Float32})
+        return vq(z_e; training=false)
+    end
+
+# ╔═╡ 5fd449bf-d0d5-4944-8fc6-c0d47a0ed83f
+# ── VQ helper functions (separate for JIT specialization) ─────────────────────
+
+"""Compute squared-distance matrix between encoder outputs and codebook entries."""
+function vq_distances(embedding::AbstractMatrix{Float32}, z_e::AbstractMatrix{Float32})
+    z_sq = sum(abs2, z_e; dims=1)          # (1, N)
+    e_sq = sum(abs2, embedding; dims=1)    # (1, K)
+    return e_sq' .+ z_sq .- 2f0 .* (embedding' * z_e)  # (K, N)
+end
+
+# ╔═╡ 1f046042-0695-4a3d-a0ee-9ce4213c9b72
+"""Nearest-neighbour lookup: returns indices (GPU CuVector) and one-hot encodings."""
+function vq_lookup(vq, z_e::AbstractMatrix{Float32})
+    dist = vq_distances(vq.embedding, z_e)
+    indices_cart = dropdims(CUDA.argmin(dist; dims=1); dims=1)
+    indices = getindex.(indices_cart, 1)
+    encodings = Flux.onehotbatch(indices, 1:vq.K)
+    z_q = vq.embedding * encodings
+    return indices, encodings, z_q
+end
+
+# ╔═╡ 0a9a8028-2ba9-43d9-8b3d-8ada32ba314b
+"""In-place EMA codebook update. Returns counts_cpu for reuse in dead-reset."""
+function vq_ema_update!(vq, z_e::AbstractMatrix{Float32},
+                        encodings)
+    enc_sum_vec = vec(sum(encodings; dims=2))
+    vq.ema_cluster_size .= vq.decay .* vq.ema_cluster_size .+ (1f0 - vq.decay) .* enc_sum_vec
+    n = sum(vq.ema_cluster_size)
+    vq.ema_cluster_size .= (vq.ema_cluster_size .+ vq.epsilon) ./ (n .+ Float32(vq.K) .* vq.epsilon) .* n
+    dw = z_e * encodings'
+    vq.ema_dw .= vq.decay .* vq.ema_dw .+ (1f0 - vq.decay) .* dw
+    vq.embedding .= vq.ema_dw ./ reshape(vq.ema_cluster_size, 1, :)
+    return cpu(enc_sum_vec)   # tiny K-vector, needed for dead tracking
+end
+
+# ╔═╡ b70d1b6c-2e5e-4548-9629-ea69011a2585
+"""Reset dead codebook entries to perturbed donor encoder outputs (all GPU ops)."""
+function vq_dead_reset!(vq, z_e,
+                        counts_cpu)
+    N = size(z_e, 2)
+    dead_mask = counts_cpu .< 0.5f0
+    vq.dead_count .= ifelse.(dead_mask, vq.dead_count .+ 1, 0)
+    reset_mask = vq.dead_count .>= vq.dead_threshold
+    n_reset = sum(reset_mask)
+    n_reset == 0 && return nothing
+    reset_idxs = CuArray(Int32.(findall(reset_mask)))
+    donor_js   = CuArray(Int32.(rand(1:N, length(reset_idxs))))
+    donor_cols = z_e[:, donor_js] .+ CUDA.randn(Float32, size(z_e, 1), length(reset_idxs)) .* 0.01f0
+    vq.embedding[:, reset_idxs]      .= donor_cols
+    vq.ema_dw[:, reset_idxs]         .= donor_cols
+    vq.ema_cluster_size[reset_idxs]  .= 1f0
+    vq.dead_count[cpu(reset_idxs)]   .= 0
+    return nothing
+end
+
+# ╔═╡ 802aa1db-04b1-4444-ab9a-d9c4aee17dd9
+"""Compute perplexity and entropy from per-entry probabilities."""
+function vq_metrics(z_e, z_q,
+                    avg_probs)
+    vq_loss_val  = Flux.mse(z_e, z_q)
+    avg_safe     = clamp.(avg_probs, 1f-10, 1f0)
+    perplexity   = exp(-sum(avg_safe .* log.(avg_safe)))
+    entropy_loss = sum(avg_safe .* log.(avg_safe))
+    return vq_loss_val, perplexity, entropy_loss
+end
 
 # ╔═╡ 4cfb91c3-97e4-4006-9ec9-5eedd7de2849
 begin
@@ -635,79 +719,7 @@ begin
             pair_ids=ids)
     end
 
-
-end
-
-# ╔═╡ ee76dd74-feaa-4422-a9a8-5931eb817c24
-"""Quantize without training updates (inference)."""
-    function quantize_inference(vq, z_e::AbstractMatrix{Float32})
-        return vq(z_e; training=false)
-    end
-
-# ╔═╡ 5fd449bf-d0d5-4944-8fc6-c0d47a0ed83f
-# ── VQ helper functions (separate for JIT specialization) ─────────────────────
-
-"""Compute squared-distance matrix between encoder outputs and codebook entries."""
-function vq_distances(embedding::AbstractMatrix{Float32}, z_e::AbstractMatrix{Float32})
-    z_sq = sum(abs2, z_e; dims=1)          # (1, N)
-    e_sq = sum(abs2, embedding; dims=1)    # (1, K)
-    return e_sq' .+ z_sq .- 2f0 .* (embedding' * z_e)  # (K, N)
-end
-
-# ╔═╡ 1f046042-0695-4a3d-a0ee-9ce4213c9b72
-"""Nearest-neighbour lookup: returns indices (GPU CuVector) and one-hot encodings."""
-function vq_lookup(vq, z_e::AbstractMatrix{Float32})
-    dist = vq_distances(vq.embedding, z_e)
-    indices_cart = dropdims(CUDA.argmin(dist; dims=1); dims=1)
-    indices = getindex.(indices_cart, 1)
-    encodings = Flux.onehotbatch(indices, 1:vq.K)
-    z_q = vq.embedding * encodings
-    return indices, encodings, z_q
-end
-
-# ╔═╡ 0a9a8028-2ba9-43d9-8b3d-8ada32ba314b
-"""In-place EMA codebook update. Returns counts_cpu for reuse in dead-reset."""
-function vq_ema_update!(vq, z_e::AbstractMatrix{Float32},
-                        encodings)
-    enc_sum_vec = vec(sum(encodings; dims=2))
-    vq.ema_cluster_size .= vq.decay .* vq.ema_cluster_size .+ (1f0 - vq.decay) .* enc_sum_vec
-    n = sum(vq.ema_cluster_size)
-    vq.ema_cluster_size .= (vq.ema_cluster_size .+ vq.epsilon) ./ (n .+ Float32(vq.K) .* vq.epsilon) .* n
-    dw = z_e * encodings'
-    vq.ema_dw .= vq.decay .* vq.ema_dw .+ (1f0 - vq.decay) .* dw
-    vq.embedding .= vq.ema_dw ./ reshape(vq.ema_cluster_size, 1, :)
-    return cpu(enc_sum_vec)   # tiny K-vector, needed for dead tracking
-end
-
-# ╔═╡ b70d1b6c-2e5e-4548-9629-ea69011a2585
-"""Reset dead codebook entries to perturbed donor encoder outputs (all GPU ops)."""
-function vq_dead_reset!(vq, z_e,
-                        counts_cpu)
-    N = size(z_e, 2)
-    dead_mask = counts_cpu .< 0.5f0
-    vq.dead_count .= ifelse.(dead_mask, vq.dead_count .+ 1, 0)
-    reset_mask = vq.dead_count .>= vq.dead_threshold
-    n_reset = sum(reset_mask)
-    n_reset == 0 && return nothing
-    reset_idxs = CuArray(Int32.(findall(reset_mask)))
-    donor_js   = CuArray(Int32.(rand(1:N, length(reset_idxs))))
-    donor_cols = z_e[:, donor_js] .+ CUDA.randn(Float32, size(z_e, 1), length(reset_idxs)) .* 0.01f0
-    vq.embedding[:, reset_idxs]      .= donor_cols
-    vq.ema_dw[:, reset_idxs]         .= donor_cols
-    vq.ema_cluster_size[reset_idxs]  .= 1f0
-    vq.dead_count[cpu(reset_idxs)]   .= 0
-    return nothing
-end
-
-# ╔═╡ 802aa1db-04b1-4444-ab9a-d9c4aee17dd9
-"""Compute perplexity and entropy from per-entry probabilities."""
-function vq_metrics(z_e, z_q,
-                    avg_probs)
-    vq_loss_val  = Flux.mse(z_e, z_q)
-    avg_safe     = clamp.(avg_probs, 1f-10, 1f0)
-    perplexity   = exp(-sum(avg_safe .* log.(avg_safe)))
-    entropy_loss = sum(avg_safe .* log.(avg_safe))
-    return vq_loss_val, perplexity, entropy_loss
+    
 end
 
 # ╔═╡ a0000008-0000-0000-0000-000000000001
@@ -782,7 +794,8 @@ begin
     Returns named tuple with reconstruction `xhat`, losses, codebook indices, etc.
     """
     function decode_from_latents(m, result)
-        xhat = m.decoder(result.z_q)
+        decoder_input = m.condition_dim == 0 ? result.z_q : vcat(result.z_q, result.condition)
+        xhat = m.decoder(decoder_input)
         return merge(result, (; xhat))
     end
 
@@ -925,7 +938,7 @@ end
 md"## Model Factory"
 
 # ╔═╡ a0000011-0000-0000-0000-000000000001
-# a0000012-0000-0000-0000-000000000001
+# ╔═╡ a0000012-0000-0000-0000-000000000001
 md"## Loss Functions"
 
 # ╔═╡ 76930390-49e1-45da-b654-7d1e65c856b1
@@ -1046,28 +1059,7 @@ function _set_diagonal_neg_inf!(scores::CuArray{Float32,2})
     return scores
 end
 
-function latent_index_embedding_dim(model, latent_index_space::Symbol)
-    if latent_index_space === :z_metric_flat
-        return model.d * model.latent_len
-    elseif latent_index_space === :z_e
-        return model.d
-    else
-        error("Unsupported latent_index_space=$(latent_index_space). Use :z_metric_flat or :z_e.")
-    end
-end
-
-function latent_index_embedding(enc, latent_index_space::Symbol)
-    if latent_index_space === :z_metric_flat
-        return enc.z_metric_flat
-    elseif latent_index_space === :z_e
-        return enc.z_e
-    else
-        error("Unsupported latent_index_space=$(latent_index_space). Use :z_metric_flat or :z_e.")
-    end
-end
-
-function rebuild_latent_index!(idx::LatentIndex, model, X, pair_ids; Mnn::Int=idx.Mnn,
-    batch_size::Int=256, latent_index_space::Symbol=:z_metric_flat)
+function rebuild_latent_index!(idx::LatentIndex, model, X, pair_ids; Mnn::Int=idx.Mnn, batch_size::Int=256)
     X_cpu = Float32.(cpu(flatten_batch(X)))
     pair_ids_cpu = Int.(pair_ids_to_cpu(pair_ids))
     T, N = size(X_cpu)
@@ -1075,13 +1067,13 @@ function rebuild_latent_index!(idx::LatentIndex, model, X, pair_ids; Mnn::Int=id
     Mnn >= 1 || error("Mnn must be >= 1, got $Mnn")
     batch_size >= 1 || error("batch_size must be >= 1, got $batch_size")
 
-    D = latent_index_embedding_dim(model, latent_index_space)
+    D = model.d
     embeddings_dev = CuArray{Float32}(undef, D, N)
     for start_idx in 1:batch_size:N
         cols = start_idx:min(start_idx + batch_size - 1, N)
         xb = xpu(X_cpu[:, cols])
         enc = encode(model, xb, pair_ids_cpu[cols]; beta_commit=0f0, training=false)
-        embeddings_dev[:, cols] .= latent_index_embedding(enc, latent_index_space)
+        embeddings_dev[:, cols] .= enc.z_e
     end
     _l2_normalize_columns!(embeddings_dev)
 
@@ -1174,7 +1166,6 @@ Base.@kwdef struct VQVAE_Training_Para
     envelope_floor::Float32 = 0.1f0
     index_refresh_every::Int = 1
     latent_index_batch_size::Int = 256
-    latent_index_space::Symbol = :z_metric_flat
 end
 
 function validate_Mnn_schedule(schedule::Vector{Tuple{Int,Int,Symbol}})
@@ -1421,14 +1412,12 @@ function update(model, loss_history, train_data, test_data,
            (phase.Mnn != last_index_Mnn || mod(phase.post_epoch - 1, training_para.index_refresh_every) == 0)
             rebuild_latent_index!(train_idx, model, train_x_cpu, train_data.pair_ids;
                 Mnn=phase.Mnn,
-                batch_size=training_para.latent_index_batch_size,
-                latent_index_space=training_para.latent_index_space)
+                batch_size=training_para.latent_index_batch_size)
             rebuild_latent_index!(test_idx, model, test_x_cpu, test_data.pair_ids;
                 Mnn=phase.Mnn,
-                batch_size=training_para.latent_index_batch_size,
-                latent_index_space=training_para.latent_index_space)
+                batch_size=training_para.latent_index_batch_size)
             last_index_Mnn = phase.Mnn
-            @info "Rebuilt latent index" epoch post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn aggregation=phase.aggregation latent_index_space=training_para.latent_index_space
+            @info "Rebuilt latent index" epoch post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn aggregation=phase.aggregation
         end
         train_loader = build_pairwise_batches(train_data, para, training_para; shuffle_pairs=false)
         monitor_train = first(train_loader)
@@ -1509,6 +1498,104 @@ function plot_neighbor_examples(X, idx::LatentIndex; nsamples::Int=5, nneighbors
         yaxis_title="Amplitude",
         margin=attr(l=60, r=20, t=50, b=50),
     ))
+end
+
+# ╔═╡ 8f8f3c1a-7c9a-4f3d-8e1f-2a1c1d2e9f5c
+"""
+    train_coarse_to_detail_classifier(coarse_codes, detail_codes; train_ratio=0.8, nepochs=100)
+
+Train a linear classifier to predict detail code trajectories from coarse codes.
+
+This is a simple mutual information proxy: if coarse and detail are disentangled,
+knowing coarse should not predict detail well (accuracy ≈ 50% for binary or baseline).
+If accuracy >> baseline, they are entangled.
+
+Arguments:
+- `coarse_codes::Vector`: coarse code indices (one per sample), e.g., from coarse_ac[1, :]
+- `detail_codes::Matrix`: detail trajectories (T_detail × n_samples)
+- `train_ratio`: fraction for training (default 0.8)
+- `nepochs`: number of training epochs (default 100)
+
+Returns:
+- `train_acc::Float32`: training accuracy on detail prediction
+- `test_acc::Float32`: test accuracy on detail prediction
+- `null_baseline::Float32`: accuracy of always guessing most common detail combo
+- `model`: trained Flux Dense layer
+"""
+function train_coarse_to_detail_classifier(coarse_codes::Vector, detail_codes::Matrix; 
+    train_ratio=0.8, nepochs=100)
+    
+    n_samples = length(coarse_codes)
+    @assert size(detail_codes, 2) == n_samples "Dimension mismatch: coarse_codes ($n_samples) vs detail_codes ($(size(detail_codes, 2)))"
+    
+    Kcoherent = maximum(coarse_codes)     # Coherent codebook size
+    T_detail = size(detail_codes, 1)      # Nuisance trajectory length
+    Knuisance = maximum(detail_codes)     # Nuisance codebook size
+    
+    # Convert detail trajectories into single class labels (combination index)
+    # Each detail trajectory (e.g., [5, 3]) becomes a unique index
+    if T_detail == 1
+        target = vec(detail_codes)
+        n_classes = Knuisance
+    else
+        target = zeros(Int32, n_samples)
+        combo_mult = cumprod(vcat(1, fill(Knuisance, T_detail-1)))
+        for j in 1:n_samples
+            target[j] = sum((detail_codes[:, j] .- 1) .* combo_mult) + 1  # 1-indexed
+        end
+        n_classes = Knuisance^T_detail
+    end
+    
+    # Null baseline: accuracy if always guessing most common detail combo
+    counts = zeros(Int, n_classes)
+    for j in 1:n_samples
+        counts[target[j]] += 1
+    end
+    null_baseline = Float32(maximum(counts) / n_samples)
+    
+    # One-hot encode coarse codes as features
+    X = Flux.onehotbatch(coarse_codes, 1:Kcoherent)  # (Kcoherent × n_samples)
+    y = Flux.onehotbatch(target, 1:n_classes)     # (n_classes × n_samples)
+    
+    # Random train/test split
+    perm = randperm(n_samples)
+    n_train = ceil(Int, train_ratio * n_samples)
+    train_idx = perm[1:n_train]
+    test_idx  = perm[n_train+1:end]
+    
+    X_train = X[:, train_idx] |> gpu
+    y_train = y[:, train_idx] |> gpu
+    X_test  = X[:, test_idx]  |> gpu
+    y_test  = y[:, test_idx]  |> gpu
+    
+    # Train linear classifier (single Dense layer)
+    model = Chain(
+        Dense(Kcoherent, n_classes, identity)
+    ) |> gpu
+    
+    opt = Adam(0.01f0)
+    opt_state = Optimisers.setup(opt, model)
+    
+    for epoch in 1:nepochs
+        g = Flux.gradient(model) do m
+            ŷ = m(X_train)
+            Flux.logitcrossentropy(ŷ, y_train)
+        end
+        Optimisers.update!(opt_state, model, g[1])
+    end
+    
+    # Compute accuracies
+    function compute_accuracy(X, y, m)
+        ŷ = m(X)
+        pred = vec(argmax(cpu(ŷ), dims=1)[1, :])
+        truth = vec(argmax(cpu(y), dims=1)[1, :])
+        return Float32(mean(pred .== truth))
+    end
+    
+    train_acc = compute_accuracy(X_train, y_train, model)
+    test_acc  = compute_accuracy(X_test, y_test, model)
+    
+    return (train_acc=train_acc, test_acc=test_acc, null_baseline=null_baseline, model=model)
 end
 
 # ╔═╡ a0000020-0000-0000-0000-000000000001
@@ -1914,7 +2001,7 @@ function get_vqvae(para)
             dead_threshold=para.dead_threshold)
     end
 
-    d_in_dec = para.d
+    d_in_dec = para.d + condition_dim
     dec_upstrides = auto_dec_upstrides_for_nt(para.nt, latent_len, d_in_dec;
         dec_kernels=para.dec_kernels, dec_filters=para.dec_filters,
         use_bn=para.use_bn, enc_strides=para.enc_strides)
@@ -1948,104 +2035,6 @@ function get_vqvae(para)
     )
 
     return model, loss_history
-end
-
-# ╔═╡ 8f8f3c1a-7c9a-4f3d-8e1f-2a1c1d2e9f5c
-"""
-    train_coarse_to_detail_classifier(coarse_codes, detail_codes; train_ratio=0.8, nepochs=100)
-
-Train a linear classifier to predict detail code trajectories from coarse codes.
-
-This is a simple mutual information proxy: if coarse and detail are disentangled,
-knowing coarse should not predict detail well (accuracy ≈ 50% for binary or baseline).
-If accuracy >> baseline, they are entangled.
-
-Arguments:
-- `coarse_codes::Vector`: coarse code indices (one per sample), e.g., from coarse_ac[1, :]
-- `detail_codes::Matrix`: detail trajectories (T_detail × n_samples)
-- `train_ratio`: fraction for training (default 0.8)
-- `nepochs`: number of training epochs (default 100)
-
-Returns:
-- `train_acc::Float32`: training accuracy on detail prediction
-- `test_acc::Float32`: test accuracy on detail prediction
-- `null_baseline::Float32`: accuracy of always guessing most common detail combo
-- `model`: trained Flux Dense layer
-"""
-function train_coarse_to_detail_classifier(coarse_codes::Vector, detail_codes::Matrix;
-    train_ratio=0.8, nepochs=100)
-
-    n_samples = length(coarse_codes)
-    @assert size(detail_codes, 2) == n_samples "Dimension mismatch: coarse_codes ($n_samples) vs detail_codes ($(size(detail_codes, 2)))"
-
-    Kcoherent = maximum(coarse_codes)     # Coherent codebook size
-    T_detail = size(detail_codes, 1)      # Nuisance trajectory length
-    Knuisance = maximum(detail_codes)     # Nuisance codebook size
-
-    # Convert detail trajectories into single class labels (combination index)
-    # Each detail trajectory (e.g., [5, 3]) becomes a unique index
-    if T_detail == 1
-        target = vec(detail_codes)
-        n_classes = Knuisance
-    else
-        target = zeros(Int32, n_samples)
-        combo_mult = cumprod(vcat(1, fill(Knuisance, T_detail-1)))
-        for j in 1:n_samples
-            target[j] = sum((detail_codes[:, j] .- 1) .* combo_mult) + 1  # 1-indexed
-        end
-        n_classes = Knuisance^T_detail
-    end
-
-    # Null baseline: accuracy if always guessing most common detail combo
-    counts = zeros(Int, n_classes)
-    for j in 1:n_samples
-        counts[target[j]] += 1
-    end
-    null_baseline = Float32(maximum(counts) / n_samples)
-
-    # One-hot encode coarse codes as features
-    X = Flux.onehotbatch(coarse_codes, 1:Kcoherent)  # (Kcoherent × n_samples)
-    y = Flux.onehotbatch(target, 1:n_classes)     # (n_classes × n_samples)
-
-    # Random train/test split
-    perm = randperm(n_samples)
-    n_train = ceil(Int, train_ratio * n_samples)
-    train_idx = perm[1:n_train]
-    test_idx  = perm[n_train+1:end]
-
-    X_train = X[:, train_idx] |> gpu
-    y_train = y[:, train_idx] |> gpu
-    X_test  = X[:, test_idx]  |> gpu
-    y_test  = y[:, test_idx]  |> gpu
-
-    # Train linear classifier (single Dense layer)
-    model = Chain(
-        Dense(Kcoherent, n_classes, identity)
-    ) |> gpu
-
-    opt = Adam(0.01f0)
-    opt_state = Optimisers.setup(opt, model)
-
-    for epoch in 1:nepochs
-        g = Flux.gradient(model) do m
-            ŷ = m(X_train)
-            Flux.logitcrossentropy(ŷ, y_train)
-        end
-        Optimisers.update!(opt_state, model, g[1])
-    end
-
-    # Compute accuracies
-    function compute_accuracy(X, y, m)
-        ŷ = m(X)
-        pred = vec(argmax(cpu(ŷ), dims=1)[1, :])
-        truth = vec(argmax(cpu(y), dims=1)[1, :])
-        return Float32(mean(pred .== truth))
-    end
-
-    train_acc = compute_accuracy(X_train, y_train, model)
-    test_acc  = compute_accuracy(X_test, y_test, model)
-
-    return (train_acc=train_acc, test_acc=test_acc, null_baseline=null_baseline, model=model)
 end
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
@@ -3767,6 +3756,7 @@ version = "17.7.0+0"
 # ╠═a0000009-0000-0000-0000-000000000001
 # ╟─a0000010-0000-0000-0000-000000000001
 # ╠═a0000011-0000-0000-0000-000000000001
+# ╟─a0000012-0000-0000-0000-000000000001
 # ╠═76930390-49e1-45da-b654-7d1e65c856b1
 # ╠═8646155e-376f-44e6-89df-c3092d350046
 # ╠═b4387329-5621-49ec-a01f-3fe0f686d399
@@ -3790,9 +3780,11 @@ version = "17.7.0+0"
 # ╠═faa3de6b-96eb-4aeb-b927-77d6771a1d0a
 # ╠═302a9921-c723-41d4-9d7a-234bf658a07e
 # ╠═b1c2d3e4-f5a6-7890-abcd-ef1234567890
+# ╠═a0000025-0000-0000-0000-000000000001
+# ╠═a0000026-0000-0000-0000-000000000001
+# ╠═a0000027-0000-0000-0000-000000000001
 # ╠═a0000028-0000-0000-0000-000000000001
 # ╠═a0000029-0000-0000-0000-000000000001
 # ╠═ce3070ae-405e-11f1-b1d1-cb34a215f45c
-# ╠═8f8f3c1a-7c9a-4f3d-8e1f-2a1c1d2e9f5c
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
