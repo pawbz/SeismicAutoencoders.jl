@@ -17,7 +17,7 @@ macro bind(def, element)
 end
 
 # ╔═╡ 7ebf7c4e-353d-4cfd-8094-c07343589e4e
-using PlutoUI, Printf, FFTW, DSP, LinearAlgebra
+using PlutoUI, Printf, FFTW, DSP, LinearAlgebra, Random
 
 # ╔═╡ a1b2c3d4-0001-0000-0000-000000000001
 using Peaks
@@ -69,27 +69,275 @@ Phase velocity mode: $(@bind phvel_mode Select(["none" => "None (group only)", "
 md"## Structs"
 
 # ╔═╡ b6d23222-ba2a-11f0-bcd7-8f110c4a4cd6
-# Data structures for MFT analysis
-"""
-    MFTResult
+begin
+	# Data structures for MFT analysis
+	"""
+	    MFTResult
+	
+	Structure to hold Multiple Filter Technique analysis results.
+	"""
+	struct MFTResult
+	    periods::Vector{Float64}                    # Analysis periods [s]
+	    frequencies::Vector{Float64}                # Analysis frequencies [Hz]
+	    group_velocities::Vector{Float64}           # Group velocities [km/s]
+	    phase_velocities::Vector{Float64}           # Phase velocities [km/s]
+	    phase_branch_numbers::Vector{Int}           # Candidate integer cycle counts N
+	    phase_velocity_branches::Matrix{Float64}    # Phase velocities [period, branch]
+	    measured_phases::Vector{Float64}            # Wrapped analytic phase at group arrival [rad]
+	    selected_phase_branches::Vector{Int}        # Selected integer cycle count N per period
+	    phase_suspect::Vector{Bool}                 # Smoothness flags for manual review
+	    u_predicted_from_phase::Vector{Float64}     # Group velocity implied by c(T)
+	    amplitudes::Vector{Float64}                 # Spectral amplitudes
+	    filtered_traces::AbstractMatrix{<:Real}     # Filtered time series [time, frequency]; empty for picks-only runs
+	    envelopes::AbstractMatrix{<:Real}           # Amplitude envelopes [time, frequency]; empty for picks-only runs
+	    arrival_times::Vector{Float64}              # Group arrival times [s]
+	    distance::Float64                           # Source-receiver distance [km]
+	    quality_factors::Vector{Float64}  # Quality assessment for each measurement
+		all_peaks::Vector{Vector{Tuple{Float64,Float64}}}  # Up to 4 strongest envelope peaks per period: (time, amplitude)
+		time::Vector{Float64 }
+	    storage_mode::Symbol
+	end
+	
+	mft_has_full_storage(res::MFTResult) =
+	    res.storage_mode == :full && !isempty(res.filtered_traces) && !isempty(res.envelopes)
+end
 
-Structure to hold Multiple Filter Technique analysis results.
-"""
-struct MFTResult
-    periods::Vector{Float64}                    # Analysis periods [s]
-    frequencies::Vector{Float64}                # Analysis frequencies [Hz]
-    group_velocities::Vector{Float64}           # Group velocities [km/s]
-    phase_velocities::Vector{Float64}           # Phase velocities [km/s]
-    phase_branch_numbers::Vector{Int}           # Relative phase-branch indices around the unwrapped branch
-    phase_velocity_branches::Matrix{Float64}    # Phase velocities [period, branch]
-    amplitudes::Vector{Float64}                 # Spectral amplitudes
-    filtered_traces::Matrix{Float64}            # Filtered time series [time, frequency]
-    envelopes::Matrix{Float64}                  # Amplitude envelopes [time, frequency]
-    arrival_times::Vector{Float64}              # Group arrival times [s]
-    distance::Float64                           # Source-receiver distance [km]
-    quality_factors::Vector{Float64}  # Quality assessment for each measurement
-	all_peaks::Vector{Vector{Tuple{Float64,Float64}}}  # Up to 4 strongest envelope peaks per period: (time, amplitude)
-	time::Vector{Float64 }
+# ╔═╡ 8134b82a-5817-11f1-9e07-07eb5ca6e1b3
+begin
+    DEFAULT_PHASE_BRANCH_NUMBERS = collect(-3:3)
+    function _fill_phase_velocity_branches!(phase_velocity_branches::AbstractMatrix{Float64}, frequencies::AbstractVector{Float64}, arrival_times::AbstractVector{Float64}, measured_phases::AbstractVector{Float64}, distance::Float64, phase_branch_numbers::AbstractVector{Int}, phvel_source_phase::Float64; phase_plausible_range::Tuple{Float64,Float64}=(0.5, 20.0))
+        fill!(phase_velocity_branches, NaN); c_min, c_max = phase_plausible_range
+        for i in eachindex(frequencies)
+            t_g = arrival_times[i]; phi = measured_phases[i]
+            (isfinite(t_g) && t_g > 0.0 && isfinite(phi)) || continue
+            omega = 2π * frequencies[i]
+            for (ib, branch) in enumerate(phase_branch_numbers)
+                denom = omega * t_g - phi - phvel_source_phase + 2π * branch
+                abs(denom) > 1e-6 || continue
+                c = omega * distance / denom
+                phase_velocity_branches[i, ib] = (c_min <= c <= c_max) ? c : NaN
+            end
+        end
+        return phase_velocity_branches
+    end
+    function _nearest_finite_branch(branch_values::AbstractVector{Float64}, target::Float64)
+        best_j = 0; best_score = Inf
+        for j in eachindex(branch_values)
+            c = branch_values[j]; isfinite(c) || continue
+            score = abs(c - target)
+            score < best_score && (best_score = score; best_j = j)
+        end
+        return best_j
+    end
+    function _nearest_anchor_branch(branch_values::AbstractVector{Float64}, target::Float64, phase_velocity_range::Tuple{Float64,Float64})
+        vmin, vmax = phase_velocity_range; best_j = 0; best_score = Inf
+        for j in eachindex(branch_values)
+            c = branch_values[j]; (isfinite(c) && vmin <= c <= vmax) || continue
+            score = abs(c - target)
+            score < best_score && (best_score = score; best_j = j)
+        end
+        return best_j == 0 ? _nearest_finite_branch(branch_values, target) : best_j
+    end
+    function compute_group_velocity_from_phase(periods::AbstractVector{Float64}, phase_velocities::AbstractVector{Float64})
+        u_pred = fill(NaN, length(periods))
+        valid = findall(i -> isfinite(periods[i]) && isfinite(phase_velocities[i]) && periods[i] > 0.0 && phase_velocities[i] > 0.0, eachindex(periods))
+        length(valid) >= 2 || return u_pred
+        sorted = valid[sortperm(periods[valid])]; n = length(sorted)
+        for (pos, i) in enumerate(sorted)
+            j1, j2 = pos == 1 ? (sorted[1], sorted[2]) : pos == n ? (sorted[n - 1], sorted[n]) : (sorted[pos - 1], sorted[pos + 1])
+            dT = periods[j2] - periods[j1]; abs(dT) > 0.0 || continue
+            dcdT = (phase_velocities[j2] - phase_velocities[j1]) / dT; c = phase_velocities[i]
+            denom = 1.0 + (periods[i] / c) * dcdT; abs(denom) > 1e-6 || continue
+            u_pred[i] = c / denom
+        end
+        return u_pred
+    end
+    compute_group_velocity_from_phase(res::MFTResult) = compute_group_velocity_from_phase(res.periods, res.phase_velocities)
+    function resolve_phase_velocity_cycles!(phase_velocities::Vector{Float64}, selected_phase_branches::Vector{Int}, phase_suspect::AbstractVector{Bool}, u_predicted_from_phase::Vector{Float64}, phase_velocity_branches::Matrix{Float64}, periods::Vector{Float64}, quality_factors::Vector{Float64}, phase_branch_numbers::Vector{Int}; min_anchor_quality::Float64=3.0, phase_anchor_velocity::Float64=3.3, phase_velocity_range::Tuple{Float64,Float64}=(2.5, 4.5), phase_smoothness_jump::Float64=0.05)
+        fill!(phase_velocities, NaN); fill!(selected_phase_branches, 0); fill!(phase_suspect, false); fill!(u_predicted_from_phase, NaN)
+        valid = findall(i -> any(isfinite, @view phase_velocity_branches[i, :]), eachindex(periods)); isempty(valid) && return phase_velocities
+        anchor_pool = [i for i in valid if isfinite(quality_factors[i]) && quality_factors[i] >= min_anchor_quality]; isempty(anchor_pool) && (anchor_pool = valid)
+        anchor = anchor_pool[argmax(periods[anchor_pool])]
+        anchor_branch_idx = _nearest_anchor_branch(@view(phase_velocity_branches[anchor, :]), phase_anchor_velocity, phase_velocity_range); anchor_branch_idx == 0 && return phase_velocities
+        phase_velocities[anchor] = phase_velocity_branches[anchor, anchor_branch_idx]; selected_phase_branches[anchor] = phase_branch_numbers[anchor_branch_idx]
+        sorted = valid[sortperm(periods[valid])]; anchor_pos = findfirst(==(anchor), sorted)
+        for pos in (anchor_pos - 1):-1:1
+            i = sorted[pos]; prev = sorted[pos + 1]; branch_idx = _nearest_finite_branch(@view(phase_velocity_branches[i, :]), phase_velocities[prev]); branch_idx == 0 && continue
+            phase_velocities[i] = phase_velocity_branches[i, branch_idx]; selected_phase_branches[i] = phase_branch_numbers[branch_idx]
+            phase_suspect[i] = abs(phase_velocities[i] - phase_velocities[prev]) / max(abs(phase_velocities[prev]), eps(Float64)) > phase_smoothness_jump
+        end
+        for pos in (anchor_pos + 1):length(sorted)
+            i = sorted[pos]; prev = sorted[pos - 1]; branch_idx = _nearest_finite_branch(@view(phase_velocity_branches[i, :]), phase_velocities[prev]); branch_idx == 0 && continue
+            phase_velocities[i] = phase_velocity_branches[i, branch_idx]; selected_phase_branches[i] = phase_branch_numbers[branch_idx]
+            phase_suspect[i] = abs(phase_velocities[i] - phase_velocities[prev]) / max(abs(phase_velocities[prev]), eps(Float64)) > phase_smoothness_jump
+        end
+        u_predicted_from_phase .= compute_group_velocity_from_phase(periods, phase_velocities); return phase_velocities
+    end
+    function finish_phase_velocity_picks!(phase_velocities::Vector{Float64}, phase_velocity_branches::Matrix{Float64}, measured_phases::Vector{Float64}, selected_phase_branches::Vector{Int}, phase_suspect::AbstractVector{Bool}, u_predicted_from_phase::Vector{Float64}, periods::Vector{Float64}, frequencies::Vector{Float64}, arrival_times::Vector{Float64}, distance::Float64, quality_factors::Vector{Float64}, phase_branch_numbers::Vector{Int}, phvel_source_phase::Float64; min_anchor_quality::Float64=3.0, phase_anchor_velocity::Float64=3.3, phase_velocity_range::Tuple{Float64,Float64}=(2.5, 4.5), phase_smoothness_jump::Float64=0.05, phase_plausible_range::Tuple{Float64,Float64}=(0.5, 20.0))
+        _fill_phase_velocity_branches!(phase_velocity_branches, frequencies, arrival_times, measured_phases, distance, phase_branch_numbers, phvel_source_phase; phase_plausible_range=phase_plausible_range)
+        return resolve_phase_velocity_cycles!(phase_velocities, selected_phase_branches, phase_suspect, u_predicted_from_phase, phase_velocity_branches, periods, quality_factors, phase_branch_numbers; min_anchor_quality=min_anchor_quality, phase_anchor_velocity=phase_anchor_velocity, phase_velocity_range=phase_velocity_range, phase_smoothness_jump=phase_smoothness_jump)
+    end
+    
+    function _interp_phase_velocity_prior(period::Float64, prior_periods, prior_velocities; fallback::Float64=3.3)
+        (isnothing(prior_periods) || isnothing(prior_velocities)) && return fallback
+        length(prior_periods) == length(prior_velocities) || return fallback
+        valid = findall(i -> isfinite(Float64(prior_periods[i])) &&
+                             isfinite(Float64(prior_velocities[i])) &&
+                             Float64(prior_periods[i]) > 0.0 &&
+                             Float64(prior_velocities[i]) > 0.0,
+                        eachindex(prior_periods))
+        isempty(valid) && return fallback
+        ps = Float64[prior_periods[i] for i in valid]
+        vs = Float64[prior_velocities[i] for i in valid]
+        order = sortperm(ps)
+        ps = ps[order]; vs = vs[order]
+        period <= ps[1] && return vs[1]
+        period >= ps[end] && return vs[end]
+        hi = searchsortedfirst(ps, period)
+        lo = hi - 1
+        w = (period - ps[lo]) / (ps[hi] - ps[lo])
+        return (1.0 - w) * vs[lo] + w * vs[hi]
+    end
+
+    function _accept_phtovel_velocity(c::Float64,
+                                      phase_velocity_range::Tuple{Float64,Float64},
+                                      phase_plausible_range::Tuple{Float64,Float64})
+        isfinite(c) || return false
+        phase_plausible_range[1] <= c <= phase_plausible_range[2] || return false
+        phase_velocity_range[1] <= c <= phase_velocity_range[2] || return false
+        return true
+    end
+
+    # pyaftan-style phase unwrapping using group-velocity-based prediction.
+    function _phtovel_unwrap_phase_to_velocity!(phase_velocities::Vector{Float64},
+                                                selected_phase_branches::Vector{Int},
+                                                phase_suspect::AbstractVector{Bool},
+                                                measured_phases::Vector{Float64},
+                                                periods::Vector{Float64},
+                                                frequencies::Vector{Float64},
+                                                arrival_times::Vector{Float64},
+                                                distance::Float64,
+                                                phvel_source_phase::Float64;
+                                                phase_anchor_velocity::Float64=3.3,
+                                                phase_velocity_range::Tuple{Float64,Float64}=(2.5, 4.5),
+                                                phase_smoothness_jump::Float64=0.05,
+                                                phase_plausible_range::Tuple{Float64,Float64}=(0.5, 20.0),
+                                                phtovel_prior_periods=nothing,
+                                                phtovel_prior_velocities=nothing)
+        fill!(phase_velocities, NaN)
+        fill!(selected_phase_branches, 0)
+        fill!(phase_suspect, false)
+        dist = Float64(distance)
+        
+        # Find valid periods with both group time and measured phase
+        valid = findall(i -> isfinite(periods[i]) && isfinite(arrival_times[i]) && isfinite(measured_phases[i]) && arrival_times[i] > 0.0 && periods[i] > 0.0, eachindex(periods))
+        isempty(valid) && return phase_velocities
+        
+        # Sort by period (ascending)
+        sorted = valid[sortperm(periods[valid])]
+        
+        # Start from longest period and unwrap downward.
+        idx_long = sorted[end]
+        t_g_long = arrival_times[idx_long]
+        phi_long = measured_phases[idx_long]
+        omega_long = 2π * frequencies[idx_long]
+        vpred_long = _interp_phase_velocity_prior(periods[idx_long],
+            phtovel_prior_periods, phtovel_prior_velocities;
+            fallback=phase_anchor_velocity)
+        phpred_long = omega_long * (t_g_long - dist / vpred_long)
+        k_long = round(Int, (phpred_long - phi_long) / (2π))
+        denom_long = t_g_long - (phi_long + 2π * k_long + phvel_source_phase) / omega_long
+        if abs(denom_long) <= 1e-6
+            phase_suspect[idx_long] = true
+            return phase_velocities
+        end
+        v_long = dist / denom_long
+        selected_phase_branches[idx_long] = k_long
+        if _accept_phtovel_velocity(v_long, phase_velocity_range, phase_plausible_range)
+            phase_velocities[idx_long] = v_long
+        else
+            phase_suspect[idx_long] = true
+            return phase_velocities
+        end
+        
+        # Propagate from longest to shortest period (descending index order)
+        for pos in (length(sorted) - 1):-1:1
+            idx_curr = sorted[pos]
+            idx_prev = sorted[pos + 1]
+            
+            t_g_curr = arrival_times[idx_curr]
+            t_g_prev = arrival_times[idx_prev]
+            phi_curr = measured_phases[idx_curr]
+            omega_curr = 2π * frequencies[idx_curr]
+            omega_prev = 2π * frequencies[idx_prev]
+            
+            v_prev = phase_velocities[idx_prev]
+            isfinite(v_prev) || (phase_suspect[idx_curr] = true; continue)
+            
+            # Group velocities from arrival times
+            u_curr = dist / t_g_curr
+            u_prev = dist / t_g_prev
+            
+            denom_pred = (1.0 / u_curr + 1.0 / u_prev) * (omega_curr - omega_prev) / 2.0 + omega_prev / v_prev
+            if abs(denom_pred) <= 1e-6
+                phase_suspect[idx_curr] = true
+                continue
+            end
+            vpred_curr = omega_curr / denom_pred
+            
+            # Unwrap phase using predicted velocity
+            phpred_curr = omega_curr * (t_g_curr - dist / vpred_curr)
+            k_curr = round(Int, (phpred_curr - phi_curr) / (2π))
+            
+            denom_curr = t_g_curr - (phi_curr + 2π * k_curr + phvel_source_phase) / omega_curr
+            if abs(denom_curr) <= 1e-6
+                phase_suspect[idx_curr] = true
+                continue
+            end
+            v_curr = dist / denom_curr
+            selected_phase_branches[idx_curr] = k_curr
+            jumpy = abs(v_curr - v_prev) / max(abs(v_prev), eps(Float64)) > phase_smoothness_jump
+            if _accept_phtovel_velocity(v_curr, phase_velocity_range, phase_plausible_range)
+                phase_velocities[idx_curr] = v_curr
+                phase_suspect[idx_curr] = jumpy
+            else
+                phase_suspect[idx_curr] = true
+            end
+        end
+        
+        return phase_velocities
+    end
+    
+    function finish_phase_velocity_picks_phtovel!(phase_velocities::Vector{Float64},
+                                                  measured_phases::Vector{Float64},
+                                                  selected_phase_branches::Vector{Int},
+                                                  phase_suspect::AbstractVector{Bool},
+                                                  u_predicted_from_phase::Vector{Float64},
+                                                  periods::Vector{Float64},
+                                                  frequencies::Vector{Float64},
+                                                  arrival_times::Vector{Float64},
+                                                  distance::Float64,
+                                                  phvel_source_phase::Float64;
+                                                  phase_anchor_velocity::Float64=3.3,
+                                                  phase_velocity_range::Tuple{Float64,Float64}=(2.5, 4.5),
+                                                  phase_smoothness_jump::Float64=0.05,
+                                                  phase_plausible_range::Tuple{Float64,Float64}=(0.5, 20.0),
+                                                  phtovel_prior_periods=nothing,
+                                                  phtovel_prior_velocities=nothing)
+        _phtovel_unwrap_phase_to_velocity!(phase_velocities, selected_phase_branches,
+                                           phase_suspect, measured_phases, periods,
+                                           frequencies, arrival_times, distance,
+                                           phvel_source_phase;
+                                           phase_anchor_velocity=phase_anchor_velocity,
+                                           phase_velocity_range=phase_velocity_range,
+                                           phase_smoothness_jump=phase_smoothness_jump,
+                                           phase_plausible_range=phase_plausible_range,
+                                           phtovel_prior_periods=phtovel_prior_periods,
+                                           phtovel_prior_velocities=phtovel_prior_velocities)
+        u_predicted_from_phase .= compute_group_velocity_from_phase(periods, phase_velocities)
+        
+        return phase_velocities
+    end
 end
 
 # ╔═╡ cee98fdd-f0d9-4ea8-9256-2492a649a512
@@ -119,11 +367,203 @@ Xsynthetic = SeismicTrace(xsynthetic, 1.0, 5.0 * 500)
 # ╔═╡ 72db9d05-2714-4e86-bf36-a0c8ee13c040
 md"## Core Functions"
 
+# ╔═╡ 0108ca10-2346-432a-bac8-a57e8c0b4e6b
+"""
+    perform_mft_analysis(trace::SeismicTrace, periods::Vector{Float64};
+                        velocity_range=(2.0, 6.0),
+                        bandwidth_factor=sqrt(2/25),
+                        zero_pad_factor=1,
+                        phvel_source_phase=0.0, compute_phase=true) -> MFTResult
+
+Perform Multiple Filter Technique analysis on a seismic trace.
+
+The Gaussian narrowband filter is controlled by a single fractional bandwidth,
+with the equivalent sacmft96 parameter given by
+
+    α = 2 / bandwidth_factor²
+
+so `bandwidth_factor ≈ 0.283` reproduces the previous `α = 25` default.
+
+# Arguments
+- `trace`            : Input seismic trace
+- `periods`          : Analysis periods [s]
+- `velocity_range`   : Expected group velocity range [km/s]
+- `bandwidth_factor` : Fractional Gaussian bandwidth relative to centre frequency
+- `zero_pad_factor`  : FFT zero-padding factor (1, 2, 4, 8). Improves frequency resolution
+                       of the Gaussian filtering while keeping picks on the original time window
+- `upsample_factor`  : Time-domain resampling factor used before envelope peak picking
+- `phvel_source_phase` : Source/CCF phase [rad] subtracted from the delay denominator
+- `phvel_correction`   : Deprecated alias for `phvel_source_phase`
+- `compute_phase`    : Compute phase velocity if true
+
+# Returns
+- `MFTResult`
+"""
+function perform_mft_analysis(data_in::AbstractVector{<:Real},
+                             dt_original::Real,
+                             distance::Real,
+                             periods::Vector{Float64};
+                             velocity_range::Tuple{Float64,Float64}=(2.0, 6.0),
+                             bandwidth_factor::Float64=sqrt(2.0 / 25.0),
+                             zero_pad_factor::Int=4,
+                             upsample_factor::Real=2.0,
+                             phvel_correction::Float64=0.0,
+                             phvel_source_phase::Float64=phvel_correction,
+                             compute_phase::Bool=true,
+                             use_phtovel::Bool=false,
+                             min_anchor_quality::Float64=3.0,
+                             phase_anchor_velocity::Float64=3.3,
+                             phase_velocity_range::Tuple{Float64,Float64}=(2.5, 4.5),
+                             phase_smoothness_jump::Float64=0.05,
+                             phase_plausible_range::Tuple{Float64,Float64}=(0.5, 20.0),
+                             phtovel_prior_periods=nothing,
+                             phtovel_prior_velocities=nothing,
+                             precision::Type{<:AbstractFloat}=Float32,
+                             storage_mode::Symbol=:picks_only)
+
+    if @isdefined(MFTFilterBank)
+        bank = MFTFilterBank(dt_original, length(data_in), periods;
+                             velocity_range=velocity_range,
+                             bandwidth_factor=bandwidth_factor,
+                             zero_pad_factor=zero_pad_factor,
+                             upsample_factor=upsample_factor,
+                             precision=precision,
+                             storage_mode=storage_mode,
+                             N_initial=1)
+        return only(perform_mft_analysis_batch!(
+            bank, reshape(data_in, :, 1), distance;
+            compute_phase=compute_phase,
+            use_phtovel=use_phtovel,
+            phvel_source_phase=phvel_source_phase,
+            min_anchor_quality=min_anchor_quality,
+            phase_anchor_velocity=phase_anchor_velocity,
+            phase_velocity_range=phase_velocity_range,
+            phase_smoothness_jump=phase_smoothness_jump,
+            phase_plausible_range=phase_plausible_range,
+            phtovel_prior_periods=phtovel_prior_periods,
+            phtovel_prior_velocities=phtovel_prior_velocities,
+        ))
+    end
+
+    upsample = Float64(upsample_factor)
+    upsample > 0.0 || throw(ArgumentError("upsample_factor must be positive"))
+
+    # Modest oversampling improves envelope peak localization without the 10× cost.
+    data_unpadded = upsample == 1.0 ? Float64.(data_in) : DSP.resample(Float64.(data_in), upsample)
+    dt            = Float64(dt_original) / upsample
+    dist          = Float64(distance)
+
+    if !(zero_pad_factor in (1, 2, 4, 8))
+        throw(ArgumentError("zero_pad_factor must be one of 1, 2, 4, 8"))
+    end
+
+    npts_original = length(data_unpadded)
+    npts_padded   = npts_original * zero_pad_factor
+    data = if zero_pad_factor == 1
+        data_unpadded
+    else
+        vcat(data_unpadded, zeros(Float64, npts_padded - npts_original))
+    end
+
+    nfreq       = length(periods)
+    frequencies = 1.0 ./ periods
+
+    # Output arrays
+    filtered_traces  = zeros(Float64, npts_original, nfreq)
+    envelopes        = zeros(Float64, npts_original, nfreq)
+    arrival_times    = fill(NaN,     nfreq)
+    group_velocities = fill(NaN,     nfreq)
+    phase_velocities = fill(NaN,     nfreq)
+    phase_branch_numbers = copy(DEFAULT_PHASE_BRANCH_NUMBERS)
+    phase_velocity_branches = fill(NaN, nfreq, length(phase_branch_numbers))
+    measured_phases  = fill(NaN,     nfreq)
+    selected_phase_branches = fill(0, nfreq)
+    phase_suspect    = falses(nfreq)
+    u_predicted_from_phase = fill(NaN, nfreq)
+    amplitudes       = zeros(Float64, nfreq)
+    quality_factors  = zeros(Float64, nfreq)
+    all_peaks        = [Tuple{Float64,Float64}[] for _ in 1:nfreq]
+    time             = collect(range(dt, step=dt, length=npts_original))
+
+    min_vel, max_vel = velocity_range
+
+    for (i, freq) in enumerate(frequencies)
+        # --- Complex analytic signal via one-sided Gaussian ---
+        z = narrow_band_filter_analytic(data, dt, freq, bandwidth_factor)[1:npts_original]
+        filtered_traces[:, i] = real.(z)
+
+        # Envelope = modulus of analytic signal
+        envelope = abs.(z)
+        envelopes[:, i] = envelope
+
+        # Velocity-bounded search window
+        t_min = dist / max_vel
+        t_max = dist / min_vel
+        search_window = (t_min, t_max)
+
+        # Up to four strongest peaks in the search window; keep the strongest
+        # one as the canonical group-velocity pick for backward compatibility.
+        peaks = find_group_arrivals(envelope, time, search_window; max_peaks=4)
+        all_peaks[i] = peaks
+        t_group, amp_peak = isempty(peaks) ? (NaN, 0.0) : first(peaks)
+        arrival_times[i] = t_group
+
+        if !isnan(t_group) && t_group > 0.0
+            group_velocities[i] = dist / t_group
+        end
+
+        amplitudes[i] = isnan(t_group) ? maximum(envelope) : amp_peak
+
+        # Quality factor: peak / mean (SNR proxy, same as sacmft96)
+        mean_env = mean(envelope)
+        quality_factors[i] = mean_env > 0.0 ? amplitudes[i] / mean_env : 0.0
+
+        # Collect wrapped analytic phase at group arrival for candidate branches.
+        if compute_phase && !isnan(t_group) && t_group > 0.0
+            i_g = clamp(round(Int, (t_group - time[1]) / dt) + 1, 1, npts_original)
+            measured_phases[i] = angle(z[i_g])
+        end
+    end
+
+    if compute_phase
+        finish_phase_velocity_picks!(phase_velocities, phase_velocity_branches,
+                                     measured_phases, selected_phase_branches,
+                                     phase_suspect, u_predicted_from_phase,
+                                     periods, frequencies, arrival_times, dist,
+                                     quality_factors, phase_branch_numbers,
+                                     phvel_source_phase;
+                                     min_anchor_quality=min_anchor_quality,
+                                     phase_anchor_velocity=phase_anchor_velocity,
+                                     phase_velocity_range=phase_velocity_range,
+                                     phase_smoothness_jump=phase_smoothness_jump,
+                                     phase_plausible_range=phase_plausible_range)
+    end
+
+    return MFTResult(periods, frequencies, group_velocities, phase_velocities,
+                     phase_branch_numbers, phase_velocity_branches,
+                     measured_phases, selected_phase_branches, phase_suspect,
+                     u_predicted_from_phase,
+                     amplitudes, filtered_traces, envelopes, arrival_times,
+                     dist, quality_factors, all_peaks, time, :full)
+end
+
+# ╔═╡ 153fc403-0279-4c85-ba06-339f4ee4003e
+function perform_mft_analysis(trace::SeismicTrace, periods::Vector{Float64}; kwargs...)
+    return perform_mft_analysis(trace.data, trace.dt, trace.distance, periods; kwargs...)
+end
+
 # ╔═╡ fcf48627-0b80-4c6b-b204-f40da981aaa5
-function perform_mft_analysis(trace::SeismicTrace, period_range, n_periods; kwargs...)
-	period_min, period_max = Float64.(period_range)
-	periods_analysis = collect(exp10.(range(log10(period_min), log10(period_max), length=n_periods)))
-	return perform_mft_analysis(trace, periods_analysis; kwargs...)
+begin
+	function perform_mft_analysis(data::AbstractVector{<:Real}, dt::Real, distance::Real,
+	                              period_range, n_periods; kwargs...)
+		period_min, period_max = Float64.(period_range)
+		periods_analysis = collect(exp10.(range(log10(period_min), log10(period_max), length=n_periods)))
+		return perform_mft_analysis(data, dt, distance, periods_analysis; kwargs...)
+	end
+	
+	function perform_mft_analysis(trace::SeismicTrace, period_range, n_periods; kwargs...)
+	    return perform_mft_analysis(trace.data, trace.dt, trace.distance, period_range, n_periods; kwargs...)
+	end
 end
 
 # ╔═╡ d5ca213a-b085-4d65-88fa-d221bf5826e1
@@ -231,16 +671,14 @@ end
 # ╔═╡ e9bfb21b-f29d-410f-827f-e66d1117020f
 """
     compute_phase_velocity(analytic_signal, time, t_group, freq, distance;
-                           phvel_correction=0.0) -> Float64
+                           phvel_source_phase=0.0, branch=0) -> Float64
 
 Estimate phase velocity from the instantaneous phase of the analytic signal at
-the group arrival time (single-frequency, n = 0 branch only).
+the group arrival time for one specified integer cycle branch.
 
-> **Note:** `perform_mft_analysis` uses cross-frequency phase unwrapping
-> (DSP.unwrap across the frequency axis) to resolve the 2πn branch ambiguity,
-> consistent with sacmft96.  This function is a single-point utility; call it
-> only when you already know the correct branch or when the distance is short
-> enough that n = 0 is guaranteed.
+> **Note:** `perform_mft_analysis` now evaluates explicit integer `N`
+> candidates and resolves the branch ambiguity with a smoothness pass. This
+> utility is for single-point checks when `branch` is already known.
 
 The total phase accumulated travelling distance Δ at phase velocity c is:
 
@@ -248,11 +686,11 @@ The total phase accumulated travelling distance Δ at phase velocity c is:
 
 The instantaneous phase of the analytic signal at the group arrival:
 
-    φ(tᵍ) = angle( z(tᵍ) ) = 2π f₀ tᵍ − φ_total + φ_correction
+    φ(tᵍ) = angle( z(tᵍ) ) = 2π f₀ tᵍ − φ_total − φ_source + 2πN
 
 Rearranging (n = 0 branch):
 
-    c = 2π f₀ Δ / ( 2π f₀ tᵍ − φ(tᵍ) + φ_correction )
+    c = 2π f₀ Δ / ( 2π f₀ tᵍ − φ(tᵍ) − φ_source + 2πN )
 
 # Arguments
 - `analytic_signal`  : complex analytic signal from `narrow_band_filter_analytic`
@@ -260,11 +698,8 @@ Rearranging (n = 0 branch):
 - `t_group`          : group arrival time [s]
 - `freq`             : centre frequency f₀ [Hz]
 - `distance`         : source–receiver distance [km]
-- `phvel_correction` : additional phase shift [rad]
-                         0.0 – single station / two-station same great circle
-                               (sacmft96 dophvel = 2)
-                         π/4 – interstation ambient-noise cross-correlation
-                               (sacmft96 dophvel = 1)
+- `phvel_source_phase` : source/CCF phase shift [rad], subtracted from the denominator
+- `branch`             : integer cycle count N
 
 # Returns
 - Phase velocity [km/s], or `NaN` if undefined or implausible
@@ -274,7 +709,9 @@ function compute_phase_velocity(analytic_signal::AbstractVector{<:Complex},
                                 t_group::Float64,
                                 freq::Float64,
                                 distance::Float64;
-                                phvel_correction::Float64=0.0)
+                                phvel_correction::Float64=0.0,
+                                phvel_source_phase::Float64=phvel_correction,
+                                branch::Int=0)
     (isnan(t_group) || t_group <= 0.0) && return NaN
     dt_local = time[2] - time[1]
     i_g = clamp(round(Int, (t_group - time[1]) / dt_local) + 1, 1, length(time))
@@ -283,7 +720,7 @@ function compute_phase_velocity(analytic_signal::AbstractVector{<:Complex},
     phi_measured = angle(analytic_signal[i_g])
 
     omega = 2π * freq
-    denom = omega * t_group - phi_measured + phvel_correction
+    denom = omega * t_group - phi_measured - phvel_source_phase + 2π * branch
     abs(denom) < 1e-6 && return NaN
 
     c = omega * distance / denom
@@ -323,7 +760,7 @@ Peaks are returned as `(time, amplitude)` tuples sorted by descending amplitude.
 If no strict local maxima are found, the absolute maximum in the window is returned.
 Returns an empty vector when the window is empty.
 """
-function find_group_arrivals(envelope::AbstractVector{Float64}, time::AbstractVector{Float64},
+function find_group_arrivals(envelope::AbstractVector{<:Real}, time::AbstractVector{Float64},
                              search_window::Tuple{Float64,Float64};
                              max_peaks::Int=4)
     t_start, t_end = search_window
@@ -351,159 +788,6 @@ function find_group_arrivals(envelope::AbstractVector{Float64}, time::AbstractVe
     return peaks
 end
 
-# ╔═╡ 7088299d-e267-42e3-9c87-1a238332f0f4
-"""
-    perform_mft_analysis(trace::SeismicTrace, periods::Vector{Float64};
-                        velocity_range=(2.0, 6.0),
-                        bandwidth_factor=sqrt(2/25),
-                        zero_pad_factor=1,
-                        phvel_correction=0.0, compute_phase=true) -> MFTResult
-
-Perform Multiple Filter Technique analysis on a seismic trace.
-
-The Gaussian narrowband filter is controlled by a single fractional bandwidth,
-with the equivalent sacmft96 parameter given by
-
-    α = 2 / bandwidth_factor²
-
-so `bandwidth_factor ≈ 0.283` reproduces the previous `α = 25` default.
-
-# Arguments
-- `trace`            : Input seismic trace
-- `periods`          : Analysis periods [s]
-- `velocity_range`   : Expected group velocity range [km/s]
-- `bandwidth_factor` : Fractional Gaussian bandwidth relative to centre frequency
-- `zero_pad_factor`  : FFT zero-padding factor (1, 2, 4, 8). Improves frequency resolution
-                       of the Gaussian filtering while keeping picks on the original time window
-- `phvel_correction` : Additional phase [rad]: 0.0 = single-station, π/4 = noise CC
-- `compute_phase`    : Compute phase velocity if true
-
-# Returns
-- `MFTResult`
-"""
-function perform_mft_analysis(trace::SeismicTrace, periods::Vector{Float64};
-                             velocity_range::Tuple{Float64,Float64}=(2.0, 6.0),
-                             bandwidth_factor::Float64=sqrt(2.0 / 25.0),
-                             zero_pad_factor::Int=4,
-                             phvel_correction::Float64=0.0,
-                             compute_phase::Bool=true)
-
-    # 10× oversampling for better arrival-time and phase resolution
-    data_unpadded = DSP.resample(trace.data, 10.0)
-    dt            = trace.dt / 10.0
-
-    if !(zero_pad_factor in (1, 2, 4, 8))
-        throw(ArgumentError("zero_pad_factor must be one of 1, 2, 4, 8"))
-    end
-
-    npts_original = length(data_unpadded)
-    npts_padded   = npts_original * zero_pad_factor
-    data = if zero_pad_factor == 1
-        data_unpadded
-    else
-        vcat(data_unpadded, zeros(Float64, npts_padded - npts_original))
-    end
-
-    nfreq       = length(periods)
-    frequencies = 1.0 ./ periods
-
-    # Output arrays
-    filtered_traces  = zeros(Float64, npts_original, nfreq)
-    envelopes        = zeros(Float64, npts_original, nfreq)
-    arrival_times    = fill(NaN,     nfreq)
-    group_velocities = fill(NaN,     nfreq)
-    phase_velocities = fill(NaN,     nfreq)
-    phase_branch_numbers = collect(-3:3)
-    phase_velocity_branches = fill(NaN, nfreq, length(phase_branch_numbers))
-    amplitudes       = zeros(Float64, nfreq)
-    quality_factors  = zeros(Float64, nfreq)
-    raw_phases       = fill(NaN,     nfreq)   # wrapped φ(tᵍ) per frequency — unwrapped after loop
-    all_peaks        = [Tuple{Float64,Float64}[] for _ in 1:nfreq]
-    time             = collect(range(dt, step=dt, length=npts_original))
-
-    min_vel, max_vel = velocity_range
-
-    for (i, freq) in enumerate(frequencies)
-        # --- Complex analytic signal via one-sided Gaussian ---
-        z = narrow_band_filter_analytic(data, dt, freq, bandwidth_factor)[1:npts_original]
-        filtered_traces[:, i] = real.(z)
-
-        # Envelope = modulus of analytic signal
-        envelope = abs.(z)
-        envelopes[:, i] = envelope
-
-        # Velocity-bounded search window
-        t_min = trace.distance / max_vel
-        t_max = trace.distance / min_vel
-        search_window = (t_min, t_max)
-
-        # Up to four strongest peaks in the search window; keep the strongest
-        # one as the canonical group-velocity pick for backward compatibility.
-        peaks = find_group_arrivals(envelope, time, search_window; max_peaks=4)
-        all_peaks[i] = peaks
-        t_group, amp_peak = isempty(peaks) ? (NaN, 0.0) : first(peaks)
-        arrival_times[i] = t_group
-
-        if !isnan(t_group) && t_group > 0.0
-            group_velocities[i] = trace.distance / t_group
-        end
-
-        amplitudes[i] = isnan(t_group) ? maximum(envelope) : amp_peak
-
-        # Quality factor: peak / mean (SNR proxy, same as sacmft96)
-        mean_env = mean(envelope)
-        quality_factors[i] = mean_env > 0.0 ? amplitudes[i] / mean_env : 0.0
-
-        # Collect wrapped phase at group arrival for post-loop unwrapping
-        if compute_phase && !isnan(t_group) && t_group > 0.0
-            i_g = clamp(round(Int, (t_group - time[1]) / dt) + 1, 1, npts_original)
-            raw_phases[i] = angle(z[i_g])
-        end
-    end
-
-    # --- Phase velocity via cross-frequency phase unwrapping (sacmft96 method) ---
-    # sacmft96 resolves the 2πn branch ambiguity by treating the array
-    # [ω·tᵍ(f) − φ_wrapped(f) + correction] as a smooth function of frequency
-    # and unwrapping it across the frequency axis.  This is equivalent to tracking
-    # the phase dispersion curve continuously rather than picking each frequency
-    # independently (which would be stuck on the n=0 branch).
-    if compute_phase
-        valid = .!isnan.(raw_phases) .& .!isnan.(arrival_times) .& (arrival_times .> 0.0)
-        valid_idxs = findall(valid)
-        if length(valid_idxs) >= 2
-            omegas = 2π .* frequencies
-            # Match Fortran-style traversal: unwrap from low frequency to high frequency
-            # (equivalently long period to short period), independent of user period ordering.
-            order = sortperm(frequencies[valid_idxs])
-            valid_sorted = valid_idxs[order]
-            # Phase differences before unwrapping (each has a 2πn ambiguity)
-            phase_diffs_valid = [
-                omegas[i] * arrival_times[i] - raw_phases[i] + phvel_correction
-                for i in valid_sorted
-            ]
-            # DSP.unwrap removes jumps > π between consecutive entries,
-            # resolving the branch-number ambiguity continuously across frequency.
-            phase_diffs_unwrapped = DSP.unwrap(phase_diffs_valid)
-            for (j, i) in enumerate(valid_sorted)
-                denom0 = phase_diffs_unwrapped[j]
-                for (ib, branch) in enumerate(phase_branch_numbers)
-                    denom = denom0 + 2π * branch
-                    if abs(denom) > 1e-6
-                        c = omegas[i] * trace.distance / denom
-                        phase_velocity_branches[i, ib] = (0.5 ≤ c ≤ 20.0) ? c : NaN
-                    end
-                end
-                phase_velocities[i] = phase_velocity_branches[i, findfirst(==(0), phase_branch_numbers)]
-            end
-        end
-    end
-
-    return MFTResult(periods, frequencies, group_velocities, phase_velocities,
-                     phase_branch_numbers, phase_velocity_branches,
-                     amplitudes, filtered_traces, envelopes, arrival_times,
-                     trace.distance, quality_factors, all_peaks, time)
-end
-
 # ╔═╡ 74f5430a-8d8a-41cf-b683-52cc29bb12c0
 """
     find_group_arrival(envelope, time, search_window) -> (t_group, amplitude)
@@ -512,7 +796,7 @@ Return the strongest envelope peak in the search window. This preserves the
 original group-velocity pick behaviour while `find_group_arrivals` exposes the
 additional overtone candidates.
 """
-function find_group_arrival(envelope::Vector{Float64}, time::Vector{Float64},
+function find_group_arrival(envelope::AbstractVector{<:Real}, time::Vector{Float64},
                             search_window::Tuple{Float64,Float64})
     peaks = find_group_arrivals(envelope, time, search_window; max_peaks=1)
     isempty(peaks) && return (NaN, 0.0)
@@ -546,7 +830,7 @@ Features:
 - Proper axis labels and colorbar
 - Configurable sizing for journal figures
 """
-function plot_envelopes(res::MFTResult;
+function plot_envelopes(res;
                   colorscale="Reds",
                   width=800,
                   height=500,
@@ -557,6 +841,10 @@ function plot_envelopes(res::MFTResult;
                   show_branches=true,
                   pick_color="white",
                   pick_width=3)
+
+    mft_has_full_storage(res) ||
+        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0],
+            text=["Envelope storage unavailable for picks-only MFT result"]))
 
 	vsticks = range(1, stop=8, step=0.5)
 	tticks = res.distance ./ vsticks
@@ -1070,6 +1358,50 @@ end
 # ╔═╡ 7a64a743-db7b-405c-a334-793d2b8a36db
 plot(synthetic_test_data.t, synthetic_test_data.data)
 
+# ╔═╡ 1293cef0-186d-4a43-86f5-181372ef59e0
+log_period_bands = begin
+    Tmin, Tmax = 10.0, 40.0
+    exp10.(range(log10(Tmin), log10(Tmax), length=prefilter_nbands))
+end
+
+# ╔═╡ 7b8ea90d-a09d-4952-bd66-943808dc9d3b
+res_synthetic_test = let
+	# plot(synthetic_data)
+			
+	       
+
+	        # Apply multi-band pre-filter if enabled
+	        filtered_components = nothing
+	        D = if apply_prefilter_flag
+
+	            filtered_components = multiple_narrow_band_filters(synthetic_test_data.data, synthetic_test_data.dt, log_period_bands, prefilter_bw)
+	            @info "Applied multi-band pre-filter: T=$(log_period_bands) s, BW=$(prefilter_bw)%"
+				mean(filtered_components)
+			else
+				synthetic_test_data.data
+	        end
+
+	 # Create seismic trace
+	        trace = SeismicTrace(
+	            data=D,
+	            dt=synthetic_test_data.dt,
+	            distance=synthetic_test_data.distance
+	        )
+
+	
+	        # Perform MFT analysis
+	        periods_analysis = synthetic_test_data.periods
+	        (; res=perform_mft_analysis(
+	            trace,
+	            periods_analysis,
+	            velocity_range = (2.0 - 0.5, 5.0 + 0.5),
+                bandwidth_factor = synth_bandwidth / 100.0,
+                zero_pad_factor = synth_zero_pad_factor,
+	            compute_phase  = true,
+                storage_mode   = :full
+	        ), filtered_trace=trace, filtered_components=filtered_components)
+end
+
 # ╔═╡ 875e8a94-2a80-4ad9-8cc6-c48adaab8e4f
 # ╠═╡ disabled = true
 #=╠═╡
@@ -1182,10 +1514,164 @@ let
 end
   ╠═╡ =#
 
-# ╔═╡ 1293cef0-186d-4a43-86f5-181372ef59e0
-log_period_bands = begin
-    Tmin, Tmax = 10.0, 40.0
-    exp10.(range(log10(Tmin), log10(Tmax), length=prefilter_nbands))
+# ╔═╡ c169578d-3dd2-42f8-8e57-4146a8dca2cd
+plot_dispersion_curve(res_synthetic_test.res)
+
+# ╔═╡ 2ba1a355-d9fa-4268-b046-0b201191c11e
+plot_envelopes(res_synthetic_test.res)
+
+# ╔═╡ 44fad356-ff66-4bbc-a83b-5d8d996d95a5
+plot(res_synthetic_test.filtered_trace.data)
+
+# ╔═╡ 8dc0f4bc-00cb-11f1-9443-a59380edd23b
+let
+	# Show original vs pre-filtered data with individual components
+    if apply_prefilter_flag
+        trace_original = SeismicTrace(
+            data=synthetic_test_data.data,
+            dt=synthetic_test_data.dt,
+            distance=synthetic_test_data.distance
+        )
+        
+        central_periods = log_period_bands
+        
+        # Get filtered components and sum
+        filtered_trace = res_synthetic_test.filtered_trace
+        filtered_components = res_synthetic_test.filtered_components
+        
+        # Plot comparison
+        traces = [scatter()]
+        
+        # Original signal
+        push!(traces, scatter(
+            x = synthetic_test_data.t,
+            y = synthetic_test_data.data ./ maximum(abs.(synthetic_test_data.data)),
+            mode = "lines",
+            name = "Original",
+            line = attr(color = "lightgray", width = 1),
+            opacity = 0.3
+        ))
+        
+        # Individual filtered components
+        if !isnothing(filtered_components)
+            colors = ["blue", "green", "orange"]
+            for (i, (T, filt, color)) in enumerate(zip(central_periods, filtered_components, colors))
+                # Normalize for display
+                filt_norm = filt ./ maximum(abs.(filt)) .* 0.5
+                push!(traces, scatter(
+                    x = synthetic_test_data.t,
+                    y = filt_norm,
+                    mode = "lines",
+                    name = "T=$(T)s band",
+                    line = attr(color = color, width = 1.5, dash = "dot"),
+                    opacity = 0.6
+                ))
+            end
+        end
+        
+        # Summed filtered signal
+        push!(traces, scatter(
+            x = synthetic_test_data.t,
+            y = filtered_trace.data ./ maximum(abs.(filtered_trace.data)),
+            mode = "lines",
+            name = "Sum of 3 bands",
+            line = attr(color = "red", width = 2.5)
+        ))
+        
+        layout = Layout(
+            title = "Multi-band Pre-filtering: Individual Components + Sum",
+            xaxis = attr(title = "Time (s)"),
+            yaxis = attr(title = "Amplitude"),
+            width = 900,
+            height = 500,
+            plot_bgcolor = "white",
+            legend = attr(x = 0.02, y = 0.98)
+        )
+        
+        PlutoPlotly.plot(traces, layout)
+    else
+        md"**Pre-filter disabled.** Check the box above to enable."
+    end
+end
+
+# ╔═╡ 8dc0fc46-00cb-11f1-9407-453086ae541f
+let
+	if apply_prefilter_flag
+        # Compute FFT of original and filtered data
+        original_fft = fft(synthetic_test_data.data)
+        filtered_fft = fft(res_synthetic_test.filtered_trace.data)
+        
+        # Frequency vector
+        n = length(synthetic_test_data.data)
+        freqs = fftfreq(n, 1.0/synthetic_test_data.dt)
+        
+        # Only positive frequencies
+        pos_idx = freqs .> 0
+        freqs_pos = freqs[pos_idx]
+        
+        # Amplitude spectrum
+        amp_original = abs.(original_fft[pos_idx])
+        amp_filtered = abs.(filtered_fft[pos_idx])
+        
+        # Normalize
+        amp_original ./= maximum(amp_original)
+        amp_filtered ./= maximum(amp_filtered)
+        
+        traces_spec = [scatter()]
+        
+        push!(traces_spec, scatter(
+            x = freqs_pos,
+            y = amp_original,
+            mode = "lines",
+            name = "Original Spectrum",
+            line = attr(color = "gray", width = 2),
+            opacity = 0.5
+        ))
+        
+        push!(traces_spec, scatter(
+            x = freqs_pos,
+            y = amp_filtered,
+            mode = "lines",
+            name = "Filtered Spectrum (sum)",
+            line = attr(color = "red", width = 2.5)
+        ))
+        
+        # Mark center frequencies for all three periods
+        central_periods = log_period_bands
+        colors = ["blue", "green", "orange"]
+        for (T, color) in zip(central_periods, colors)
+            fc = 1.0 / T
+            push!(traces_spec, scatter(
+                x = [fc, fc],
+                y = [1e-4, 1],
+                mode = "lines",
+                name = "fc=$(round(fc, digits=3)) Hz (T=$(T)s)",
+                line = attr(color = color, width = 2, dash = "dash")
+            ))
+        end
+        
+        layout_spec = Layout(
+            title = "Frequency Domain: 3-Band Pre-filtering",
+            xaxis = attr(
+                title = "Frequency (Hz)",
+                range = [-2, log10(0.3)],
+                type = "log"
+            ),
+            yaxis = attr(
+                title = "Normalized Amplitude",
+                type = "log",
+                range = [-4, 0]
+            ),
+            width = 900,
+            height = 500,
+            plot_bgcolor = "white",
+            legend = attr(x = 0.65, y = 0.98, font=attr(size=10))
+        )
+        
+        PlutoPlotly.plot(traces_spec, layout_spec)
+    else
+        md"Enable pre-filter to see spectrum comparison."
+    end
 end
 
 # ╔═╡ 64882ed3-eea4-45a7-bf0f-6d0c1e14d5af
@@ -1235,6 +1721,54 @@ end
 
 # ╔═╡ 7fd65030-f541-4fd4-aea8-8ab6d9cc6d0e
 @bind run_synth_suite CounterButton("Run synthetic MFT suite")
+
+# ╔═╡ 78a3288f-6b85-4ed1-a399-b4528799f95a
+let
+    run_synth_suite
+
+    distances = [100.0, 250.0, 500.0, 1000.0]
+    noises = [0.0, 5.0, 10.0]
+    freqs = collect(0.02:0.01:0.30)
+    periods = inv.(freqs)
+
+    rows = String[]
+    push!(rows, "Synthetic MFT benchmark (group + phase errors)")
+    push!(rows, "dist[km] noise[%] g_mean[%] g_max[%] p_mean[%] p_max[%] n_g n_p")
+
+    for dist in distances
+        for noise in noises
+            dt = inv(2.0 * maximum(freqs))
+            t = collect(0:dt:300)
+
+            u, cg, cp, tg = multi_frequency_cosine_sum(
+                t, dist;
+                freqs=freqs,
+                c0=3.5,
+                α=1.0
+            )
+            data = u ./ maximum(abs, u) .+ noise / 100.0 * randn(length(u))
+            trace = SeismicTrace(data=data, dt=dt, distance=dist)
+
+            res_case = perform_mft_analysis(
+                trace,
+                periods;
+                velocity_range=(1.5, 6.5),
+                bandwidth_factor=synth_bandwidth / 100.0,
+                zero_pad_factor=synth_zero_pad_factor,
+                compute_phase=true
+            )
+
+            m = compute_velocity_error_metrics(res_case, periods, cg, cp)
+            push!(rows,
+                @sprintf("%7.1f %8.1f %8.2f %8.2f %8.2f %8.2f %4d %4d",
+                         dist, noise, m.group_mean, m.group_max,
+                         m.phase_mean, m.phase_max, m.n_group, m.n_phase)
+            )
+        end
+    end
+
+    print("```\n" * join(rows, "\n") * "\n```")
+end
 
 # ╔═╡ 871ae074-31c8-4b62-8a94-3aa018b1de87
 
@@ -1306,13 +1840,15 @@ function plot_phase_velocities(res::MFTResult;
 
     traces = [scatter()]
     branch_palette = ["#2c7bb6", "#00a6ca", "#00ccbc", "#d7191c", "#fdae61", "#abd9e9", "#7b3294"]
-    zero_idx = findfirst(==(0), res.phase_branch_numbers)
 
     for (ib, branch) in enumerate(res.phase_branch_numbers)
         valid_idx = findall(i -> !isnan(res.phase_velocity_branches[i, ib]), 1:length(res.periods))
         isempty(valid_idx) && continue
 
-        is_canonical = ib == zero_idx
+        is_canonical = any(i -> res.selected_phase_branches[i] == branch &&
+                                isfinite(res.phase_velocities[i]) &&
+                                res.phase_velocities[i] == res.phase_velocity_branches[i, ib],
+                           valid_idx)
         push!(traces, scatter(
             x = res.periods[valid_idx],
             y = res.phase_velocity_branches[valid_idx, ib],
@@ -1328,7 +1864,7 @@ function plot_phase_velocities(res::MFTResult;
                 width = is_canonical ? 3 : 1.5,
                 dash = is_canonical ? "solid" : (branch < 0 ? "dot" : "dash")
             ),
-            name = branch == 0 ? "Phase branch 0 (unwrapped)" : "Phase branch $(branch > 0 ? "+" : "")$(branch)",
+            name = branch == 0 ? "Phase N=0" : "Phase N=$(branch > 0 ? "+" : "")$(branch)",
             hovertemplate = "Period: %{x:.2f} s<br>Phase Vel: %{y:.3f} km/s<br>Branch: $(branch)<extra></extra>"
         ))
     end
@@ -1350,6 +1886,9 @@ function plot_phase_velocities(res::MFTResult;
 
     return PlutoPlotly.plot(traces, layout)
 end
+
+# ╔═╡ 9db0d269-d3ca-48fc-9583-91b5e11822d2
+WideCell(plot_phase_velocities(res_synthetic_test.res))
 
 # ╔═╡ 76f5c114-3cdb-11f1-917c-2b05ca51409f
 """
@@ -1576,197 +2115,6 @@ function extract_all_modes(res::MFTResult; distance::Float64=1.0, max_modes::Int
     return modes
 end
 
-# ╔═╡ 347f96a4-3cdc-11f1-9cee-ab8ff408ac98
-"""
-    BranchAnalysisResult
-
-Structure to hold MFT analysis results for both causal and acausal branches.
-
-Fields:
-- `causal_result::MFTResult` — MFT result from causal branch
-- `acausal_result::MFTResult` — MFT result from acausal branch
-- `causal_modes::Vector{MultimodalDispersion}` — Extracted modes from causal branch
-- `acausal_modes::Vector{MultimodalDispersion}` — Extracted modes from acausal branch
-- `branch_correlation::Vector{Float64}` — Zero-lag correlation at each period (causal vs acausal)
-- `periods::Vector{Float64}` — Analysis periods [s]
-- `distance::Float64` — Source-receiver distance [km]
-
-Enables comparison of dispersion curves between causal (positive time lags) and acausal (negative, time-reversed) 
-branches of ambient noise cross-correlations for validation and multimodal tracking.
-"""
-struct BranchAnalysisResult
-    causal_result::MFTResult
-    acausal_result::MFTResult
-    causal_modes::Vector{MultimodalDispersion}
-    acausal_modes::Vector{MultimodalDispersion}
-    branch_correlation::Vector{Float64}
-    periods::Vector{Float64}
-    distance::Float64
-end
-
-# ╔═╡ 347f9a3c-3cdc-11f1-8f82-9d9b48d7858b
-"""
-    zero_lag_correlation(filtered_traces_causal::Matrix{Float64}, filtered_traces_acausal::Matrix{Float64})
-
-Compute normalized zero-lag cross-correlation between causal and acausal filtered traces at each frequency.
-
-**Purpose:** Validates consistency between causal and acausal branches of ambient noise correlations.
-High correlation (>0.85) indicates reliable, physically consistent wave propagation across both branches.
-
-# Arguments
-- `filtered_traces_causal` : Filtered narrowband time series [time × frequency] from causal branch
-- `filtered_traces_acausal` : Filtered narrowband time series [time × frequency] from acausal branch
-
-# Returns
-- `Vector{Float64}` — Correlation coefficient [-1,1] at each frequency (period)
-"""
-function zero_lag_correlation(filtered_traces_causal::Matrix{Float64}, filtered_traces_acausal::Matrix{Float64})
-    nfreq = size(filtered_traces_causal, 2)
-    correlations = Float64[]
-    
-    for i in 1:nfreq
-        fc = filtered_traces_causal[:, i]
-        fa = filtered_traces_acausal[:, i]
-        
-        # Normalize
-        fc_norm = fc .- mean(fc)
-        fa_norm = fa .- mean(fa)
-        
-        # Compute correlation
-        numerator = sum(fc_norm .* fa_norm)
-        denominator = sqrt(sum(fc_norm.^2) * sum(fa_norm.^2))
-        
-        if denominator > 0
-            corr = numerator / denominator
-            push!(correlations, clamp(corr, -1.0, 1.0))  # Clamp to [-1, 1] range
-        else
-            push!(correlations, NaN)
-        end
-    end
-    
-    return correlations
-end
-
-# ╔═╡ 4c915e4e-3cdc-11f1-9235-33f20a13a658
-"""
-    plot_branch_correlation(result::BranchAnalysisResult;
-                           title="Causal-Acausal Envelope Correlation",
-                           width=900, height=500,
-                           font_family="Arial, sans-serif",
-                           font_size=14,
-                           correlation_threshold=0.85)
-
-Plot the zero-lag correlation between causal and acausal branches across periods.
-
-**Interpretation:**
-- Correlation > threshold (default 0.85): Consistent, reliable arrivals on both branches
-- Correlation < threshold: Possible mode/branch inconsistency; manually check
-- NaN: Unable to compute (e.g., zero-amplitude envelope)
-
-# Arguments
-- `result` : BranchAnalysisResult from analyze_causal_acausal_branches
-- `title` : Plot title
-- `width`, `height` : Plot dimensions
-- `correlation_threshold` : Horizontal threshold line to highlight acceptable correlations (default: 0.85)
-
-# Returns
-- PlutoPlotly plot object
-"""
-function plot_branch_correlation(result::BranchAnalysisResult;
-                                title="Causal-Acausal Correlation",
-                                width=900,
-                                height=500,
-                                font_family="Arial, sans-serif",
-                                font_size=14,
-                                correlation_threshold=0.85)
-    
-    # Filter out NaN values for plotting
-    valid_idx = findall(!isnan, result.branch_correlation)
-    
-    if isempty(valid_idx)
-        @warn "No valid correlation values found"
-        return PlutoPlotly.plot(scatter(x=[0], y=[0], text=["No correlation data"]))
-    end
-    
-    periods_valid = result.periods[valid_idx]
-    corr_valid = result.branch_correlation[valid_idx]
-    
-    # Color code by threshold
-    colors = [c >= correlation_threshold ? "green" : "orange" for c in corr_valid]
-    
-    traces = [
-        scatter(
-            x=periods_valid,
-            y=corr_valid,
-            mode="markers+lines",
-            marker=attr(size=10, color=colors, line=attr(color="darkgray", width=1)),
-            line=attr(color="lightgray", width=2),
-            name="Correlation",
-            hovertemplate="Period: %{x:.2f} s<br>Correlation: %{y:.3f}<extra></extra>"
-        ),
-        scatter(
-            x=[minimum(periods_valid), maximum(periods_valid)],
-            y=[correlation_threshold, correlation_threshold],
-            mode="lines",
-            line=attr(color="red", width=2, dash="dash"),
-            name="Threshold ($correlation_threshold)",
-            hoverinfo="skip"
-        )
-    ]
-    
-    layout = Layout(
-        title=attr(text=title, font=attr(size=font_size+2, family=font_family)),
-        xaxis=attr(title="Period (s)", type="linear", range=[minimum(result.periods), maximum(result.periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        yaxis=attr(title="Correlation Coefficient", range=[-0.1, 1.05], 
-                  showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        width=width, height=height,
-        plot_bgcolor="white", paper_bgcolor="white",
-        margin=attr(l=80, r=80, t=80, b=80),
-        showlegend=true,
-        legend=attr(x=0.02, y=0.98, font=attr(size=font_size-2),
-                   bgcolor="rgba(255,255,255,0.8)", borderwidth=1)
-    )
-    
-    return PlutoPlotly.plot(traces, layout)
-end
-
-# ╔═╡ 91b2f6bc-c0f9-4b84-a3d1-37ff6a4bf02d
-"""
-    _sample_scheme_colors(name::AbstractString, n::Int) -> Vector{String}
-
-Sample `n` colors from ColorSchemes.jl and return Plotly-compatible `"rgb(r,g,b)"` strings.
-Falls back to `viridis` when the requested scheme name is not found.
-"""
-function _sample_scheme_colors(name::AbstractString, n::Int)
-    if n <= 0
-        return String[]
-    end
-
-    candidates = (
-        Symbol(name),
-        Symbol(lowercase(name)),
-        Symbol(replace(name, " " => "_")),
-        Symbol(lowercase(replace(name, " " => "_"))),
-    )
-
-    cs = nothing
-    for key in candidates
-        if haskey(ColorSchemes.colorschemes, key)
-            cs = ColorSchemes.colorschemes[key]
-            break
-        end
-    end
-    cs === nothing && (cs = ColorSchemes.colorschemes[:viridis])
-
-    ts = n == 1 ? [0.5] : collect(range(0.0, 1.0, length=n))
-    return [
-        let c = get(cs, t)
-            "rgb($(round(Int, 255 * red(c))),$(round(Int, 255 * green(c))),$(round(Int, 255 * blue(c))))"
-        end
-        for t in ts
-    ]
-end
-
 # ╔═╡ 8cd3a49a-3cdb-11f1-bf54-4dd564d7b55a
 """
     plot_multipeak_dispersion(modes::Vector{MultimodalDispersion}; 
@@ -1926,6 +2274,168 @@ function plot_multipeak_dispersion(modes::Vector{MultimodalDispersion};
     return PlutoPlotly.plot(traces, layout)
 end
 
+# ╔═╡ 347f96a4-3cdc-11f1-9cee-ab8ff408ac98
+"""
+    BranchAnalysisResult
+
+Structure to hold MFT analysis results for both causal and acausal branches.
+
+Fields:
+- `causal_result::MFTResult` — MFT result from causal branch
+- `acausal_result::MFTResult` — MFT result from acausal branch
+- `causal_modes::Vector{MultimodalDispersion}` — Extracted modes from causal branch
+- `acausal_modes::Vector{MultimodalDispersion}` — Extracted modes from acausal branch
+- `branch_correlation::Vector{Float64}` — Zero-lag correlation at each period (causal vs acausal)
+- `periods::Vector{Float64}` — Analysis periods [s]
+- `distance::Float64` — Source-receiver distance [km]
+
+Enables comparison of dispersion curves between causal (positive time lags) and acausal (negative, time-reversed) 
+branches of ambient noise cross-correlations for validation and multimodal tracking.
+"""
+struct BranchAnalysisResult
+    causal_result::MFTResult
+    acausal_result::MFTResult
+    causal_modes::Vector{MultimodalDispersion}
+    acausal_modes::Vector{MultimodalDispersion}
+    branch_correlation::Vector{Float64}
+    periods::Vector{Float64}
+    distance::Float64
+end
+
+# ╔═╡ 347f9a3c-3cdc-11f1-8f82-9d9b48d7858b
+"""
+    zero_lag_correlation(filtered_traces_causal::Matrix{Float64}, filtered_traces_acausal::Matrix{Float64})
+
+Compute normalized zero-lag cross-correlation between causal and acausal filtered traces at each frequency.
+
+**Purpose:** Validates consistency between causal and acausal branches of ambient noise correlations.
+High correlation (>0.85) indicates reliable, physically consistent wave propagation across both branches.
+
+# Arguments
+- `filtered_traces_causal` : Filtered narrowband time series [time × frequency] from causal branch
+- `filtered_traces_acausal` : Filtered narrowband time series [time × frequency] from acausal branch
+
+# Returns
+- `Vector{Float64}` — Correlation coefficient [-1,1] at each frequency (period)
+"""
+function zero_lag_correlation(filtered_traces_causal::AbstractMatrix{<:Real},
+                              filtered_traces_acausal::AbstractMatrix{<:Real})
+    nfreq = size(filtered_traces_causal, 2)
+    correlations = Float64[]
+    
+    for i in 1:nfreq
+        fc = filtered_traces_causal[:, i]
+        fa = filtered_traces_acausal[:, i]
+        
+        # Normalize
+        fc_norm = fc .- mean(fc)
+        fa_norm = fa .- mean(fa)
+        
+        # Compute correlation
+        numerator = sum(fc_norm .* fa_norm)
+        denominator = sqrt(sum(fc_norm.^2) * sum(fa_norm.^2))
+        
+        if denominator > 0
+            corr = numerator / denominator
+            push!(correlations, clamp(corr, -1.0, 1.0))  # Clamp to [-1, 1] range
+        else
+            push!(correlations, NaN)
+        end
+    end
+    
+    return correlations
+end
+
+# ╔═╡ 347f9eb0-3cdc-11f1-a7ce-4d4b3258205b
+begin
+	"""
+	    analyze_causal_acausal_branches(w_c, w_ac, dt, dist, periods; ...)
+	        -> BranchAnalysisResult
+	
+	Array-first single-state branch analysis. A temporary `MFTFilterBank` is built
+	from the fixed `dt`, raw waveform length, and requested periods, then both
+	branches are processed together through the banked batch path.
+	"""
+	function analyze_causal_acausal_branches(w_c::AbstractVector{<:Real},
+	                                         w_ac::AbstractVector{<:Real},
+	                                         dt::Real,
+	                                         dist::Real,
+	                                         periods::Vector{Float64};
+	                                         velocity_range::Tuple{Float64,Float64}=(2.0, 6.0),
+	                                         bandwidth_factor::Float64=sqrt(2.0 / 25.0),
+	                                         zero_pad_factor::Int=4,
+	                                         upsample_factor::Real=2.0,
+	                                         precision::Type{<:AbstractFloat}=Float32,
+	                                         storage_mode::Symbol=:picks_only,
+	                                         kwargs...)
+	    bank = MFTFilterBank(Float64(dt), length(w_c), periods;
+	                         bandwidth_factor=bandwidth_factor,
+	                         zero_pad_factor=zero_pad_factor,
+	                         upsample_factor=upsample_factor,
+	                         velocity_range=velocity_range,
+	                         precision=precision,
+	                         storage_mode=storage_mode,
+	                         N_initial=2)
+	    return analyze_causal_acausal_branches(w_c, w_ac, Float64(dist), bank; kwargs...)
+	end
+	
+	"""
+	    analyze_causal_acausal_branches(W_c, W_ac, dt, dists, periods; ...)
+	        -> BranchBatchAnalysisResult
+	
+	Array-first N-D branch analysis. `W_c` and `W_ac` have shape
+	`(nt × trailing dims...)`; `dists` is scalar or has shape `trailing dims`.
+	All causal and acausal waveforms are processed in one banked batch.
+	"""
+	function analyze_causal_acausal_branches(W_c::AbstractArray{<:Real},
+	                                         W_ac::AbstractArray{<:Real},
+	                                         dt::Real,
+	                                         dists::Union{Real,AbstractArray{<:Real}},
+	                                         periods::Vector{Float64};
+	                                         velocity_range::Tuple{Float64,Float64}=(2.0, 6.0),
+	                                         bandwidth_factor::Float64=sqrt(2.0 / 25.0),
+	                                         zero_pad_factor::Int=4,
+	                                         upsample_factor::Real=2.0,
+	                                         precision::Type{<:AbstractFloat}=Float32,
+	                                         storage_mode::Symbol=:picks_only,
+	                                         kwargs...)
+	    ndims(W_c) >= 2 || throw(ArgumentError("W_c must have shape (nt × trailing dims...)"))
+	    bank = MFTFilterBank(Float64(dt), size(W_c, 1), periods;
+	                         bandwidth_factor=bandwidth_factor,
+	                         zero_pad_factor=zero_pad_factor,
+	                         upsample_factor=upsample_factor,
+	                         velocity_range=velocity_range,
+	                         precision=precision,
+	                         storage_mode=storage_mode,
+	                         N_initial=2 * prod(size(W_c)[2:end]))
+	    return analyze_causal_acausal_branches(W_c, W_ac, dists, bank; kwargs...)
+	end
+	
+	"""
+	    analyze_causal_acausal_branches(trace_causal::SeismicTrace, trace_acausal::SeismicTrace,
+	                                   periods::Vector{Float64}; max_modes=4,
+	                                   compute_correlation=true, kwargs...) -> BranchAnalysisResult
+	
+	Legacy compatibility wrapper. Prefer the array-first methods above.
+	"""
+	function analyze_causal_acausal_branches(trace_causal::SeismicTrace,
+	                                         trace_acausal::SeismicTrace,
+	                                         periods::Vector{Float64};
+	                                         max_modes::Int=4,
+	                                         compute_correlation::Bool=true,
+	                                         kwargs...)
+	    # Validate input
+	    @assert length(trace_causal.data) == length(trace_acausal.data) "Causal and acausal traces must have same length"
+	    @assert trace_causal.dt ≈ trace_acausal.dt "Causal and acausal traces must have same sampling interval"
+	    return analyze_causal_acausal_branches(trace_causal.data, trace_acausal.data,
+	                                           trace_causal.dt, trace_causal.distance,
+	                                           periods;
+	                                           max_modes=max_modes,
+	                                           compute_correlation=compute_correlation,
+	                                           kwargs...)
+	end
+end
+
 # ╔═╡ 4c914cc4-3cdc-11f1-9254-6500ce058f12
 """
     plot_branch_comparison(result::BranchAnalysisResult; 
@@ -2063,6 +2573,132 @@ function plot_branch_comparison(result::BranchAnalysisResult;
     return PlutoPlotly.plot(all_traces, layout)
 end
 
+# ╔═╡ 4c915e4e-3cdc-11f1-9235-33f20a13a658
+"""
+    plot_branch_correlation(result::BranchAnalysisResult;
+                           title="Causal-Acausal Envelope Correlation",
+                           width=900, height=500,
+                           font_family="Arial, sans-serif",
+                           font_size=14,
+                           correlation_threshold=0.85)
+
+Plot the zero-lag correlation between causal and acausal branches across periods.
+
+**Interpretation:**
+- Correlation > threshold (default 0.85): Consistent, reliable arrivals on both branches
+- Correlation < threshold: Possible mode/branch inconsistency; manually check
+- NaN: Unable to compute (e.g., zero-amplitude envelope)
+
+# Arguments
+- `result` : BranchAnalysisResult from analyze_causal_acausal_branches
+- `title` : Plot title
+- `width`, `height` : Plot dimensions
+- `correlation_threshold` : Horizontal threshold line to highlight acceptable correlations (default: 0.85)
+
+# Returns
+- PlutoPlotly plot object
+"""
+function plot_branch_correlation(result::BranchAnalysisResult;
+                                title="Causal-Acausal Correlation",
+                                width=900,
+                                height=500,
+                                font_family="Arial, sans-serif",
+                                font_size=14,
+                                correlation_threshold=0.85,
+                                wavelength_ref_velocity::Union{Nothing,Real}=nothing,
+                                wavelength_fraction::Union{Nothing,Real}=nothing)
+    
+    # Filter out NaN values for plotting
+    wavelength_idx = Set(_wavelength_valid_indices(result.periods, result.distance;
+                                                    wavelength_ref_velocity=wavelength_ref_velocity,
+                                                    wavelength_fraction=wavelength_fraction))
+    valid_idx = findall(ip -> !isnan(result.branch_correlation[ip]) && ip in wavelength_idx,
+                        eachindex(result.branch_correlation))
+    
+    if isempty(valid_idx)
+        @warn "No valid correlation values found"
+        return PlutoPlotly.plot(scatter(x=[0], y=[0], text=["No correlation data"]))
+    end
+    
+    periods_valid = result.periods[valid_idx]
+    corr_valid = result.branch_correlation[valid_idx]
+    
+    # Color code by threshold
+    colors = [c >= correlation_threshold ? "green" : "orange" for c in corr_valid]
+    
+    traces = [
+        scatter(
+            x=periods_valid,
+            y=corr_valid,
+            mode="markers+lines",
+            marker=attr(size=10, color=colors, line=attr(color="darkgray", width=1)),
+            line=attr(color="lightgray", width=2),
+            name="Correlation",
+            hovertemplate="Period: %{x:.2f} s<br>Correlation: %{y:.3f}<extra></extra>"
+        ),
+        scatter(
+            x=[minimum(periods_valid), maximum(periods_valid)],
+            y=[correlation_threshold, correlation_threshold],
+            mode="lines",
+            line=attr(color="red", width=2, dash="dash"),
+            name="Threshold ($correlation_threshold)",
+            hoverinfo="skip"
+        )
+    ]
+    
+    layout = Layout(
+        title=attr(text=title, font=attr(size=font_size+2, family=font_family)),
+        xaxis=attr(title="Period (s)", type="linear", range=[minimum(periods_valid), maximum(periods_valid)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        yaxis=attr(title="Correlation Coefficient", range=[-0.1, 1.05], 
+                  showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        width=width, height=height,
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=attr(l=80, r=80, t=80, b=80),
+        showlegend=true,
+        legend=attr(x=0.02, y=0.98, font=attr(size=font_size-2),
+                   bgcolor="rgba(255,255,255,0.8)", borderwidth=1)
+    )
+    
+    return PlutoPlotly.plot(traces, layout)
+end
+
+# ╔═╡ 91b2f6bc-c0f9-4b84-a3d1-37ff6a4bf02d
+"""
+    _sample_scheme_colors(name::AbstractString, n::Int) -> Vector{String}
+
+Sample `n` colors from ColorSchemes.jl and return Plotly-compatible `"rgb(r,g,b)"` strings.
+Falls back to `viridis` when the requested scheme name is not found.
+"""
+function _sample_scheme_colors(name::AbstractString, n::Int)
+    if n <= 0
+        return String[]
+    end
+
+    candidates = (
+        Symbol(name),
+        Symbol(lowercase(name)),
+        Symbol(replace(name, " " => "_")),
+        Symbol(lowercase(replace(name, " " => "_"))),
+    )
+
+    cs = nothing
+    for key in candidates
+        if haskey(ColorSchemes.colorschemes, key)
+            cs = ColorSchemes.colorschemes[key]
+            break
+        end
+    end
+    cs === nothing && (cs = ColorSchemes.colorschemes[:viridis])
+
+    ts = n == 1 ? [0.5] : collect(range(0.0, 1.0, length=n))
+    return [
+        let c = get(cs, t)
+            "rgb($(round(Int, 255 * red(c))),$(round(Int, 255 * green(c))),$(round(Int, 255 * blue(c))))"
+        end
+        for t in ts
+    ]
+end
+
 # ╔═╡ 60f8c1a1-5c76-4cda-a257-84bc5bf8c791
 """
     BranchBatchAnalysisResult
@@ -2080,6 +2716,390 @@ struct BranchBatchAnalysisResult
     branch_correlation::Matrix{Float64}
     periods::Vector{Float64}
     state_labels::Vector{String}
+end
+
+# ╔═╡ a2000001-0000-0000-0000-000000000001
+"""
+    PhaseRegressionObservation
+
+One pair/period phase observation for robust multi-pair phase-velocity fitting.
+`base_phase = omega * t_peak - phi_meas - phvel_source_phase`; the fitter adds
+`2pi * N` and fits the unwrapped phase against inter-station distance.
+"""
+struct PhaseRegressionObservation
+    pair_label::String
+    period::Float64
+    frequency::Float64
+    omega::Float64
+    distance::Float64
+    t_peak::Float64
+    phi_meas::Float64
+    base_phase::Float64
+    sigma_phi::Float64
+    quality::Float64
+    azimuth_deg::Float64
+end
+
+# ╔═╡ a2000002-0000-0000-0000-000000000001
+"""
+    PhaseVelocityPeriodFit
+
+Robust fit result for one period. `unwrapped_phase[i]` equals
+`base_phase + 2pi * cycle_number[i]` for the corresponding observation.
+"""
+struct PhaseVelocityPeriodFit
+    period::Float64
+    frequency::Float64
+    omega::Float64
+    phase_velocity::Float64
+    sigma_c::Float64
+    slope::Float64
+    sigma_slope::Float64
+    observations::Vector{PhaseRegressionObservation}
+    cycle_numbers::Vector{Int}
+    unwrapped_phase::Vector{Float64}
+    residuals::Vector{Float64}
+    inlier::Vector{Bool}
+    azimuth_outlier::Vector{Bool}
+    weights::Vector{Float64}
+    prior_c::Float64
+    ransac_score::Float64
+end
+
+# ╔═╡ a2000003-0000-0000-0000-000000000001
+struct PhaseVelocityCurveFit
+    periods::Vector{Float64}
+    phase_velocities::Vector{Float64}
+    sigma_c::Vector{Float64}
+    fits::Vector{PhaseVelocityPeriodFit}
+end
+
+# ╔═╡ a2000004-0000-0000-0000-000000000001
+begin
+    _wrap_pi(x::Real) = mod(Float64(x) + π, 2π) - π
+
+    function _circular_mean_pair(phi1::Real, phi2::Real, w1::Real, w2::Real)
+        z = Float64(w1) * cis(Float64(phi1)) + Float64(w2) * cis(Float64(phi2))
+        abs(z) <= eps(Float64) && return NaN
+        return angle(z)
+    end
+
+    function _sigma_phi_from_quality(quality::Real; floor::Float64=0.05, cap::Float64=π)
+        q = Float64(quality)
+        isfinite(q) && q > 0 || return cap
+        return clamp(1.0 / q, floor, cap)
+    end
+
+    function folded_path_azimuth_deg(lat1::Real, lon1::Real, lat2::Real, lon2::Real)
+        vals = Float64.((lat1, lon1, lat2, lon2))
+        all(isfinite, vals) || return NaN
+        φ1, φ2 = deg2rad(vals[1]), deg2rad(vals[3])
+        Δλ = deg2rad(vals[4] - vals[2])
+        y = sin(Δλ) * cos(φ2)
+        x = cos(φ1) * sin(φ2) - sin(φ1) * cos(φ2) * cos(Δλ)
+        az = mod(rad2deg(atan(y, x)), 360.0)
+        return az >= 180.0 ? az - 180.0 : az
+    end
+end
+
+# ╔═╡ a2000005-0000-0000-0000-000000000001
+function phase_regression_observations(branch_results_by_pair;
+        branch_policy::Symbol=:symmetric_average,
+        sigma_phi=nothing,
+        sigma_from_quality::Bool=true,
+        sigma_phi_floor::Float64=0.05,
+        sigma_phi_cap::Float64=π,
+        phvel_source_phase::Float64=π / 4,
+        pair_azimuths=Dict{String,Float64}(),
+        min_quality::Float64=0.0)
+    branch_policy == :symmetric_average ||
+        throw(ArgumentError("Only branch_policy=:symmetric_average is implemented"))
+
+    rows = PhaseRegressionObservation[]
+    for pair_key in sort(collect(keys(branch_results_by_pair)); by=string)
+        pair_label = String(pair_key)
+        result = branch_results_by_pair[pair_key]
+        result isa BranchAnalysisResult || continue
+        az = get(pair_azimuths, pair_label, NaN)
+        for ip in eachindex(result.periods)
+            c = result.causal_result
+            a = result.acausal_result
+            period = Float64(result.periods[ip])
+            freq = 1.0 / period
+            omega = 2π * freq
+            t_c, t_a = c.arrival_times[ip], a.arrival_times[ip]
+            phi_c, phi_a = c.measured_phases[ip], a.measured_phases[ip]
+            q_c, q_a = c.quality_factors[ip], a.quality_factors[ip]
+            all(isfinite, (period, t_c, t_a, phi_c, phi_a, q_c, q_a)) || continue
+            (period > 0.0 && t_c > 0.0 && t_a > 0.0 && q_c >= min_quality && q_a >= min_quality) || continue
+
+            wc = max(Float64(q_c), eps(Float64))
+            wa = max(Float64(q_a), eps(Float64))
+            t_peak = (wc * Float64(t_c) + wa * Float64(t_a)) / (wc + wa)
+            phi_meas = _circular_mean_pair(phi_c, phi_a, wc, wa)
+            isfinite(phi_meas) || continue
+            quality = 0.5 * (Float64(q_c) + Float64(q_a))
+            sigma = if !isnothing(sigma_phi)
+                sigma_phi isa Function ? Float64(sigma_phi(pair_label, period)) : Float64(sigma_phi)
+            elseif sigma_from_quality
+                _sigma_phi_from_quality(quality; floor=sigma_phi_floor, cap=sigma_phi_cap)
+            else
+                sigma_phi_cap
+            end
+            isfinite(sigma) && sigma > 0.0 || continue
+            base_phase = omega * t_peak - phi_meas - phvel_source_phase
+            push!(rows, PhaseRegressionObservation(
+                pair_label, period, freq, omega, Float64(result.distance),
+                t_peak, phi_meas, base_phase, sigma, quality, Float64(az)))
+        end
+    end
+    return rows
+end
+
+# ╔═╡ a2000006-0000-0000-0000-000000000001
+begin
+    function _phase_cycles_for_slope(obs::Vector{PhaseRegressionObservation}, slope::Float64)
+        [round(Int, (slope * o.distance - o.base_phase) / (2π)) for o in obs]
+    end
+
+    _phase_unwrapped(obs::Vector{PhaseRegressionObservation}, cycles::Vector{Int}) =
+        [obs[i].base_phase + 2π * cycles[i] for i in eachindex(obs)]
+
+    _phase_weights(obs::Vector{PhaseRegressionObservation}) =
+        [1.0 / max(o.sigma_phi^2, eps(Float64)) for o in obs]
+
+    function _weighted_origin_slope(distances, phases, weights)
+        den = sum(weights[i] * distances[i]^2 for i in eachindex(distances))
+        den > 0 || return NaN
+        return sum(weights[i] * distances[i] * phases[i] for i in eachindex(distances)) / den
+    end
+
+    function _robust_scale(xs)
+        vals = [abs(Float64(x)) for x in xs if isfinite(x)]
+        isempty(vals) && return NaN
+        med = median(vals)
+        mad = median(abs.(vals .- med))
+        return max(1.4826 * mad, median(vals), eps(Float64))
+    end
+
+    function _candidate_slopes(obs::Vector{PhaseRegressionObservation}, period::Float64;
+            velocity_range::Tuple{Float64,Float64},
+            cycle_range::UnitRange{Int},
+            prior_c::Union{Nothing,Real}=nothing,
+            prior_width_fraction::Float64=0.20,
+            max_candidates::Int=400)
+        vmin, vmax = velocity_range
+        omega = 2π / period
+        slopes = Float64[omega / vmax, omega / vmin]
+        if !isnothing(prior_c) && isfinite(Float64(prior_c)) && Float64(prior_c) > 0
+            cp = Float64(prior_c)
+            append!(slopes, omega ./ [cp, cp * (1 - prior_width_fraction), cp * (1 + prior_width_fraction)])
+        end
+        for o in obs
+            o.distance > 0 || continue
+            for n in cycle_range
+                phi = o.base_phase + 2π * n
+                phi > 0 || continue
+                slope = phi / o.distance
+                c = omega / slope
+                vmin <= c <= vmax && push!(slopes, slope)
+            end
+        end
+        slopes = sort(unique(round.(filter(isfinite, slopes); digits=10)))
+        if length(slopes) <= max_candidates
+            return slopes
+        end
+        step = max(1, floor(Int, length(slopes) / max_candidates))
+        return slopes[1:step:end][1:min(max_candidates, length(slopes[1:step:end]))]
+    end
+end
+
+# ╔═╡ a2000007-0000-0000-0000-000000000001
+function fit_phase_velocity_period(observations::AbstractVector{PhaseRegressionObservation},
+        period::Real;
+        prior_c::Union{Nothing,Real}=nothing,
+        velocity_range::Tuple{Float64,Float64}=(2.5, 4.5),
+        cycle_range::UnitRange{Int}=-80:80,
+        ransac_tolerance::Float64=2.5,
+        min_inliers::Int=4,
+        max_refit_iterations::Int=4,
+        phvel_source_phase::Float64=π / 4,
+        azimuth_rejection::Bool=true,
+        azimuth_bin_width::Float64=20.0,
+        azimuth_threshold::Float64=2.5,
+        prior_penalty::Float64=0.05)
+    obs = [o for o in observations if isfinite(o.period) && isapprox(o.period, Float64(period); rtol=1e-8, atol=1e-8)]
+    isempty(obs) && return PhaseVelocityPeriodFit(Float64(period), 1.0 / Float64(period), 2π / Float64(period),
+        NaN, NaN, NaN, NaN, PhaseRegressionObservation[], Int[], Float64[], Float64[], Bool[], Bool[], Float64[],
+        isnothing(prior_c) ? NaN : Float64(prior_c), -Inf)
+
+    omega = 2π / Float64(period)
+    weights = _phase_weights(obs)
+    distances = [o.distance for o in obs]
+    candidates = _candidate_slopes(obs, Float64(period);
+        velocity_range=velocity_range, cycle_range=cycle_range, prior_c=prior_c)
+
+    best = nothing
+    for slope0 in candidates
+        slope = slope0
+        cycles = _phase_cycles_for_slope(obs, slope)
+        phases = _phase_unwrapped(obs, cycles)
+        residuals = phases .- slope .* distances
+        inlier = [abs(residuals[i]) / obs[i].sigma_phi <= ransac_tolerance for i in eachindex(obs)]
+        for _ in 1:max_refit_iterations
+            count(inlier) >= 2 || break
+            inds = findall(inlier)
+            slope_new = _weighted_origin_slope(distances[inds], phases[inds], weights[inds])
+            isfinite(slope_new) || break
+            slope = slope_new
+            cycles = _phase_cycles_for_slope(obs, slope)
+            phases = _phase_unwrapped(obs, cycles)
+            residuals = phases .- slope .* distances
+            inlier = [abs(residuals[i]) / obs[i].sigma_phi <= ransac_tolerance for i in eachindex(obs)]
+        end
+        support = sum((weights[i] for i in eachindex(obs) if inlier[i]); init=0.0)
+        rss = sum((weights[i] * residuals[i]^2 for i in eachindex(obs) if inlier[i]); init=0.0)
+        prior_cost = if isnothing(prior_c) || !isfinite(Float64(prior_c))
+            0.0
+        else
+            c0 = omega / slope
+            prior_penalty * abs(c0 - Float64(prior_c)) / max(abs(Float64(prior_c)), eps(Float64))
+        end
+        score = support - rss - prior_cost
+        if isnothing(best) || score > best.score
+            best = (; score, slope, cycles, phases, residuals, inlier)
+        end
+    end
+
+    if isnothing(best)
+        best = (; score=-Inf, slope=NaN, cycles=zeros(Int, length(obs)),
+            phases=fill(NaN, length(obs)), residuals=fill(NaN, length(obs)),
+            inlier=falses(length(obs)))
+    end
+
+    azimuth_outlier = falses(length(obs))
+    inlier = copy(best.inlier)
+    slope = best.slope
+    cycles = copy(best.cycles)
+    phases = copy(best.phases)
+    residuals = copy(best.residuals)
+
+    if azimuth_rejection && count(inlier) >= min_inliers
+        finite_az = [i for i in eachindex(obs) if inlier[i] && isfinite(obs[i].azimuth_deg)]
+        if !isempty(finite_az)
+            scale = _robust_scale(residuals[finite_az] ./ [obs[i].sigma_phi for i in finite_az])
+            if isfinite(scale) && scale > 0
+                bins = Dict{Int,Vector{Int}}()
+                for i in finite_az
+                    b = floor(Int, obs[i].azimuth_deg / azimuth_bin_width)
+                    push!(get!(bins, b, Int[]), i)
+                end
+                for inds in values(bins)
+                    length(inds) < 2 && continue
+                    zmed = median(residuals[inds] ./ [obs[i].sigma_phi for i in inds])
+                    if abs(zmed) > azimuth_threshold * scale
+                        azimuth_outlier[inds] .= true
+                    end
+                end
+                inlier .&= .!azimuth_outlier
+                if count(inlier) >= 2
+                    inds = findall(inlier)
+                    slope = _weighted_origin_slope(distances[inds], phases[inds], weights[inds])
+                    cycles = _phase_cycles_for_slope(obs, slope)
+                    phases = _phase_unwrapped(obs, cycles)
+                    residuals = phases .- slope .* distances
+                    inlier = [inlier[i] && abs(residuals[i]) / obs[i].sigma_phi <= ransac_tolerance for i in eachindex(obs)]
+                end
+            end
+        end
+    end
+
+    n_in = count(inlier)
+    cfit = isfinite(slope) && slope > 0 ? omega / slope : NaN
+    if n_in >= max(min_inliers, 2) && isfinite(slope)
+        inds = findall(inlier)
+        den = sum(weights[i] * distances[i]^2 for i in inds)
+        dof = max(n_in - 1, 1)
+        wrss = sum(weights[i] * residuals[i]^2 for i in inds)
+        sigma_slope = den > 0 ? sqrt((wrss / dof) / den) : NaN
+        sigma_c = isfinite(cfit) && isfinite(sigma_slope) ? abs(omega / slope^2) * sigma_slope : NaN
+    else
+        sigma_slope = NaN
+        sigma_c = NaN
+        cfit = NaN
+    end
+
+    return PhaseVelocityPeriodFit(Float64(period), 1.0 / Float64(period), omega,
+        cfit, sigma_c, slope, sigma_slope, obs, cycles, phases, residuals,
+        collect(inlier), collect(azimuth_outlier), weights,
+        isnothing(prior_c) ? NaN : Float64(prior_c), best.score)
+end
+
+# ╔═╡ a2000008-0000-0000-0000-000000000001
+function fit_phase_velocity_curve(observations::AbstractVector{PhaseRegressionObservation};
+        period_order::Symbol=:descending,
+        warm_start::Bool=true,
+        kwargs...)
+    periods = sort(unique(o.period for o in observations), rev=(period_order == :descending))
+    fits = PhaseVelocityPeriodFit[]
+    prior = nothing
+    for period in periods
+        fit = fit_phase_velocity_period(observations, period; prior_c=warm_start ? prior : nothing, kwargs...)
+        push!(fits, fit)
+        if isfinite(fit.phase_velocity) && fit.phase_velocity > 0
+            prior = fit.phase_velocity
+        end
+    end
+    return PhaseVelocityCurveFit(
+        Float64[f.period for f in fits],
+        Float64[f.phase_velocity for f in fits],
+        Float64[f.sigma_c for f in fits],
+        fits,
+    )
+end
+
+# ╔═╡ a2000009-0000-0000-0000-000000000001
+function plot_phase_regression_fit(fit::PhaseVelocityPeriodFit;
+        width::Int=950,
+        height::Int=560,
+        title::String="Robust phase-velocity regression")
+    isempty(fit.observations) &&
+        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No phase observations"]))
+    xs = [o.distance for o in fit.observations]
+    status = [fit.inlier[i] ? "inlier" : fit.azimuth_outlier[i] ? "azimuth outlier" : "outlier"
+              for i in eachindex(fit.observations)]
+    colors = [fit.inlier[i] ? "royalblue" : fit.azimuth_outlier[i] ? "darkorange" : "crimson"
+              for i in eachindex(fit.observations)]
+    line_x = collect(range(minimum(xs), maximum(xs), length=100))
+    traces = AbstractTrace[
+        scatter(
+            x=xs,
+            y=fit.unwrapped_phase,
+            mode="markers",
+            name="observations",
+            marker=attr(size=10, color=colors),
+            text=[let az_label = isfinite(o.azimuth_deg) ? string(round(o.azimuth_deg; digits=1)) : "NA"
+                    "$(o.pair_label)<br>N=$(fit.cycle_numbers[i])<br>$(status[i])<br>res=$(round(fit.residuals[i]; digits=3)) rad<br>sigma_phi=$(round(o.sigma_phi; digits=3))<br>q=$(round(o.quality; digits=2))<br>az=$(az_label)"
+                  end for (i, o) in enumerate(fit.observations)],
+            hovertemplate="%{text}<br>d=%{x:.1f} km<br>Φ=%{y:.3f} rad<extra></extra>",
+        ),
+        scatter(
+            x=line_x,
+            y=fit.slope .* line_x,
+            mode="lines",
+            name="WLS fit c=$(isfinite(fit.phase_velocity) ? round(fit.phase_velocity; digits=3) : NaN) km/s",
+            line=attr(color="black", width=2.5),
+        ),
+    ]
+    return PlutoPlotly.plot(traces, Layout(
+        title=title,
+        xaxis=attr(title="Distance d (km)"),
+        yaxis=attr(title="Unwrapped phase Φ (rad)"),
+        width=width,
+        height=height,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    ))
 end
 
 # ╔═╡ 7f0eb497-46c0-4a43-95d5-39f6af0d783e
@@ -2108,27 +3128,25 @@ function analyze_causal_acausal_branches(traces_causal::AbstractVector{<:Seismic
     nstates = length(traces_causal)
     @assert nstates == length(traces_acausal) "Causal and acausal trace vectors must have the same number of source states"
     @assert nstates > 0 "At least one source state is required"
-
-    labels = if isnothing(state_labels)
-        ["State $(i)" for i in 1:nstates]
-    else
-        @assert length(state_labels) == nstates "state_labels length must match number of source states"
-        string.(state_labels)
-    end
-
-    state_results = BranchAnalysisResult[]
-    corr_matrix = fill(NaN, length(periods), nstates)
-
+    nt = length(traces_causal[1].data)
+    dt_ref = traces_causal[1].dt
+    W_c = Matrix{Float64}(undef, nt, nstates)
+    W_ac = Matrix{Float64}(undef, nt, nstates)
+    dists = Vector{Float64}(undef, nstates)
     for i in 1:nstates
-        st_res = analyze_causal_acausal_branches(traces_causal[i], traces_acausal[i], periods;
-                                                 max_modes=max_modes,
-                                                 compute_correlation=compute_correlation,
-                                                 kwargs...)
-        push!(state_results, st_res)
-        corr_matrix[:, i] = st_res.branch_correlation
+        @assert length(traces_causal[i].data) == nt "All causal traces must have the same length"
+        @assert length(traces_acausal[i].data) == nt "All acausal traces must have the same length"
+        @assert traces_causal[i].dt ≈ traces_acausal[i].dt "State $(i): causal and acausal dt must match"
+        @assert traces_causal[i].dt ≈ dt_ref "All source states must share the same dt"
+        W_c[:, i] .= traces_causal[i].data
+        W_ac[:, i] .= traces_acausal[i].data
+        dists[i] = traces_causal[i].distance
     end
-
-    return BranchBatchAnalysisResult(state_results, corr_matrix, periods, labels)
+    return analyze_causal_acausal_branches(W_c, W_ac, dt_ref, dists, periods;
+                                           state_labels=state_labels,
+                                           max_modes=max_modes,
+                                           compute_correlation=compute_correlation,
+                                           kwargs...)
 end
 
 # ╔═╡ 5da0af71-cfbc-4598-bf6f-cf38f8fce6fe
@@ -2152,17 +3170,25 @@ function plot_branch_correlation(result::BranchBatchAnalysisResult;
                                  font_size=14,
                                  correlation_threshold=0.85,
                                  reference_results::AbstractVector{<:BranchAnalysisResult}=BranchAnalysisResult[],
-                                 reference_labels::AbstractVector{<:AbstractString}=String[])
+                                 reference_labels::AbstractVector{<:AbstractString}=String[],
+                                 wavelength_ref_velocity::Union{Nothing,Real}=nothing,
+                                 wavelength_fraction::Union{Nothing,Real}=nothing)
     nstates = size(result.branch_correlation, 2)
     nstates == 0 && return PlutoPlotly.plot(scatter(x=[0], y=[0], text=["No source states"]))
 
     colors = _sample_scheme_colors(colorscale, max(nstates, 2))
     traces = [scatter()]
+    visible_periods = Float64[]
 
     for i in 1:nstates
+        st = result.state_results[i]
         corr_i = result.branch_correlation[:, i]
-        valid_idx = findall(!isnan, corr_i)
+        wavelength_idx = Set(_wavelength_valid_indices(result.periods, st.distance;
+                                                        wavelength_ref_velocity=wavelength_ref_velocity,
+                                                        wavelength_fraction=wavelength_fraction))
+        valid_idx = findall(ip -> !isnan(corr_i[ip]) && ip in wavelength_idx, eachindex(corr_i))
         isempty(valid_idx) && continue
+        append!(visible_periods, result.periods[valid_idx])
 
         push!(traces, scatter(
             x = result.periods[valid_idx],
@@ -2177,8 +3203,12 @@ function plot_branch_correlation(result::BranchBatchAnalysisResult;
 
     for (iref, ref) in enumerate(reference_results)
         corr_ref = ref.branch_correlation
-        valid_idx = findall(c -> !isnan(c), corr_ref)
+        wavelength_idx = Set(_wavelength_valid_indices(ref.periods, ref.distance;
+                                                        wavelength_ref_velocity=wavelength_ref_velocity,
+                                                        wavelength_fraction=wavelength_fraction))
+        valid_idx = findall(ip -> !isnan(corr_ref[ip]) && ip in wavelength_idx, eachindex(corr_ref))
         isempty(valid_idx) && continue
+        append!(visible_periods, ref.periods[valid_idx])
         ref_label = iref <= length(reference_labels) ? String(reference_labels[iref]) : "Global average"
         push!(traces, scatter(
             x = ref.periods[valid_idx],
@@ -2191,9 +3221,11 @@ function plot_branch_correlation(result::BranchBatchAnalysisResult;
         ))
     end
 
+    isempty(visible_periods) && return PlutoPlotly.plot(scatter(x=[0], y=[0], text=["No correlation data"]))
+
     # Threshold guide
     push!(traces, scatter(
-        x = [minimum(result.periods), maximum(result.periods)],
+        x = [minimum(visible_periods), maximum(visible_periods)],
         y = [correlation_threshold, correlation_threshold],
         mode = "lines",
         line = attr(color = "red", width = 2, dash = "dash"),
@@ -2236,6 +3268,392 @@ Return a boolean mask [period, state] selecting finite correlation values above 
 """
 function high_correlation_indices(result::BranchBatchAnalysisResult; correlation_threshold::Float64=0.85)
     return map(c -> isfinite(c) && c >= correlation_threshold, result.branch_correlation)
+end
+
+# ╔═╡ 07f578f5-f269-45f1-a6e6-c90f4d0f5c2f
+"""
+    plot_all_highcorr_groupvelocity_picks(result::BranchAnalysisResult;
+                                          correlation_threshold=0.85,
+                                          width=1000,
+                                          height=600,
+                                          font_family="Arial, sans-serif",
+                                          font_size=14,
+                                          title="All High-Correlation Group-Velocity Picks")
+
+Plot all causal and acausal envelope-peak group-velocity picks, restricted to periods
+where branch correlation is above `correlation_threshold`.
+"""
+function plot_all_highcorr_groupvelocity_picks(result::BranchAnalysisResult;
+                                               correlation_threshold::Float64=0.85,
+                                               pair_and_average::Bool=false,
+                                               velocity_tolerance_fraction::Float64=0.10,
+                                               width::Int=1000,
+                                               height::Int=600,
+                                               font_family::String="Arial, sans-serif",
+                                               font_size::Int=14,
+                                               title::String="All High-Correlation Group-Velocity Picks",
+                                               wavelength_ref_velocity::Union{Nothing,Real}=nothing,
+                                               wavelength_fraction::Union{Nothing,Real}=nothing)
+    wavelength_idx = Set(_wavelength_valid_indices(result.periods, result.distance;
+                                                    wavelength_ref_velocity=wavelength_ref_velocity,
+                                                    wavelength_fraction=wavelength_fraction))
+    hi_idx = [ip for ip in high_correlation_indices(result; correlation_threshold=correlation_threshold)
+             if ip in wavelength_idx]
+    if isempty(hi_idx)
+        @warn "No periods satisfy the correlation threshold $(correlation_threshold)"
+        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No high-correlation periods"]))
+    end
+
+    traces = [scatter()]
+    all_vels = Float64[]
+
+    if pair_and_average
+        matched_by_period = Dict{Int,Vector{Float64}}()
+        max_matched = 0
+
+        for ip in hi_idx
+            causal_peaks = result.causal_result.all_peaks[ip]
+            acausal_peaks = result.acausal_result.all_peaks[ip]
+            vavg = _matched_peak_average_velocities(causal_peaks, acausal_peaks, result.distance;
+                                                    velocity_tolerance_fraction=velocity_tolerance_fraction)
+            isempty(vavg) && continue
+            matched_by_period[ip] = vavg
+            max_matched = max(max_matched, length(vavg))
+            append!(all_vels, vavg)
+        end
+
+        for pidx in 1:max_matched
+            xp = Float64[]
+            yp = Float64[]
+            cp = Float64[]
+
+            for ip in hi_idx
+                if haskey(matched_by_period, ip)
+                    vals = matched_by_period[ip]
+                    if pidx <= length(vals)
+                        push!(xp, result.periods[ip])
+                        push!(yp, vals[pidx])
+                        push!(cp, result.branch_correlation[ip])
+                    end
+                end
+            end
+
+            isempty(xp) && continue
+            push!(traces, scatter(
+                x=xp,
+                y=yp,
+                mode="markers+lines",
+                marker=attr(size=8, color="#2ca02c", symbol="circle", line=attr(color="white", width=0.8)),
+                line=attr(color="#2ca02c", width=1.8),
+                name="Avg matched peak $(pidx)",
+                hovertemplate="Matched Avg<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
+                customdata=cp
+            ))
+        end
+    else
+        branches = [
+            ("Causal", result.causal_result, "#1f77b4", "circle"),
+            ("Acausal", result.acausal_result, "#d62728", "diamond"),
+        ]
+
+        for (branch_name, mft_res, color, marker_symbol) in branches
+            max_peaks = maximum(length.(mft_res.all_peaks); init=0)
+            max_peaks == 0 && continue
+
+            for pidx in 1:max_peaks
+                xp = Float64[]
+                yp = Float64[]
+                cp = Float64[]
+
+                for ip in hi_idx
+                    peaks = mft_res.all_peaks[ip]
+                    if pidx <= length(peaks)
+                        tpk, _ = peaks[pidx]
+                        if isfinite(tpk) && tpk > 0.0
+                            vpk = result.distance / tpk
+                            if isfinite(vpk) && vpk > 0.0
+                                push!(xp, mft_res.periods[ip])
+                                push!(yp, vpk)
+                                push!(cp, result.branch_correlation[ip])
+                                push!(all_vels, vpk)
+                            end
+                        end
+                    end
+                end
+
+                isempty(xp) && continue
+
+                push!(traces, scatter(
+                    x=xp,
+                    y=yp,
+                    mode="markers+lines",
+                    marker=attr(size=8, color=color, symbol=marker_symbol, line=attr(color="white", width=0.8)),
+                    line=attr(color=color, width=1.8),
+                    name="$(branch_name) peak $(pidx)",
+                    hovertemplate="$(branch_name)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
+                    customdata=cp
+                ))
+            end
+        end
+    end
+
+    if length(traces) == 1 || isempty(all_vels)
+        @warn "No valid peak-derived group-velocity picks found in high-correlation periods"
+        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No valid high-correlation picks"]))
+    end
+
+    y_min = 0.9 * minimum(all_vels)
+    y_max = 1.1 * maximum(all_vels)
+    n_hi = length(hi_idx)
+
+    layout = Layout(
+        title=attr(text="$(title) (N=$(n_hi), threshold=$(correlation_threshold))", font=attr(size=font_size + 2, family=font_family)),
+        xaxis=attr(title="Period (s)", type="linear", range=[minimum(result.periods[hi_idx]), maximum(result.periods[hi_idx])], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        yaxis=attr(title="Group Velocity (km/s)", range=[y_min, y_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        width=width,
+        height=height,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        margin=attr(l=80, r=80, t=80, b=80),
+        showlegend=true,
+        legend=attr(x=1.02, y=1.0, font=attr(size=font_size - 2), bgcolor="rgba(255,255,255,0.8)", borderwidth=1)
+    )
+
+    return PlutoPlotly.plot(traces, layout)
+end
+
+# ╔═╡ 58d6ecb6-2c42-4a53-9cbc-b72ebf48356c
+"""
+    plot_all_highcorr_groupvelocity_picks(result::BranchBatchAnalysisResult;
+                                          correlation_threshold=0.85,
+                                          colorscale="Viridis",
+                                          width=1200,
+                                          height=700,
+                                          font_family="Arial, sans-serif",
+                                          font_size=13,
+                                          title="All High-Correlation Group-Velocity Picks Across Source States")
+
+Plot all envelope-peak group-velocity picks for every source state, restricted to
+periods where that state's branch correlation is above `correlation_threshold`.
+"""
+function plot_all_highcorr_groupvelocity_picks(result::BranchBatchAnalysisResult;
+                                               correlation_threshold::Float64=0.85,
+                                               pair_and_average::Bool=false,
+                                               velocity_tolerance_fraction::Float64=0.10,
+                                               reference_results::AbstractVector{<:BranchAnalysisResult}=BranchAnalysisResult[],
+                                               reference_labels::AbstractVector{<:AbstractString}=String[],
+                                               colorscale::String="Viridis",
+                                               width::Int=1200,
+                                               height::Int=700,
+                                               font_family::String="Arial, sans-serif",
+                                               font_size::Int=13,
+                                               title::String="All High-Correlation Group-Velocity Picks Across Source States",
+                                               wavelength_ref_velocity::Union{Nothing,Real}=nothing,
+                                               wavelength_fraction::Union{Nothing,Real}=nothing)
+    nstates = length(result.state_results)
+    nstates == 0 && return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No source states"]))
+
+    state_colors = _sample_scheme_colors(colorscale, max(nstates, 2))
+    traces = [scatter()]
+    all_vels = Float64[]
+    total_hi = 0
+    visible_periods = Float64[]
+
+    for i in 1:nstates
+        st = result.state_results[i]
+        label = result.state_labels[i]
+        wavelength_idx = Set(_wavelength_valid_indices(st.periods, st.distance;
+                                                        wavelength_ref_velocity=wavelength_ref_velocity,
+                                                        wavelength_fraction=wavelength_fraction))
+        hi_idx = [ip for ip in high_correlation_indices(st; correlation_threshold=correlation_threshold)
+                 if ip in wavelength_idx]
+        total_hi += length(hi_idx)
+        isempty(hi_idx) && continue
+        append!(visible_periods, st.periods[hi_idx])
+
+        if pair_and_average
+            matched_by_period = Dict{Int,Vector{Float64}}()
+            max_matched = 0
+
+            for ip in hi_idx
+                causal_peaks = st.causal_result.all_peaks[ip]
+                acausal_peaks = st.acausal_result.all_peaks[ip]
+                vavg = _matched_peak_average_velocities(causal_peaks, acausal_peaks, st.distance;
+                                                        velocity_tolerance_fraction=velocity_tolerance_fraction)
+                isempty(vavg) && continue
+                matched_by_period[ip] = vavg
+                max_matched = max(max_matched, length(vavg))
+            end
+
+            for pidx in 1:max_matched
+                xp = Float64[]
+                yp = Float64[]
+                cp = Float64[]
+
+                for ip in hi_idx
+                    if haskey(matched_by_period, ip)
+                        vals = matched_by_period[ip]
+                        if pidx <= length(vals)
+                            push!(xp, st.periods[ip])
+                            push!(yp, vals[pidx])
+                            push!(cp, st.branch_correlation[ip])
+                            push!(all_vels, vals[pidx])
+                        end
+                    end
+                end
+
+                isempty(xp) && continue
+
+                push!(traces, scatter(
+                    x=xp,
+                    y=yp,
+                    mode="markers",
+                    marker=attr(
+                        size=7,
+                        color=state_colors[i],
+                        opacity=0.82,
+                        symbol="circle",
+                        line=attr(color="white", width=0.7)
+                    ),
+                    name="$(label) | Avg matched p$(pidx)",
+                    hovertemplate="State: $(label)<br>Type: Avg matched<br>Peak: $(pidx)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
+                    customdata=cp
+                ))
+            end
+
+            continue
+        end
+
+        branch_defs = [
+            ("Causal", st.causal_result, "circle"),
+            ("Acausal", st.acausal_result, "diamond"),
+        ]
+
+        for (branch_name, mft_res, marker_symbol) in branch_defs
+            max_peaks = maximum(length.(mft_res.all_peaks); init=0)
+            max_peaks == 0 && continue
+
+            for pidx in 1:max_peaks
+                xp = Float64[]
+                yp = Float64[]
+                cp = Float64[]
+
+                for ip in hi_idx
+                    peaks = mft_res.all_peaks[ip]
+                    if pidx <= length(peaks)
+                        tpk, _ = peaks[pidx]
+                        if isfinite(tpk) && tpk > 0.0
+                            vpk = st.distance / tpk
+                            if isfinite(vpk) && vpk > 0.0
+                                push!(xp, mft_res.periods[ip])
+                                push!(yp, vpk)
+                                push!(cp, st.branch_correlation[ip])
+                                push!(all_vels, vpk)
+                            end
+                        end
+                    end
+                end
+
+                isempty(xp) && continue
+
+                push!(traces, scatter(
+                    x=xp,
+                    y=yp,
+                    mode="markers",
+                    marker=attr(
+                        size=7,
+                        color=state_colors[i],
+                        opacity=0.78,
+                        symbol=marker_symbol,
+                        line=attr(color="white", width=0.7)
+                    ),
+                    name="$(label) | $(branch_name) p$(pidx)",
+                    hovertemplate="State: $(label)<br>Branch: $(branch_name)<br>Peak: $(pidx)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
+                    customdata=cp
+                ))
+            end
+        end
+    end
+
+    reference_styles = [
+        ("Causal", "#08306b", "circle-open"),
+        ("Acausal", "#7f0000", "diamond-open"),
+    ]
+
+    for (iref, ref) in enumerate(reference_results)
+        ref_label = iref <= length(reference_labels) ? String(reference_labels[iref]) : "Global avg"
+        ref_idx = _wavelength_valid_indices(ref.periods, ref.distance;
+                                             wavelength_ref_velocity=wavelength_ref_velocity,
+                                             wavelength_fraction=wavelength_fraction)
+        isempty(ref_idx) && continue
+        append!(visible_periods, ref.periods[ref_idx])
+        for (branch_name, mft_res, color, marker_symbol) in [
+                (reference_styles[1][1], ref.causal_result, reference_styles[1][2], reference_styles[1][3]),
+                (reference_styles[2][1], ref.acausal_result, reference_styles[2][2], reference_styles[2][3])]
+            max_peaks = maximum(length.(mft_res.all_peaks); init=0)
+            max_peaks == 0 && continue
+            for pidx in 1:max_peaks
+                xp = Float64[]
+                yp = Float64[]
+                cp = Float64[]
+                for ip in ref_idx
+                    peaks = mft_res.all_peaks[ip]
+                    if pidx <= length(peaks)
+                        tpk, _ = peaks[pidx]
+                        if isfinite(tpk) && tpk > 0.0
+                            vpk = ref.distance / tpk
+                            if isfinite(vpk) && vpk > 0.0
+                                push!(xp, mft_res.periods[ip])
+                                push!(yp, vpk)
+                                push!(cp, ref.branch_correlation[ip])
+                                push!(all_vels, vpk)
+                            end
+                        end
+                    end
+                end
+                isempty(xp) && continue
+                push!(traces, scatter(
+                    x=xp,
+                    y=yp,
+                    mode="lines+markers",
+                    marker=attr(
+                        size=9,
+                        color=color,
+                        opacity=1.0,
+                        symbol=marker_symbol,
+                        line=attr(color=color, width=1.4)
+                    ),
+                    line=attr(color=color, width=2.6, dash="dash"),
+                    name="$(ref_label) $(lowercase(branch_name)) peak $(pidx)",
+                    hovertemplate="$(ref_label)<br>Branch: $(branch_name)<br>Peak: $(pidx)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
+                    customdata=cp
+                ))
+            end
+        end
+    end
+
+    if length(traces) == 1 || isempty(all_vels)
+        @warn "No valid high-correlation picks across source states"
+        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No valid high-correlation picks"]))
+    end
+
+    y_min = 0.9 * minimum(all_vels)
+    y_max = 1.1 * maximum(all_vels)
+
+    layout = Layout(
+        title=attr(text="$(title) (threshold=$(correlation_threshold), high-corr samples=$(total_hi))", font=attr(size=font_size + 2, family=font_family)),
+        xaxis=attr(title="Period (s)", type="linear", range=[minimum(visible_periods), maximum(visible_periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        yaxis=attr(title="Group Velocity (km/s)", range=[y_min, y_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        width=width,
+        height=height,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        margin=attr(l=80, r=120, t=80, b=80),
+        showlegend=true,
+        legend=attr(x=1.02, y=1.0, font=attr(size=font_size - 2), bgcolor="rgba(255,255,255,0.8)", borderwidth=1)
+    )
+
+    return PlutoPlotly.plot(traces, layout)
 end
 
 # ╔═╡ 1a67f649-4fd7-4f63-bf4a-28d5cb66f52d
@@ -2327,6 +3745,9 @@ function plot_filtered_traces_by_period(result::BranchBatchAnalysisResult;
             end
         end
 
+        if !mft_has_full_storage(st.acausal_result) || !mft_has_full_storage(st.causal_result)
+            continue
+        end
         ac = st.acausal_result.filtered_traces[:, idx]
         ca = st.causal_result.filtered_traces[:, idx]
         if isempty(ac) || isempty(ca)
@@ -2527,1227 +3948,6 @@ function _matched_peak_average_velocities(causal_peaks::Vector{Tuple{Float64,Flo
     return matched_avg
 end
 
-# ╔═╡ 07f578f5-f269-45f1-a6e6-c90f4d0f5c2f
-"""
-    plot_all_highcorr_groupvelocity_picks(result::BranchAnalysisResult;
-                                          correlation_threshold=0.85,
-                                          width=1000,
-                                          height=600,
-                                          font_family="Arial, sans-serif",
-                                          font_size=14,
-                                          title="All High-Correlation Group-Velocity Picks")
-
-Plot all causal and acausal envelope-peak group-velocity picks, restricted to periods
-where branch correlation is above `correlation_threshold`.
-"""
-function plot_all_highcorr_groupvelocity_picks(result::BranchAnalysisResult;
-                                               correlation_threshold::Float64=0.85,
-                                               pair_and_average::Bool=false,
-                                               velocity_tolerance_fraction::Float64=0.10,
-                                               width::Int=1000,
-                                               height::Int=600,
-                                               font_family::String="Arial, sans-serif",
-                                               font_size::Int=14,
-                                               title::String="All High-Correlation Group-Velocity Picks")
-    hi_idx = high_correlation_indices(result; correlation_threshold=correlation_threshold)
-    if isempty(hi_idx)
-        @warn "No periods satisfy the correlation threshold $(correlation_threshold)"
-        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No high-correlation periods"]))
-    end
-
-    traces = [scatter()]
-    all_vels = Float64[]
-
-    if pair_and_average
-        matched_by_period = Dict{Int,Vector{Float64}}()
-        max_matched = 0
-
-        for ip in hi_idx
-            causal_peaks = result.causal_result.all_peaks[ip]
-            acausal_peaks = result.acausal_result.all_peaks[ip]
-            vavg = _matched_peak_average_velocities(causal_peaks, acausal_peaks, result.distance;
-                                                    velocity_tolerance_fraction=velocity_tolerance_fraction)
-            isempty(vavg) && continue
-            matched_by_period[ip] = vavg
-            max_matched = max(max_matched, length(vavg))
-            append!(all_vels, vavg)
-        end
-
-        for pidx in 1:max_matched
-            xp = Float64[]
-            yp = Float64[]
-            cp = Float64[]
-
-            for ip in hi_idx
-                if haskey(matched_by_period, ip)
-                    vals = matched_by_period[ip]
-                    if pidx <= length(vals)
-                        push!(xp, result.periods[ip])
-                        push!(yp, vals[pidx])
-                        push!(cp, result.branch_correlation[ip])
-                    end
-                end
-            end
-
-            isempty(xp) && continue
-            push!(traces, scatter(
-                x=xp,
-                y=yp,
-                mode="markers+lines",
-                marker=attr(size=8, color="#2ca02c", symbol="circle", line=attr(color="white", width=0.8)),
-                line=attr(color="#2ca02c", width=1.8),
-                name="Avg matched peak $(pidx)",
-                hovertemplate="Matched Avg<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
-                customdata=cp
-            ))
-        end
-    else
-        branches = [
-            ("Causal", result.causal_result, "#1f77b4", "circle"),
-            ("Acausal", result.acausal_result, "#d62728", "diamond"),
-        ]
-
-        for (branch_name, mft_res, color, marker_symbol) in branches
-            max_peaks = maximum(length.(mft_res.all_peaks); init=0)
-            max_peaks == 0 && continue
-
-            for pidx in 1:max_peaks
-                xp = Float64[]
-                yp = Float64[]
-                cp = Float64[]
-
-                for ip in hi_idx
-                    peaks = mft_res.all_peaks[ip]
-                    if pidx <= length(peaks)
-                        tpk, _ = peaks[pidx]
-                        if isfinite(tpk) && tpk > 0.0
-                            vpk = result.distance / tpk
-                            if isfinite(vpk) && vpk > 0.0
-                                push!(xp, mft_res.periods[ip])
-                                push!(yp, vpk)
-                                push!(cp, result.branch_correlation[ip])
-                                push!(all_vels, vpk)
-                            end
-                        end
-                    end
-                end
-
-                isempty(xp) && continue
-
-                push!(traces, scatter(
-                    x=xp,
-                    y=yp,
-                    mode="markers+lines",
-                    marker=attr(size=8, color=color, symbol=marker_symbol, line=attr(color="white", width=0.8)),
-                    line=attr(color=color, width=1.8),
-                    name="$(branch_name) peak $(pidx)",
-                    hovertemplate="$(branch_name)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
-                    customdata=cp
-                ))
-            end
-        end
-    end
-
-    if length(traces) == 1 || isempty(all_vels)
-        @warn "No valid peak-derived group-velocity picks found in high-correlation periods"
-        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No valid high-correlation picks"]))
-    end
-
-    y_min = 0.9 * minimum(all_vels)
-    y_max = 1.1 * maximum(all_vels)
-    n_hi = length(hi_idx)
-
-    layout = Layout(
-        title=attr(text="$(title) (N=$(n_hi), threshold=$(correlation_threshold))", font=attr(size=font_size + 2, family=font_family)),
-        xaxis=attr(title="Period (s)", type="linear", range=[minimum(result.periods), maximum(result.periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        yaxis=attr(title="Group Velocity (km/s)", range=[y_min, y_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        width=width,
-        height=height,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        margin=attr(l=80, r=80, t=80, b=80),
-        showlegend=true,
-        legend=attr(x=1.02, y=1.0, font=attr(size=font_size - 2), bgcolor="rgba(255,255,255,0.8)", borderwidth=1)
-    )
-
-    return PlutoPlotly.plot(traces, layout)
-end
-
-# ╔═╡ 58d6ecb6-2c42-4a53-9cbc-b72ebf48356c
-"""
-    plot_all_highcorr_groupvelocity_picks(result::BranchBatchAnalysisResult;
-                                          correlation_threshold=0.85,
-                                          colorscale="Viridis",
-                                          width=1200,
-                                          height=700,
-                                          font_family="Arial, sans-serif",
-                                          font_size=13,
-                                          title="All High-Correlation Group-Velocity Picks Across Source States")
-
-Plot all envelope-peak group-velocity picks for every source state, restricted to
-periods where that state's branch correlation is above `correlation_threshold`.
-"""
-function plot_all_highcorr_groupvelocity_picks(result::BranchBatchAnalysisResult;
-                                               correlation_threshold::Float64=0.85,
-                                               pair_and_average::Bool=false,
-                                               velocity_tolerance_fraction::Float64=0.10,
-                                               reference_results::AbstractVector{<:BranchAnalysisResult}=BranchAnalysisResult[],
-                                               reference_labels::AbstractVector{<:AbstractString}=String[],
-                                               colorscale::String="Viridis",
-                                               width::Int=1200,
-                                               height::Int=700,
-                                               font_family::String="Arial, sans-serif",
-                                               font_size::Int=13,
-                                               title::String="All High-Correlation Group-Velocity Picks Across Source States")
-    nstates = length(result.state_results)
-    nstates == 0 && return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No source states"]))
-
-    state_colors = _sample_scheme_colors(colorscale, max(nstates, 2))
-    traces = [scatter()]
-    all_vels = Float64[]
-    total_hi = 0
-
-    for i in 1:nstates
-        st = result.state_results[i]
-        label = result.state_labels[i]
-        hi_idx = high_correlation_indices(st; correlation_threshold=correlation_threshold)
-        total_hi += length(hi_idx)
-        isempty(hi_idx) && continue
-
-        if pair_and_average
-            matched_by_period = Dict{Int,Vector{Float64}}()
-            max_matched = 0
-
-            for ip in hi_idx
-                causal_peaks = st.causal_result.all_peaks[ip]
-                acausal_peaks = st.acausal_result.all_peaks[ip]
-                vavg = _matched_peak_average_velocities(causal_peaks, acausal_peaks, st.distance;
-                                                        velocity_tolerance_fraction=velocity_tolerance_fraction)
-                isempty(vavg) && continue
-                matched_by_period[ip] = vavg
-                max_matched = max(max_matched, length(vavg))
-            end
-
-            for pidx in 1:max_matched
-                xp = Float64[]
-                yp = Float64[]
-                cp = Float64[]
-
-                for ip in hi_idx
-                    if haskey(matched_by_period, ip)
-                        vals = matched_by_period[ip]
-                        if pidx <= length(vals)
-                            push!(xp, st.periods[ip])
-                            push!(yp, vals[pidx])
-                            push!(cp, st.branch_correlation[ip])
-                            push!(all_vels, vals[pidx])
-                        end
-                    end
-                end
-
-                isempty(xp) && continue
-
-                push!(traces, scatter(
-                    x=xp,
-                    y=yp,
-                    mode="markers",
-                    marker=attr(
-                        size=7,
-                        color=state_colors[i],
-                        opacity=0.82,
-                        symbol="circle",
-                        line=attr(color="white", width=0.7)
-                    ),
-                    name="$(label) | Avg matched p$(pidx)",
-                    hovertemplate="State: $(label)<br>Type: Avg matched<br>Peak: $(pidx)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
-                    customdata=cp
-                ))
-            end
-
-            continue
-        end
-
-        branch_defs = [
-            ("Causal", st.causal_result, "circle"),
-            ("Acausal", st.acausal_result, "diamond"),
-        ]
-
-        for (branch_name, mft_res, marker_symbol) in branch_defs
-            max_peaks = maximum(length.(mft_res.all_peaks); init=0)
-            max_peaks == 0 && continue
-
-            for pidx in 1:max_peaks
-                xp = Float64[]
-                yp = Float64[]
-                cp = Float64[]
-
-                for ip in hi_idx
-                    peaks = mft_res.all_peaks[ip]
-                    if pidx <= length(peaks)
-                        tpk, _ = peaks[pidx]
-                        if isfinite(tpk) && tpk > 0.0
-                            vpk = st.distance / tpk
-                            if isfinite(vpk) && vpk > 0.0
-                                push!(xp, mft_res.periods[ip])
-                                push!(yp, vpk)
-                                push!(cp, st.branch_correlation[ip])
-                                push!(all_vels, vpk)
-                            end
-                        end
-                    end
-                end
-
-                isempty(xp) && continue
-
-                push!(traces, scatter(
-                    x=xp,
-                    y=yp,
-                    mode="markers",
-                    marker=attr(
-                        size=7,
-                        color=state_colors[i],
-                        opacity=0.78,
-                        symbol=marker_symbol,
-                        line=attr(color="white", width=0.7)
-                    ),
-                    name="$(label) | $(branch_name) p$(pidx)",
-                    hovertemplate="State: $(label)<br>Branch: $(branch_name)<br>Peak: $(pidx)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
-                    customdata=cp
-                ))
-            end
-        end
-    end
-
-    reference_styles = [
-        ("Causal", "#08306b", "circle-open"),
-        ("Acausal", "#7f0000", "diamond-open"),
-    ]
-
-    for (iref, ref) in enumerate(reference_results)
-        ref_label = iref <= length(reference_labels) ? String(reference_labels[iref]) : "Global avg"
-        ref_idx = eachindex(ref.periods)
-        for (branch_name, mft_res, color, marker_symbol) in [
-                (reference_styles[1][1], ref.causal_result, reference_styles[1][2], reference_styles[1][3]),
-                (reference_styles[2][1], ref.acausal_result, reference_styles[2][2], reference_styles[2][3])]
-            max_peaks = maximum(length.(mft_res.all_peaks); init=0)
-            max_peaks == 0 && continue
-            for pidx in 1:max_peaks
-                xp = Float64[]
-                yp = Float64[]
-                cp = Float64[]
-                for ip in ref_idx
-                    peaks = mft_res.all_peaks[ip]
-                    if pidx <= length(peaks)
-                        tpk, _ = peaks[pidx]
-                        if isfinite(tpk) && tpk > 0.0
-                            vpk = ref.distance / tpk
-                            if isfinite(vpk) && vpk > 0.0
-                                push!(xp, mft_res.periods[ip])
-                                push!(yp, vpk)
-                                push!(cp, ref.branch_correlation[ip])
-                                push!(all_vels, vpk)
-                            end
-                        end
-                    end
-                end
-                isempty(xp) && continue
-                push!(traces, scatter(
-                    x=xp,
-                    y=yp,
-                    mode="lines+markers",
-                    marker=attr(
-                        size=9,
-                        color=color,
-                        opacity=1.0,
-                        symbol=marker_symbol,
-                        line=attr(color=color, width=1.4)
-                    ),
-                    line=attr(color=color, width=2.6, dash="dash"),
-                    name="$(ref_label) $(lowercase(branch_name)) peak $(pidx)",
-                    hovertemplate="$(ref_label)<br>Branch: $(branch_name)<br>Peak: $(pidx)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
-                    customdata=cp
-                ))
-            end
-        end
-    end
-
-    if length(traces) == 1 || isempty(all_vels)
-        @warn "No valid high-correlation picks across source states"
-        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No valid high-correlation picks"]))
-    end
-
-    y_min = 0.9 * minimum(all_vels)
-    y_max = 1.1 * maximum(all_vels)
-
-    layout = Layout(
-        title=attr(text="$(title) (threshold=$(correlation_threshold), high-corr samples=$(total_hi))", font=attr(size=font_size + 2, family=font_family)),
-        xaxis=attr(title="Period (s)", type="linear", range=[minimum(result.periods), maximum(result.periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        yaxis=attr(title="Group Velocity (km/s)", range=[y_min, y_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        width=width,
-        height=height,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        margin=attr(l=80, r=120, t=80, b=80),
-        showlegend=true,
-        legend=attr(x=1.02, y=1.0, font=attr(size=font_size - 2), bgcolor="rgba(255,255,255,0.8)", borderwidth=1)
-    )
-
-    return PlutoPlotly.plot(traces, layout)
-end
-
-# ╔═╡ a079a952-8252-4f56-a4c7-2a9ae58e0f11
-"""
-    SourceStateConsensusPick
-
-Consensus group-velocity picks combined across source states for one receiver pair.
-
-Fields:
-- `periods`: Analysis periods [s]
-- `group_velocities`: Final consensus group velocity per period [km/s]
-- `arrival_times`: Final arrival time per period [s]
-- `confidence`: Confidence score per period [0,1]
-- `support`: Number of unique source states supporting the selected cluster
-- `candidate_velocities`: All causal/acausal-matched candidate velocities per period
-- `accepted_candidate_velocities`: Candidate velocities inside the selected cluster
-- `rejected_candidate_velocities`: Candidate velocities outside the selected cluster
-- `selected_cluster_index`: Selected cluster index per period, or 0 when no pick is accepted
-- `candidate_group_velocities`: Smooth consensus candidate branches [period, candidate]
-- `candidate_arrival_times`: Candidate arrival times [period, candidate]
-- `candidate_confidence`: Candidate confidence scores [period, candidate]
-- `candidate_support`: Candidate source-state support counts [period, candidate]
-- `candidate_cluster_index`: Selected cluster index for each candidate branch [period, candidate]
-"""
-struct SourceStateConsensusPick
-    periods::Vector{Float64}
-    group_velocities::Vector{Float64}
-    arrival_times::Vector{Float64}
-    confidence::Vector{Float64}
-    support::Vector{Int}
-    candidate_velocities::Vector{Vector{Float64}}
-    accepted_candidate_velocities::Vector{Vector{Float64}}
-    rejected_candidate_velocities::Vector{Vector{Float64}}
-    selected_cluster_index::Vector{Int}
-    candidate_group_velocities::Matrix{Float64}
-    candidate_arrival_times::Matrix{Float64}
-    candidate_confidence::Matrix{Float64}
-    candidate_support::Matrix{Int}
-    candidate_cluster_index::Matrix{Int}
-end
-
-# ╔═╡ f2c83612-d161-4fef-a728-c2dcbfa48b1c
-struct _ConsensusCandidate
-    velocity::Float64
-    state_index::Int
-    branch_correlation::Float64
-end
-
-# ╔═╡ 1c36878c-f684-46a8-a2ab-4203a01d0169
-struct _ConsensusCluster
-    velocity::Float64
-    confidence::Float64
-    support::Int
-    candidate_indices::Vector{Int}
-end
-
-# ╔═╡ 7f9cbf19-46b3-403b-90f8-a4591fd5ef4f
-function _relative_difference(a::Float64, b::Float64)
-    denom = max((abs(a) + abs(b)) / 2.0, eps(Float64))
-    return abs(a - b) / denom
-end
-
-# ╔═╡ f7f4e17f-0784-43db-9a6b-c2b07a963f94
-function _median_sorted(vals::Vector{Float64})
-    isempty(vals) && return NaN
-    s = sort(vals)
-    n = length(s)
-    mid = fld(n + 1, 2)
-    return isodd(n) ? s[mid] : 0.5 * (s[mid] + s[mid + 1])
-end
-
-# ╔═╡ c17d7f26-3d82-44b8-860c-b12df0bf9293
-function _mean_finite(vals::Vector{Float64})
-    good = [v for v in vals if isfinite(v)]
-    isempty(good) && return NaN
-    return sum(good) / length(good)
-end
-
-# ╔═╡ 1a7d4cbb-a1ea-4319-a404-2293faf72069
-function _cluster_consensus_candidates(candidates::Vector{_ConsensusCandidate},
-                                       nstates::Int;
-                                       cluster_tolerance_fraction::Float64=0.08)
-    cluster_tolerance_fraction >= 0.0 || throw(ArgumentError("cluster_tolerance_fraction must be >= 0"))
-    isempty(candidates) && return _ConsensusCluster[]
-
-    order = sortperm([c.velocity for c in candidates])
-    groups = Vector{Vector{Int}}()
-
-    for idx in order
-        v = candidates[idx].velocity
-        if isempty(groups)
-            push!(groups, [idx])
-            continue
-        end
-
-        last_group = groups[end]
-        center = _median_sorted([candidates[j].velocity for j in last_group])
-        if _relative_difference(v, center) <= cluster_tolerance_fraction
-            push!(last_group, idx)
-        else
-            push!(groups, [idx])
-        end
-    end
-
-    clusters = _ConsensusCluster[]
-    for group in groups
-        velocities = [candidates[j].velocity for j in group]
-        corrs = [candidates[j].branch_correlation for j in group]
-        states = unique([candidates[j].state_index for j in group])
-
-        v_med = _median_sorted(velocities)
-        v_avg = _mean_finite(velocities)
-        mean_corr = clamp(_mean_finite(corrs), 0.0, 1.0)
-        support_fraction = nstates > 0 ? clamp(length(states) / nstates, 0.0, 1.0) : 0.0
-
-        compactness = 1.0
-        if length(velocities) > 1 && isfinite(v_med) && v_med > 0.0
-            rel_spread = maximum(abs.(velocities .- v_med)) / v_med
-            compactness = clamp(1.0 - rel_spread / max(cluster_tolerance_fraction, eps(Float64)), 0.0, 1.0)
-        end
-
-        confidence = clamp(0.45 * support_fraction + 0.35 * mean_corr + 0.20 * compactness, 0.0, 1.0)
-        push!(clusters, _ConsensusCluster(v_avg, confidence, length(states), group))
-    end
-
-    return clusters
-end
-
-# ╔═╡ c7600895-0b53-477d-aaca-19925dec0d91
-function _select_consensus_clusters(period_clusters::Vector{Vector{_ConsensusCluster}};
-                                    min_support::Int=1,
-                                    min_confidence::Float64=0.0,
-                                    smoothness_weight::Float64=1.0)
-    min_support >= 1 || throw(ArgumentError("min_support must be >= 1"))
-    0.0 <= min_confidence <= 1.0 || throw(ArgumentError("min_confidence must be in [0, 1]"))
-    smoothness_weight >= 0.0 || throw(ArgumentError("smoothness_weight must be >= 0"))
-
-    nperiods = length(period_clusters)
-    selected = zeros(Int, nperiods)
-    prev_velocity = NaN
-
-    for ip in 1:nperiods
-        clusters = period_clusters[ip]
-        best_j = 0
-        best_score = -Inf
-
-        for (j, cluster) in enumerate(clusters)
-            cluster.support < min_support && continue
-            cluster.confidence < min_confidence && continue
-
-            smooth_penalty = 0.0
-            if isfinite(prev_velocity) && isfinite(cluster.velocity) && cluster.velocity > 0.0
-                smooth_penalty = smoothness_weight * _relative_difference(cluster.velocity, prev_velocity)
-            end
-
-            score = cluster.confidence + 0.08 * cluster.support - smooth_penalty
-            if score > best_score
-                best_score = score
-                best_j = j
-            end
-        end
-
-        selected[ip] = best_j
-        if best_j > 0
-            prev_velocity = clusters[best_j].velocity
-        end
-    end
-
-    return selected
-end
-
-# ╔═╡ 07914f7d-70fb-477d-bb05-dfa2a68d03ff
-function _eligible_cluster_indices(clusters::Vector{_ConsensusCluster},
-                                   used::AbstractVector{Bool};
-                                   min_support::Int,
-                                   min_confidence::Float64)
-    return [j for j in eachindex(clusters)
-            if !used[j] &&
-               clusters[j].support >= min_support &&
-	               clusters[j].confidence >= min_confidence]
-end
-
-# ╔═╡ 2e76ea52-ad8e-4f32-9b01-b88d7d1163f9
-function _local_low_velocity_bonus(clusters::Vector{_ConsensusCluster}, j::Int,
-                                   eligible::Vector{Int})
-    isempty(eligible) && return 0.0
-    vals = [clusters[k].velocity for k in eligible if isfinite(clusters[k].velocity)]
-    isempty(vals) && return 0.0
-    vmin = minimum(vals)
-    vmax = maximum(vals)
-    span = vmax - vmin
-    span <= eps(Float64) && return 0.5
-    return clamp((vmax - clusters[j].velocity) / span, 0.0, 1.0)
-end
-
-# ╔═╡ bdccfc35-4436-4716-a868-bec5a18317d3
-function _select_smooth_consensus_candidate_branches(period_clusters::Vector{Vector{_ConsensusCluster}};
-                                                     max_candidates::Int=3,
-                                                     min_support::Int=1,
-                                                     min_confidence::Float64=0.0,
-                                                     smoothness_weight::Float64=1.0,
-                                                     max_smooth_jump_fraction::Float64=0.12,
-                                                     max_gap_periods::Int=1,
-                                                     selection_mode::Symbol=:low_velocity)
-    max_candidates >= 1 || throw(ArgumentError("max_candidates must be >= 1"))
-    min_support >= 1 || throw(ArgumentError("min_support must be >= 1"))
-    0.0 <= min_confidence <= 1.0 || throw(ArgumentError("min_confidence must be in [0, 1]"))
-    smoothness_weight >= 0.0 || throw(ArgumentError("smoothness_weight must be >= 0"))
-    max_smooth_jump_fraction >= 0.0 || throw(ArgumentError("max_smooth_jump_fraction must be >= 0"))
-    max_gap_periods >= 0 || throw(ArgumentError("max_gap_periods must be >= 0"))
-    selection_mode in (:low_velocity, :confidence) || throw(ArgumentError("selection_mode must be :low_velocity or :confidence"))
-
-    nperiods = length(period_clusters)
-    selected = zeros(Int, nperiods, max_candidates)
-    used = [falses(length(clusters)) for clusters in period_clusters]
-
-    for icand in 1:max_candidates
-        seed_ip = 0
-        seed_j = 0
-        seed_score = -Inf
-
-        for ip in 1:nperiods
-            eligible = _eligible_cluster_indices(period_clusters[ip], used[ip];
-                                                 min_support=min_support,
-                                                 min_confidence=min_confidence)
-            for j in eligible
-                cluster = period_clusters[ip][j]
-                low_bonus = _local_low_velocity_bonus(period_clusters[ip], j, eligible)
-                score = selection_mode == :low_velocity ?
-                        (cluster.confidence + 0.08 * cluster.support + 0.12 * low_bonus) :
-                        (cluster.confidence + 0.08 * cluster.support)
-                if score > seed_score
-                    seed_score = score
-                    seed_ip = ip
-                    seed_j = j
-                end
-            end
-        end
-
-        seed_j == 0 && break
-
-        selected[seed_ip, icand] = seed_j
-        used[seed_ip][seed_j] = true
-
-        for direction in (-1, 1)
-            prev_velocity = period_clusters[seed_ip][seed_j].velocity
-            gap_count = 0
-            ip_range = direction == -1 ? ((seed_ip - 1):-1:1) : ((seed_ip + 1):nperiods)
-
-            for ip in ip_range
-                best_j = 0
-                best_score = -Inf
-
-                eligible = _eligible_cluster_indices(period_clusters[ip], used[ip];
-                                                     min_support=min_support,
-                                                     min_confidence=min_confidence)
-
-                for j in eligible
-                    cluster = period_clusters[ip][j]
-                    rel_jump = _relative_difference(cluster.velocity, prev_velocity)
-                    rel_jump <= max_smooth_jump_fraction || continue
-
-                    low_bonus = _local_low_velocity_bonus(period_clusters[ip], j, eligible)
-                    score = selection_mode == :low_velocity ?
-                            (cluster.confidence + 0.08 * cluster.support + 0.12 * low_bonus - smoothness_weight * rel_jump) :
-                            (cluster.confidence + 0.08 * cluster.support - smoothness_weight * rel_jump)
-                    if score > best_score
-                        best_score = score
-                        best_j = j
-                    end
-                end
-
-                if best_j == 0
-                    gap_count += 1
-                    gap_count > max_gap_periods && break
-                    continue
-                end
-
-                selected[ip, icand] = best_j
-                used[ip][best_j] = true
-                prev_velocity = period_clusters[ip][best_j].velocity
-                gap_count = 0
-            end
-        end
-    end
-
-    return selected
-end
-
-# ╔═╡ 0eed3963-d6e2-4c6d-938b-7e233811364c
-"""
-    consensus_group_velocity_picks(result::BranchBatchAnalysisResult;
-        correlation_threshold=0.85,
-        velocity_tolerance_fraction=0.10,
-        cluster_tolerance_fraction=nothing,
-        min_support=1,
-        min_confidence=0.0,
-        smoothness_weight=1.0,
-        max_candidates=3,
-        max_smooth_jump_fraction=0.12,
-        max_gap_periods=1,
-        selection_mode=:low_velocity,
-        min_candidate_periods=2)
-
-Combine causal/acausal-matched group-velocity candidates across source states
-for one receiver pair. Causal/acausal agreement is required inside each source
-state, while source states are pooled with OR-style support. The output keeps
-up to `max_candidates` smooth candidate branches with gaps allowed.
-	Use `selection_mode=:low_velocity` to trace the local minimum group-velocity
-	envelope; use `selection_mode=:confidence` for the older confidence-first
-	branch ordering. Candidate branches that cover more periods are ordered ahead
-	of shorter branches; set `min_candidate_periods=1` to keep single-period islands.
-	"""
-function consensus_group_velocity_picks(result::BranchBatchAnalysisResult;
-                                        correlation_threshold::Float64=0.85,
-                                        velocity_tolerance_fraction::Float64=0.10,
-                                        cluster_tolerance_fraction::Union{Float64,Nothing}=nothing,
-                                        min_support::Int=1,
-                                        min_confidence::Float64=0.0,
-                                        smoothness_weight::Float64=1.0,
-                                        max_candidates::Int=3,
-                                        max_smooth_jump_fraction::Float64=0.12,
-                                        max_gap_periods::Int=1,
-                                        selection_mode::Symbol=:low_velocity,
-                                        min_candidate_periods::Int=2)
-    nstates = length(result.state_results)
-    nstates > 0 || throw(ArgumentError("At least one source state is required"))
-    min_candidate_periods >= 1 || throw(ArgumentError("min_candidate_periods must be >= 1"))
-    cluster_tol = isnothing(cluster_tolerance_fraction) ? velocity_tolerance_fraction : cluster_tolerance_fraction
-    cluster_tol >= 0.0 || throw(ArgumentError("cluster_tolerance_fraction must be >= 0"))
-    nperiods = length(result.periods)
-    distance_ref = result.state_results[1].distance
-    for (istate, st) in enumerate(result.state_results)
-        st.distance ≈ distance_ref || throw(ArgumentError("State $(istate) distance $(st.distance) does not match receiver-pair distance $(distance_ref)"))
-    end
-
-    period_candidates = [Vector{_ConsensusCandidate}() for _ in 1:nperiods]
-    candidate_velocities = [Float64[] for _ in 1:nperiods]
-
-    for (istate, st) in enumerate(result.state_results)
-        for ip in 1:nperiods
-            corr = st.branch_correlation[ip]
-            (isfinite(corr) && corr >= correlation_threshold) || continue
-
-            causal_peaks = st.causal_result.all_peaks[ip]
-            acausal_peaks = st.acausal_result.all_peaks[ip]
-            matched_velocities = _matched_peak_average_velocities(causal_peaks, acausal_peaks, st.distance;
-                                                                  velocity_tolerance_fraction=velocity_tolerance_fraction)
-            for velocity in matched_velocities
-                isfinite(velocity) && velocity > 0.0 || continue
-                push!(period_candidates[ip], _ConsensusCandidate(velocity, istate, corr))
-                push!(candidate_velocities[ip], velocity)
-            end
-        end
-    end
-
-    period_clusters = [_cluster_consensus_candidates(period_candidates[ip], nstates;
-                                                     cluster_tolerance_fraction=cluster_tol)
-                       for ip in 1:nperiods]
-    candidate_cluster_index = _select_smooth_consensus_candidate_branches(period_clusters;
-                                                                          max_candidates=max_candidates,
-                                                                          min_support=min_support,
-                                                                          min_confidence=min_confidence,
-                                                                          smoothness_weight=smoothness_weight,
-                                                                          max_smooth_jump_fraction=max_smooth_jump_fraction,
-                                                                          max_gap_periods=max_gap_periods,
-                                                                          selection_mode=selection_mode)
-    selected_cluster_index = vec(candidate_cluster_index[:, 1])
-
-    group_velocities = fill(NaN, nperiods)
-    arrival_times = fill(NaN, nperiods)
-    confidence = fill(0.0, nperiods)
-    support = zeros(Int, nperiods)
-    candidate_group_velocities = fill(NaN, nperiods, max_candidates)
-    candidate_arrival_times = fill(NaN, nperiods, max_candidates)
-    candidate_confidence = fill(0.0, nperiods, max_candidates)
-    candidate_support = zeros(Int, nperiods, max_candidates)
-    accepted_candidate_velocities = [Float64[] for _ in 1:nperiods]
-    rejected_candidate_velocities = [copy(candidate_velocities[ip]) for ip in 1:nperiods]
-
-    for icand in 1:max_candidates
-        for ip in 1:nperiods
-            j = candidate_cluster_index[ip, icand]
-            j == 0 && continue
-
-            cluster = period_clusters[ip][j]
-            candidate_group_velocities[ip, icand] = cluster.velocity
-            candidate_confidence[ip, icand] = cluster.confidence
-            candidate_support[ip, icand] = cluster.support
-
-            if isfinite(distance_ref) && distance_ref > 0.0 && isfinite(cluster.velocity) && cluster.velocity > 0.0
-                candidate_arrival_times[ip, icand] = distance_ref / cluster.velocity
-            end
-        end
-    end
-
-    candidate_counts = [count(v -> isfinite(v) && v > 0.0, candidate_group_velocities[:, icand])
-                        for icand in 1:max_candidates]
-    for icand in 1:max_candidates
-        if candidate_counts[icand] < min_candidate_periods
-            candidate_group_velocities[:, icand] .= NaN
-            candidate_arrival_times[:, icand] .= NaN
-            candidate_confidence[:, icand] .= 0.0
-            candidate_support[:, icand] .= 0
-            candidate_cluster_index[:, icand] .= 0
-        end
-    end
-
-    candidate_counts = [count(v -> isfinite(v) && v > 0.0, candidate_group_velocities[:, icand])
-                        for icand in 1:max_candidates]
-    candidate_medians = [_median_sorted([v for v in candidate_group_velocities[:, icand] if isfinite(v) && v > 0.0])
-                         for icand in 1:max_candidates]
-    candidate_mean_conf = [_mean_finite([v for v in candidate_confidence[:, icand] if isfinite(v) && v > 0.0])
-                           for icand in 1:max_candidates]
-    for icand in 1:max_candidates
-        isnan(candidate_medians[icand]) && (candidate_medians[icand] = Inf)
-        isnan(candidate_mean_conf[icand]) && (candidate_mean_conf[icand] = 0.0)
-    end
-
-    order = if selection_mode == :low_velocity
-        sortperm(1:max_candidates, by=icand -> (-candidate_counts[icand],
-                                                candidate_medians[icand],
-                                                -candidate_mean_conf[icand]))
-    else
-        sortperm(1:max_candidates, by=icand -> (-candidate_counts[icand],
-                                                -candidate_mean_conf[icand],
-                                                candidate_medians[icand]))
-    end
-
-    candidate_group_velocities = candidate_group_velocities[:, order]
-    candidate_arrival_times = candidate_arrival_times[:, order]
-    candidate_confidence = candidate_confidence[:, order]
-    candidate_support = candidate_support[:, order]
-    candidate_cluster_index = candidate_cluster_index[:, order]
-
-    for ip in 1:nperiods
-        group_velocities[ip] = candidate_group_velocities[ip, 1]
-        arrival_times[ip] = candidate_arrival_times[ip, 1]
-        confidence[ip] = candidate_confidence[ip, 1]
-        support[ip] = candidate_support[ip, 1]
-
-        accepted_all = Set{Int}()
-        for icand in 1:max_candidates
-            j = candidate_cluster_index[ip, icand]
-            j == 0 && continue
-            union!(accepted_all, period_clusters[ip][j].candidate_indices)
-        end
-
-        accepted_candidate_velocities[ip] = [period_candidates[ip][k].velocity for k in sort(collect(accepted_all))]
-        rejected_candidate_velocities[ip] = [period_candidates[ip][k].velocity
-                                             for k in eachindex(period_candidates[ip])
-                                             if !(k in accepted_all)]
-    end
-
-    return SourceStateConsensusPick(result.periods, group_velocities, arrival_times,
-                                    confidence, support, candidate_velocities,
-                                    accepted_candidate_velocities, rejected_candidate_velocities,
-                                    selected_cluster_index,
-                                    candidate_group_velocities, candidate_arrival_times,
-                                    candidate_confidence, candidate_support,
-                                    candidate_cluster_index)
-end
-
-# ╔═╡ a669a82b-b147-45d8-bf4e-c2e4d97c1bd3
-"""
-    plot_consensus_groupvelocity_picks(batch_result, consensus_result; ...)
-
-Plot all causal/acausal-matched source-state candidates as faint markers and
-overlay the accepted OR-style source-state consensus group-velocity curve.
-"""
-function plot_consensus_groupvelocity_picks(batch_result::BranchBatchAnalysisResult,
-                                            consensus_result::SourceStateConsensusPick;
-                                            correlation_threshold::Float64=0.85,
-                                            velocity_tolerance_fraction::Float64=0.10,
-                                            colorscale::String="Viridis",
-                                            width::Int=1200,
-                                            height::Int=700,
-                                            font_family::String="Arial, sans-serif",
-                                            font_size::Int=13,
-                                            title::String="Source-State Consensus Group-Velocity Picks")
-    nperiods = length(consensus_result.periods)
-    nstates = length(batch_result.state_results)
-    state_colors = _sample_scheme_colors(colorscale, max(nstates, 2))
-    traces = [scatter()]
-    all_vels = Float64[]
-
-    for istate in 1:nstates
-        xp = Float64[]
-        yp = Float64[]
-        cp = Float64[]
-        label = batch_result.state_labels[istate]
-
-        for ip in 1:nperiods
-            st = batch_result.state_results[istate]
-            corr = st.branch_correlation[ip]
-            (isfinite(corr) && corr >= correlation_threshold) || continue
-            causal_peaks = st.causal_result.all_peaks[ip]
-            acausal_peaks = st.acausal_result.all_peaks[ip]
-            matched_velocities = _matched_peak_average_velocities(causal_peaks, acausal_peaks, st.distance;
-                                                                  velocity_tolerance_fraction=velocity_tolerance_fraction)
-            for velocity in matched_velocities
-                isfinite(velocity) && velocity > 0.0 || continue
-                push!(xp, consensus_result.periods[ip])
-                push!(yp, velocity)
-                push!(cp, corr)
-                push!(all_vels, velocity)
-            end
-        end
-
-        isempty(xp) && continue
-        push!(traces, scatter(
-            x=xp,
-            y=yp,
-            mode="markers",
-            marker=attr(size=6, color=state_colors[istate], opacity=0.28, symbol="circle"),
-            name="$(label) candidates",
-            hovertemplate="State: $(label)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
-            customdata=cp
-        ))
-    end
-
-    candidate_colors = ["#111111", "#d62728", "#1f77b4", "#2ca02c", "#9467bd"]
-    ncandidates = size(consensus_result.candidate_group_velocities, 2)
-
-    for icand in 1:ncandidates
-        vels = consensus_result.candidate_group_velocities[:, icand]
-        valid = findall(v -> isfinite(v) && v > 0.0, vels)
-        isempty(valid) && continue
-
-        append!(all_vels, vels[valid])
-        marker_sizes = [8 + 3 * consensus_result.candidate_support[ip, icand] for ip in valid]
-        custom = [[consensus_result.candidate_confidence[ip, icand],
-                   consensus_result.candidate_support[ip, icand],
-                   icand] for ip in valid]
-        color = candidate_colors[mod1(icand, length(candidate_colors))]
-
-        push!(traces, scatter(
-            x=consensus_result.periods,
-            y=vels,
-            mode="lines+markers",
-            connectgaps=false,
-            line=attr(color=color, width=icand == 1 ? 3.0 : 2.2, dash=icand == 1 ? "solid" : "dash"),
-            marker=attr(
-                size=[isfinite(vels[ip]) && vels[ip] > 0.0 ? 8 + 3 * consensus_result.candidate_support[ip, icand] : 0 for ip in 1:nperiods],
-                color=consensus_result.candidate_confidence[:, icand],
-                colorscale="Viridis",
-                cmin=0.0,
-                cmax=1.0,
-                colorbar=icand == 1 ? attr(title="Confidence") : nothing,
-                symbol=icand == 1 ? "diamond" : "circle",
-                line=attr(color="white", width=1.0)
-            ),
-            name="Consensus candidate $(icand)",
-            hovertemplate="Consensus candidate %{customdata[2]}<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Confidence: %{customdata[0]:.3f}<br>Support: %{customdata[1]} states<extra></extra>",
-            customdata=[[consensus_result.candidate_confidence[ip, icand],
-                         consensus_result.candidate_support[ip, icand],
-                         icand] for ip in 1:nperiods]
-        ))
-    end
-
-    if length(traces) == 1 || isempty(all_vels)
-        @warn "No source-state consensus candidates available"
-        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No consensus candidates"]))
-    end
-
-    y_min = 0.9 * minimum(all_vels)
-    y_max = 1.1 * maximum(all_vels)
-
-    layout = Layout(
-        title=attr(text=title, font=attr(size=font_size + 2, family=font_family)),
-        xaxis=attr(title="Period (s)", type="linear", range=[minimum(consensus_result.periods), maximum(consensus_result.periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        yaxis=attr(title="Group Velocity (km/s)", range=[y_min, y_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        width=width,
-        height=height,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        margin=attr(l=80, r=120, t=80, b=80),
-        showlegend=true,
-        legend=attr(x=1.02, y=1.0, font=attr(size=font_size - 2), bgcolor="rgba(255,255,255,0.8)", borderwidth=1)
-    )
-
-    return PlutoPlotly.plot(traces, layout)
-end
-
-# ╔═╡ 6e91e0bb-ef16-48bc-a9c9-f5b2d691ee1a
-"""
-    ReceiverPairGeometry
-
-Endpoint and ray-path summary for one receiver pair.
-"""
-struct ReceiverPairGeometry
-    station1::String
-    station2::String
-    lat1::Float64
-    lon1::Float64
-    lat2::Float64
-    lon2::Float64
-    midpoint_lat::Float64
-    midpoint_lon::Float64
-    distance_km::Float64
-    azimuth_deg::Float64
-end
-
-# ╔═╡ 19ac99e3-f2b0-4d78-af7d-b688d548724b
-"""
-    PairConsensusForTomography
-
-Geometry plus source-state consensus candidates for one receiver pair.
-"""
-struct PairConsensusForTomography
-    label::String
-    pair::Tuple{String,String}
-    geometry::ReceiverPairGeometry
-    consensus::SourceStateConsensusPick
-end
-
-# ╔═╡ c50a86d5-7f3e-4d03-9583-0a33a238e227
-"""
-    TomographyCandidateMix
-
-One candidate curve for tomography. `candidate_indices` may contain several
-non-overlapping consensus candidate columns from the same receiver pair.
-"""
-struct TomographyCandidateMix
-    pair_index::Int
-    label::String
-    candidate_indices::Vector{Int}
-    group_velocities::Vector{Float64}
-    confidence::Vector{Float64}
-    support::Vector{Int}
-    coverage_count::Int
-    mean_confidence::Float64
-    neighbor_agreement::Float64
-    total_score::Float64
-end
-
-# ╔═╡ b2460f88-a89c-4402-a3ee-6f9190624932
-function _haversine_km(lat1::Real, lon1::Real, lat2::Real, lon2::Real)
-    r = 6371.0
-    φ1, φ2 = deg2rad(Float64(lat1)), deg2rad(Float64(lat2))
-    dφ = deg2rad(Float64(lat2 - lat1))
-    dλ = deg2rad(Float64(lon2 - lon1))
-    a = sin(dφ / 2)^2 + cos(φ1) * cos(φ2) * sin(dλ / 2)^2
-    return 2.0 * r * asin(min(1.0, sqrt(a)))
-end
-
-# ╔═╡ 9da0699a-8146-44b7-8eef-89f3e7cf6882
-function _azimuth_deg(lat1::Real, lon1::Real, lat2::Real, lon2::Real)
-    φ1, φ2 = deg2rad(Float64(lat1)), deg2rad(Float64(lat2))
-    dλ = deg2rad(Float64(lon2 - lon1))
-    y = sin(dλ) * cos(φ2)
-    x = cos(φ1) * sin(φ2) - sin(φ1) * cos(φ2) * cos(dλ)
-    return mod(rad2deg(atan(y, x)) + 360.0, 360.0)
-end
-
-# ╔═╡ b67deee3-1244-4f49-81bd-05c86b0c9084
-function _axial_angle_difference_deg(a::Real, b::Real)
-    d = abs(mod(Float64(a - b) + 180.0, 360.0) - 180.0)
-    return min(d, 180.0 - d)
-end
-
-# ╔═╡ 40e5fc55-8f4e-43fa-8ac7-eaa9608a18c7
-function receiver_pair_geometry(pair::Tuple{<:AbstractString,<:AbstractString},
-                                latitudes::AbstractVector{<:Real},
-                                longitudes::AbstractVector{<:Real};
-                                distance::Union{Nothing,Real}=nothing)
-    length(latitudes) >= 2 || throw(ArgumentError("latitudes must contain two endpoints"))
-    length(longitudes) >= 2 || throw(ArgumentError("longitudes must contain two endpoints"))
-
-    lat1, lat2 = Float64(latitudes[1]), Float64(latitudes[2])
-    lon1, lon2 = Float64(longitudes[1]), Float64(longitudes[2])
-    midpoint_lat = 0.5 * (lat1 + lat2)
-    midpoint_lon = 0.5 * (lon1 + lon2)
-    dist = isnothing(distance) ? _haversine_km(lat1, lon1, lat2, lon2) : Float64(distance)
-    az = _azimuth_deg(lat1, lon1, lat2, lon2)
-
-    return ReceiverPairGeometry(String(pair[1]), String(pair[2]),
-                                lat1, lon1, lat2, lon2,
-                                midpoint_lat, midpoint_lon, dist, az)
-end
-
-# ╔═╡ f203a997-875b-42df-a0af-196d11e7c0af
-function tomography_pair_consensus(pair::Tuple{<:AbstractString,<:AbstractString},
-                                   consensus::SourceStateConsensusPick;
-                                   latitudes,
-                                   longitudes,
-                                   distance=nothing,
-                                   label::Union{Nothing,String}=nothing)
-    geom = receiver_pair_geometry(pair, latitudes, longitudes; distance=distance)
-    lbl = isnothing(label) ? "$(pair[1])-$(pair[2])" : label
-    return PairConsensusForTomography(lbl, (String(pair[1]), String(pair[2])), geom, consensus)
-end
-
-# ╔═╡ a05f6476-568b-4c82-9512-f74ae6d6c8f3
-function similar_ray_paths(a::ReceiverPairGeometry, b::ReceiverPairGeometry;
-                           midpoint_radius_km::Float64=75.0,
-                           azimuth_tolerance_deg::Float64=25.0,
-                           distance_tolerance_fraction::Float64=0.35)
-    mid_dist = _haversine_km(a.midpoint_lat, a.midpoint_lon, b.midpoint_lat, b.midpoint_lon)
-    az_diff = _axial_angle_difference_deg(a.azimuth_deg, b.azimuth_deg)
-    dist_rel = abs(a.distance_km - b.distance_km) / max((a.distance_km + b.distance_km) / 2.0, eps(Float64))
-    return mid_dist <= midpoint_radius_km &&
-           az_diff <= azimuth_tolerance_deg &&
-           dist_rel <= distance_tolerance_fraction
-end
-
-# ╔═╡ 730cd90e-9afe-413a-ae31-fe624a919bb8
-function _nonoverlapping_candidate_sets(consensus::SourceStateConsensusPick;
-                                        max_mix_parts::Int=3,
-                                        min_candidate_periods::Int=2)
-    ncandidates = size(consensus.candidate_group_velocities, 2)
-    valid_masks = [isfinite.(consensus.candidate_group_velocities[:, i]) .&
-                   (consensus.candidate_group_velocities[:, i] .> 0.0)
-                   for i in 1:ncandidates]
-    valid_indices = [i for i in 1:ncandidates if count(valid_masks[i]) >= min_candidate_periods]
-    mixes = Vector{Vector{Int}}()
-
-    function extend!(current::Vector{Int}, start_pos::Int, used_mask::BitVector)
-        !isempty(current) && push!(mixes, copy(current))
-        length(current) >= max_mix_parts && return
-        for pos in start_pos:length(valid_indices)
-            idx = valid_indices[pos]
-            any(used_mask .& valid_masks[idx]) && continue
-            push!(current, idx)
-            extend!(current, pos + 1, used_mask .| valid_masks[idx])
-            pop!(current)
-        end
-    end
-
-    extend!(Int[], 1, falses(length(consensus.periods)))
-    return mixes
-end
-
-# ╔═╡ eab08182-daca-4206-882b-e4fb24ae17a2
-function _build_mix_curve(consensus::SourceStateConsensusPick, candidate_indices::Vector{Int})
-    nperiods = length(consensus.periods)
-    velocities = fill(NaN, nperiods)
-    confidence = fill(0.0, nperiods)
-    support = zeros(Int, nperiods)
-
-    for idx in candidate_indices
-        vals = consensus.candidate_group_velocities[:, idx]
-        mask = isfinite.(vals) .& (vals .> 0.0)
-        velocities[mask] .= vals[mask]
-        confidence[mask] .= consensus.candidate_confidence[mask, idx]
-        support[mask] .= consensus.candidate_support[mask, idx]
-    end
-
-    return velocities, confidence, support
-end
-
-# ╔═╡ c6331917-8167-4dfa-9a50-6fe0888d16d5
-function _neighbor_agreement(mix::TomographyCandidateMix,
-                             all_mixes::Vector{TomographyCandidateMix},
-                             pairs::Vector{PairConsensusForTomography};
-                             midpoint_radius_km::Float64=75.0,
-                             azimuth_tolerance_deg::Float64=25.0,
-                             distance_tolerance_fraction::Float64=0.35,
-                             velocity_tolerance_fraction::Float64=0.10)
-    geom = pairs[mix.pair_index].geometry
-    total = 0
-    agree = 0
-
-    for ip in eachindex(mix.group_velocities)
-        v = mix.group_velocities[ip]
-        isfinite(v) && v > 0.0 || continue
-        total += 1
-        period_agrees = false
-
-        for other in all_mixes
-            other.pair_index == mix.pair_index && continue
-            similar_ray_paths(geom, pairs[other.pair_index].geometry;
-                              midpoint_radius_km=midpoint_radius_km,
-                              azimuth_tolerance_deg=azimuth_tolerance_deg,
-                              distance_tolerance_fraction=distance_tolerance_fraction) || continue
-            vo = other.group_velocities[ip]
-            isfinite(vo) && vo > 0.0 || continue
-            if _relative_difference(v, vo) <= velocity_tolerance_fraction
-                period_agrees = true
-                break
-            end
-        end
-
-        period_agrees && (agree += 1)
-    end
-
-    total == 0 && return 0.0
-    return agree / total
-end
-
-# ╔═╡ 3626d6ca-38f2-4b38-9398-9cd052f43950
-"""
-    tomography_candidate_mixes(pairs; kwargs...) -> Vector{TomographyCandidateMix}
-
-Create and score tomography-ready candidate curves from per-pair consensus
-results. Each output can be one consensus candidate or a non-overlapping mix of
-candidate columns from the same receiver pair. Scores prefer period coverage,
-confidence/support, and agreement with geometrically similar ray paths.
-"""
-function tomography_candidate_mixes(pairs::Vector{PairConsensusForTomography};
-                                    max_mix_parts::Int=3,
-                                    min_candidate_periods::Int=2,
-                                    midpoint_radius_km::Float64=75.0,
-                                    azimuth_tolerance_deg::Float64=25.0,
-                                    distance_tolerance_fraction::Float64=0.35,
-                                    velocity_tolerance_fraction::Float64=0.10,
-                                    coverage_weight::Float64=1.0,
-                                    confidence_weight::Float64=0.5,
-                                    support_weight::Float64=0.25,
-                                    neighbor_weight::Float64=1.0)
-    mixes = TomographyCandidateMix[]
-
-    for (pair_index, item) in enumerate(pairs)
-        candidate_sets = _nonoverlapping_candidate_sets(item.consensus;
-                                                        max_mix_parts=max_mix_parts,
-                                                        min_candidate_periods=min_candidate_periods)
-        for candidate_indices in candidate_sets
-            velocities, confidence, support = _build_mix_curve(item.consensus, candidate_indices)
-            coverage = count(v -> isfinite(v) && v > 0.0, velocities)
-            coverage >= min_candidate_periods || continue
-            mean_conf = _mean_finite([c for c in confidence if c > 0.0])
-            isfinite(mean_conf) || (mean_conf = 0.0)
-            label = "$(item.label) | candidates $(join(candidate_indices, "+"))"
-            push!(mixes, TomographyCandidateMix(pair_index, label, candidate_indices,
-                                                velocities, confidence, support,
-                                                coverage, mean_conf, 0.0, 0.0))
-        end
-    end
-
-    scored = TomographyCandidateMix[]
-    max_coverage = maximum([m.coverage_count for m in mixes]; init=1)
-    max_support = maximum([maximum(m.support; init=0) for m in mixes]; init=1)
-
-    for mix in mixes
-        neighbor = _neighbor_agreement(mix, mixes, pairs;
-                                       midpoint_radius_km=midpoint_radius_km,
-                                       azimuth_tolerance_deg=azimuth_tolerance_deg,
-                                       distance_tolerance_fraction=distance_tolerance_fraction,
-                                       velocity_tolerance_fraction=velocity_tolerance_fraction)
-        support_score = _mean_finite([s / max_support for s in mix.support if s > 0])
-        isfinite(support_score) || (support_score = 0.0)
-        total = coverage_weight * (mix.coverage_count / max_coverage) +
-                confidence_weight * mix.mean_confidence +
-                support_weight * support_score +
-                neighbor_weight * neighbor
-
-        push!(scored, TomographyCandidateMix(mix.pair_index, mix.label, mix.candidate_indices,
-                                             mix.group_velocities, mix.confidence, mix.support,
-                                             mix.coverage_count, mix.mean_confidence, neighbor, total))
-    end
-
-    sort!(scored, by=m -> -m.total_score)
-    return scored
-end
-
 # ╔═╡ a1000001-0000-0000-0000-000000000001
 function _column_normalise(X)
     Xf = Float64.(X)
@@ -3924,161 +4124,131 @@ function plot_state_ncc_heatmap(acausal::AbstractMatrix, causal::AbstractMatrix;
     return PlutoPlotly.plot([trace_ac, trace_c], layout)
 end
 
-# ╔═╡ a1000008-0000-0000-0000-000000000001
-function plot_top_tomography_mixes(mixes, pairs; n::Int=25,
-        period_min::Real=1.0, period_max::Real=100.0)
-    isempty(mixes) && return PlutoPlotly.plot(PlutoPlotly.scatter(x=[0], y=[0], text=["No mixes"]))
-    top = mixes[1:min(n, length(mixes))]
-    all_vels = Float64[]
-    colors = [Colors.hex(get(ColorSchemes.viridis, (i - 1) / max(1, length(top) - 1))) for i in 1:length(top)]
-    traces = [PlutoPlotly.scatter()]
-    for (i, mix) in enumerate(top)
-        valid = findall(v -> isfinite(v) && v > 0.0, mix.group_velocities)
-        isempty(valid) && continue
-        append!(all_vels, mix.group_velocities[valid])
-        pair = pairs[mix.pair_index]
-        push!(traces, PlutoPlotly.scatter(
-            x=pair.consensus.periods[valid],
-            y=mix.group_velocities[valid],
-            mode="lines+markers",
-            name=mix.label,
-            line=attr(color=colors[i], width=2),
-            marker=attr(size=6, color=colors[i]),
-            customdata=[[mix.total_score, mix.neighbor_agreement, mix.coverage_count] for _ in valid],
-            hovertemplate="%{fullData.name}<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Score: %{customdata[0]:.3f}<br>Neighbor agree: %{customdata[1]:.3f}<br>Periods: %{customdata[2]}<extra></extra>",
-        ))
-    end
-    isempty(all_vels) && return PlutoPlotly.plot(PlutoPlotly.scatter(x=[0], y=[0], text=["No valid velocities"]))
-    return PlutoPlotly.plot(traces, PlutoPlotly.Layout(
-        title="Top trained-VQ-VAE tomography candidate mixes",
-        xaxis=attr(title="Period (s)", type="linear", range=[period_min, period_max]),
-        yaxis=attr(title="Group velocity (km/s)", range=[0.9 * minimum(all_vels), 1.1 * maximum(all_vels)]),
-        width=1200, height=720,
-        plot_bgcolor="white", paper_bgcolor="white",
-        legend=attr(x=1.02, y=1.0),
-        margin=attr(l=80, r=180, t=70, b=70),
-    ))
-end
-
 # ╔═╡ 1f405df8-9fef-436a-a713-1e2cab48b541
 begin
-	"""
-	    MFTFilterBank
+	begin
+		"""
+		    MFTFilterBank
+		
+		Pre-computed Gaussian filter bank for efficient repeated MFT analysis.
+		Stores FFTW plans, workspace buffers, and filter coefficients so that
+		`perform_mft_analysis_batch!` requires only one batch FFT + nfreq IFFTs
+		for N waveforms, with no heap allocation after the first call.
+		
+		Construct once per notebook session (parameters fixed by dt, npts, periods).
+		Set `N_initial` to the maximum waveform-column count the bang calls will use.
+		"""
+		mutable struct MFTFilterBank{T<:AbstractFloat}
+		    # geometry
+		    periods::Vector{Float64}
+		    frequencies::Vector{Float64}
+		    dt::Float64                 # upsampled = dt_original / upsample_factor
+		    dt_original::Float64
+		    npts_original::Int          # length after upsampling (before pad)
+		    npts_padded::Int            # npts_original * zero_pad_factor
+		    nfreq::Int
+		    velocity_range::Tuple{Float64,Float64}
+		    bandwidth_factor::Float64
+		    zero_pad_factor::Int
+		    upsample_factor::Float64
+		    time::Vector{Float64}       # (npts_original,) time axis starting at dt
+		
+		    # pre-computed filter weights: one-sided Gaussians, ×2 on positive freqs, neg freqs = 0
+		    H_full::Matrix{Complex{T}}  # (npts_padded × nfreq)
+		
+		    # workspace preallocated for N_buf waveform columns
+		    N_buf::Int
+		    W_pad_buf::Matrix{Complex{T}}    # (npts_padded × N_buf) input after upsample+pad
+		    SPEC_buf::Matrix{Complex{T}}     # (npts_padded × N_buf) FFT of W_pad_buf
+		    Z_buf::Matrix{Complex{T}}        # (npts_padded × N_buf) per-freq filtered spectrum
+		    Z_time_buf::Matrix{Complex{T}}   # (npts_padded × N_buf) IFFT result (analytic signal)
+		    envelopes_buf::Union{Nothing,Array{T,3}}  # Full-storage Hilbert envelopes
+		    filtered_buf::Union{Nothing,Array{T,3}}   # Full-storage real filtered traces
+		    arrivals_buf::Matrix{Float64}    # (nfreq × N_buf) group arrival times
+		    phases_buf::Matrix{Float64}      # (nfreq × N_buf) wrapped phases at group arrival
+	        storage_mode::Symbol
+		
+		    # FFTW out-of-place plans: mul!(dst, plan, src) writes into dst without allocating
+		    plan_fwd::Any   # plan_fft(W_pad_buf, 1)  — mul!(SPEC_buf, plan_fwd, W_pad_buf)
+		    plan_inv::Any   # plan_ifft(Z_buf, 1)     — mul!(Z_time_buf, plan_inv, Z_buf)
+		end
+		
+		function MFTFilterBank(dt_original::Real, npts_raw::Int,
+		                       periods::Vector{Float64};
+		                       bandwidth_factor::Float64=sqrt(2.0/25.0),
+		                       zero_pad_factor::Int=4,
+		                       upsample_factor::Real=2.0,
+		                       velocity_range::Tuple{Float64,Float64}=(2.0, 6.0),
+	                           precision::Type{T}=Float32,
+	                           storage_mode::Symbol=:picks_only,
+		                       N_initial::Int=1) where {T<:AbstractFloat}
+	        storage_mode in (:picks_only, :full) ||
+	            throw(ArgumentError("storage_mode must be :picks_only or :full"))
+			
+		    upsample = Float64(upsample_factor)
+		    upsample > 0.0 || throw(ArgumentError("upsample_factor must be positive"))
 	
-	Pre-computed Gaussian filter bank for efficient repeated MFT analysis.
-	Stores FFTW plans, workspace buffers, and filter coefficients so that
-	`perform_mft_analysis_batch!` requires only one batch FFT + nfreq IFFTs
-	for N waveforms, with no heap allocation after the first call.
-	
-	Construct once per notebook session (parameters fixed by dt, npts, periods).
-	The workspace is resized lazily if called with more columns than N_initial.
-	"""
-	mutable struct MFTFilterBank
-	    # geometry
-	    periods::Vector{Float64}
-	    frequencies::Vector{Float64}
-	    dt::Float64                 # upsampled = dt_original / 10
-	    dt_original::Float64
-	    npts_original::Int          # length after 10× upsample (before pad)
-	    npts_padded::Int            # npts_original * zero_pad_factor
-	    nfreq::Int
-	    velocity_range::Tuple{Float64,Float64}
-	    bandwidth_factor::Float64
-	    zero_pad_factor::Int
-	    time::Vector{Float64}       # (npts_original,) time axis starting at dt
-	
-	    # pre-computed filter weights: one-sided Gaussians, ×2 on positive freqs, neg freqs = 0
-	    H_full::Matrix{ComplexF64}  # (npts_padded × nfreq)
-	
-	    # workspace (sized for N_buf columns; resized lazily via _ensure_batch_size!)
-	    N_buf::Int
-	    W_pad_buf::Matrix{ComplexF64}    # (npts_padded × N_buf) input after upsample+pad
-	    SPEC_buf::Matrix{ComplexF64}     # (npts_padded × N_buf) FFT of W_pad_buf
-	    Z_buf::Matrix{ComplexF64}        # (npts_padded × N_buf) per-freq filtered spectrum
-	    Z_time_buf::Matrix{ComplexF64}   # (npts_padded × N_buf) IFFT result (analytic signal)
-	    envelopes_buf::Array{Float64,3}  # (npts_original × nfreq × N_buf) Hilbert envelopes
-	    filtered_buf::Array{Float64,3}   # (npts_original × nfreq × N_buf) real filtered traces
-	    arrivals_buf::Matrix{Float64}    # (nfreq × N_buf) group arrival times
-	    phases_buf::Matrix{Float64}      # (nfreq × N_buf) wrapped phases at group arrival
-	
-	    # FFTW out-of-place plans: mul!(dst, plan, src) writes into dst without allocating
-	    plan_fwd::Any   # plan_fft(W_pad_buf, 1)  — mul!(SPEC_buf, plan_fwd, W_pad_buf)
-	    plan_inv::Any   # plan_ifft(Z_buf, 1)     — mul!(Z_time_buf, plan_inv, Z_buf)
+		    dt_original = Float64(dt_original)
+		    dt = dt_original / upsample
+		    # Derive exact upsampled length using the same matrix code path as perform_mft_analysis_batch!
+		    npts_original = upsample == 1.0 ? npts_raw :
+		        size(DSP.resample(zeros(T, npts_raw, 1), upsample; dims=1), 1)
+		    npts_padded   = npts_original * zero_pad_factor
+		    nfreq         = length(periods)
+		    frequencies   = 1.0 ./ periods
+		
+		    # Build H_full: one-sided complex Gaussian filter matrix
+		    freqs_full = fftfreq(npts_padded, 1.0 / dt)
+		    H_full = zeros(Complex{T}, npts_padded, nfreq)
+		    for ifreq in 1:nfreq
+		        f0    = frequencies[ifreq]
+		        sigma = f0 * bandwidth_factor / 2.0
+		        for k in eachindex(freqs_full)
+		            f = freqs_full[k]
+		            if f > 0.0
+		                H_full[k, ifreq] = T(2.0 * exp(-0.5 * ((f - f0) / sigma)^2))
+		            elseif f == 0.0
+		                H_full[k, ifreq] = T(exp(-0.5 * (f0 / sigma)^2))
+		            end
+		            # f < 0: stays zero — one-sided analytic spectrum
+		        end
+		    end
+		
+		    time = collect(range(dt, step=dt, length=npts_original))
+		
+		    W_pad_buf  = zeros(Complex{T}, npts_padded, N_initial)
+		    SPEC_buf   = zeros(Complex{T}, npts_padded, N_initial)
+		    Z_buf      = zeros(Complex{T}, npts_padded, N_initial)
+		    Z_time_buf = zeros(Complex{T}, npts_padded, N_initial)
+		    envelopes_buf = storage_mode == :full ? zeros(T, npts_original, nfreq, N_initial) : nothing
+		    filtered_buf  = storage_mode == :full ? zeros(T, npts_original, nfreq, N_initial) : nothing
+		    arrivals_buf  = fill(NaN, nfreq, N_initial)
+		    phases_buf    = fill(NaN, nfreq, N_initial)
+		
+		    # Out-of-place plans measured against the initial buffer shapes
+		    plan_fwd = FFTW.plan_fft(W_pad_buf, 1)
+		    plan_inv = FFTW.plan_ifft(Z_buf, 1)
+		
+			    MFTFilterBank{T}(
+			        periods, frequencies, dt, dt_original, npts_original, npts_padded, nfreq,
+			        velocity_range, bandwidth_factor, zero_pad_factor, upsample, time, H_full,
+		        N_initial, W_pad_buf, SPEC_buf, Z_buf, Z_time_buf,
+		        envelopes_buf, filtered_buf, arrivals_buf, phases_buf, storage_mode,
+		        plan_fwd, plan_inv,
+		    )
+		end
 	end
 	
-	function MFTFilterBank(dt_original::Float64, npts_raw::Int,
-	                       periods::Vector{Float64};
-	                       bandwidth_factor::Float64=sqrt(2.0/25.0),
-	                       zero_pad_factor::Int=4,
-	                       velocity_range::Tuple{Float64,Float64}=(2.0, 6.0),
-	                       N_initial::Int=256)
-	
-	    dt = dt_original / 10.0
-	    # Derive exact upsampled length using the same matrix code path as perform_mft_analysis_batch!
-	    npts_original = size(DSP.resample(zeros(npts_raw, 1), 10.0; dims=1), 1)
-	    npts_padded   = npts_original * zero_pad_factor
-	    nfreq         = length(periods)
-	    frequencies   = 1.0 ./ periods
-	
-	    # Build H_full: one-sided complex Gaussian filter matrix
-	    freqs_full = fftfreq(npts_padded, 1.0 / dt)
-	    H_full = zeros(ComplexF64, npts_padded, nfreq)
-	    for ifreq in 1:nfreq
-	        f0    = frequencies[ifreq]
-	        sigma = f0 * bandwidth_factor / 2.0
-	        for k in eachindex(freqs_full)
-	            f = freqs_full[k]
-	            if f > 0.0
-	                H_full[k, ifreq] = 2.0 * exp(-0.5 * ((f - f0) / sigma)^2)
-	            elseif f == 0.0
-	                H_full[k, ifreq] = exp(-0.5 * (f0 / sigma)^2)
-	            end
-	            # f < 0: stays zero — one-sided analytic spectrum
-	        end
-	    end
-	
-	    time = collect(range(dt, step=dt, length=npts_original))
-	
-	    W_pad_buf  = zeros(ComplexF64, npts_padded, N_initial)
-	    SPEC_buf   = zeros(ComplexF64, npts_padded, N_initial)
-	    Z_buf      = zeros(ComplexF64, npts_padded, N_initial)
-	    Z_time_buf = zeros(ComplexF64, npts_padded, N_initial)
-	    envelopes_buf = zeros(Float64, npts_original, nfreq, N_initial)
-	    filtered_buf  = zeros(Float64, npts_original, nfreq, N_initial)
-	    arrivals_buf  = fill(NaN, nfreq, N_initial)
-	    phases_buf    = fill(NaN, nfreq, N_initial)
-	
-	    # Out-of-place plans measured against the initial buffer shapes
-	    plan_fwd = FFTW.plan_fft(W_pad_buf, 1)
-	    plan_inv = FFTW.plan_ifft(Z_buf, 1)
-	
-	    MFTFilterBank(
-	        periods, frequencies, dt, dt_original, npts_original, npts_padded, nfreq,
-	        velocity_range, bandwidth_factor, zero_pad_factor, time, H_full,
-	        N_initial, W_pad_buf, SPEC_buf, Z_buf, Z_time_buf,
-	        envelopes_buf, filtered_buf, arrivals_buf, phases_buf,
-	        plan_fwd, plan_inv,
-	    )
-	end
+	_bank_float_type(::MFTFilterBank{T}) where {T} = T
 end
 
-# ╔═╡ c062cc38-7e5e-4df7-8a19-ae23191c343c
-
-
 # ╔═╡ c9da28e0-64ae-491f-879e-47b2490babac
-function _ensure_batch_size!(bank::MFTFilterBank, N::Int)
-    N <= bank.N_buf && return
-    bank.N_buf         = N
-    bank.W_pad_buf     = zeros(ComplexF64, bank.npts_padded, N)
-    bank.SPEC_buf      = zeros(ComplexF64, bank.npts_padded, N)
-    bank.Z_buf         = zeros(ComplexF64, bank.npts_padded, N)
-    bank.Z_time_buf    = zeros(ComplexF64, bank.npts_padded, N)
-    bank.envelopes_buf = zeros(Float64, bank.npts_original, bank.nfreq, N)
-    bank.filtered_buf  = zeros(Float64, bank.npts_original, bank.nfreq, N)
-    bank.arrivals_buf  = fill(NaN, bank.nfreq, N)
-    bank.phases_buf    = fill(NaN, bank.nfreq, N)
-    bank.plan_fwd = FFTW.plan_fft(bank.W_pad_buf, 1)
-    bank.plan_inv = FFTW.plan_ifft(bank.Z_buf, 1)
+function _require_batch_size(bank::MFTFilterBank, N::Int)
+    N <= bank.N_buf || throw(ArgumentError(
+        "MFTFilterBank was preallocated for $(bank.N_buf) waveform columns, " *
+        "but this call needs $(N). Allocate a bank with N_initial >= $(N) " *
+        "or use non-bang perform_mft_analysis_batch to allocate a call-local bank."
+    ))
     return nothing
 end
 
@@ -4086,12 +4256,23 @@ end
 function _assemble_mft_result(bank::MFTFilterBank, dist::Float64, n::Int,
                                all_peaks_n::Vector{Vector{Tuple{Float64,Float64}}};
                                compute_phase::Bool=false,
-                               phvel_correction::Float64=0.0)
+                               use_phtovel::Bool=false,
+                               phvel_correction::Float64=0.0,
+                               phvel_source_phase::Float64=phvel_correction,
+                               min_anchor_quality::Float64=3.0,
+                               phase_anchor_velocity::Float64=3.3,
+                               phase_velocity_range::Tuple{Float64,Float64}=(2.5, 4.5),
+                               phase_smoothness_jump::Float64=0.05,
+                               phase_plausible_range::Tuple{Float64,Float64}=(0.5, 20.0),
+                               phtovel_prior_periods=nothing,
+                               phtovel_prior_velocities=nothing)
     nfreq = bank.nfreq
-    phase_branch_numbers = collect(-3:3)
+    phase_branch_numbers = copy(DEFAULT_PHASE_BRANCH_NUMBERS)
     nbranches = length(phase_branch_numbers)
 
     arrivals     = bank.arrivals_buf[:, n]
+    bank.storage_mode == :full ||
+        throw(ArgumentError("_assemble_mft_result requires a :full MFTFilterBank"))
     filtered     = bank.filtered_buf[:, :, n]
     envelopes    = bank.envelopes_buf[:, :, n]
 
@@ -4100,7 +4281,10 @@ function _assemble_mft_result(bank::MFTFilterBank, dist::Float64, n::Int,
     quality_factors       = zeros(Float64, nfreq)
     phase_velocities      = fill(NaN, nfreq)
     phase_velocity_branches = fill(NaN, nfreq, nbranches)
-    raw_phases            = fill(NaN, nfreq)
+    measured_phases       = fill(NaN, nfreq)
+    selected_phase_branches = fill(0, nfreq)
+    phase_suspect         = falses(nfreq)
+    u_predicted_from_phase = fill(NaN, nfreq)
 
     for ifreq in 1:nfreq
         t_g = arrivals[ifreq]
@@ -4116,33 +4300,35 @@ function _assemble_mft_result(bank::MFTFilterBank, dist::Float64, n::Int,
         quality_factors[ifreq] = mean_env > 0.0 ? amplitudes[ifreq] / mean_env : 0.0
 
         if compute_phase && !isnan(t_g) && t_g > 0.0
-            raw_phases[ifreq] = bank.phases_buf[ifreq, n]
+            measured_phases[ifreq] = bank.phases_buf[ifreq, n]
         end
     end
 
     if compute_phase
-        valid = .!isnan.(raw_phases) .& .!isnan.(arrivals) .& (arrivals .> 0.0)
-        valid_idxs = findall(valid)
-        if length(valid_idxs) >= 2
-            omegas = 2π .* bank.frequencies
-            order  = sortperm(bank.frequencies[valid_idxs])
-            valid_sorted = valid_idxs[order]
-            phase_diffs_valid = [
-                omegas[i] * arrivals[i] - raw_phases[i] + phvel_correction
-                for i in valid_sorted
-            ]
-            phase_diffs_unwrapped = DSP.unwrap(phase_diffs_valid)
-            for (j, i) in enumerate(valid_sorted)
-                denom0 = phase_diffs_unwrapped[j]
-                for (ib, branch) in enumerate(phase_branch_numbers)
-                    denom = denom0 + 2π * branch
-                    if abs(denom) > 1e-6
-                        c = omegas[i] * dist / denom
-                        phase_velocity_branches[i, ib] = (0.5 ≤ c ≤ 20.0) ? c : NaN
-                    end
-                end
-                phase_velocities[i] = phase_velocity_branches[i, findfirst(==(0), phase_branch_numbers)]
-            end
+        if use_phtovel
+            finish_phase_velocity_picks_phtovel!(phase_velocities, measured_phases,
+                                                 selected_phase_branches,
+                                                 phase_suspect, u_predicted_from_phase,
+                                                 bank.periods, bank.frequencies, arrivals,
+                                                 dist, phvel_source_phase;
+                                                 phase_anchor_velocity=phase_anchor_velocity,
+                                                 phase_velocity_range=phase_velocity_range,
+                                                 phase_smoothness_jump=phase_smoothness_jump,
+                                                 phase_plausible_range=phase_plausible_range,
+                                                 phtovel_prior_periods=phtovel_prior_periods,
+                                                 phtovel_prior_velocities=phtovel_prior_velocities)
+        else
+            finish_phase_velocity_picks!(phase_velocities, phase_velocity_branches,
+                                         measured_phases, selected_phase_branches,
+                                         phase_suspect, u_predicted_from_phase,
+                                         bank.periods, bank.frequencies, arrivals, dist,
+                                         quality_factors, phase_branch_numbers,
+                                         phvel_source_phase;
+                                         min_anchor_quality=min_anchor_quality,
+                                         phase_anchor_velocity=phase_anchor_velocity,
+                                         phase_velocity_range=phase_velocity_range,
+                                         phase_smoothness_jump=phase_smoothness_jump,
+                                         phase_plausible_range=phase_plausible_range)
         end
     end
 
@@ -4150,15 +4336,20 @@ function _assemble_mft_result(bank::MFTFilterBank, dist::Float64, n::Int,
         bank.periods, bank.frequencies,
         group_velocities, phase_velocities,
         phase_branch_numbers, phase_velocity_branches,
+        measured_phases, selected_phase_branches, phase_suspect,
+        u_predicted_from_phase,
         amplitudes, filtered, envelopes, arrivals,
-        dist, quality_factors, all_peaks_n, bank.time,
+        dist, quality_factors, all_peaks_n, bank.time, :full,
     )
 end
 
 # ╔═╡ 9a6cb7e1-6ea0-4dd1-97f3-47f3b8a717de
 # --- Phase 1: dist-independent (upsample, FFT, filter, IFFT → fills envelopes_buf/filtered_buf)
-function _run_phase1!(bank::MFTFilterBank, W_flat::AbstractMatrix{Float64}, N::Int)
-    W_up = DSP.resample(W_flat, 10.0; dims=1)   # (npts_original × N) — one allocation
+function _run_phase1!(bank::MFTFilterBank{T}, W_flat::AbstractMatrix{T}, N::Int) where {T}
+    bank.storage_mode == :full ||
+        throw(ArgumentError("_run_phase1! requires a :full MFTFilterBank"))
+    W_up = bank.upsample_factor == 1.0 ? W_flat :
+        DSP.resample(W_flat, bank.upsample_factor; dims=1)   # (npts_original × N)
     @views bank.W_pad_buf[:, 1:N] .= 0
     @views bank.W_pad_buf[1:bank.npts_original, 1:N] .= W_up
     mul!(bank.SPEC_buf, bank.plan_fwd, bank.W_pad_buf)
@@ -4173,39 +4364,212 @@ function _run_phase1!(bank::MFTFilterBank, W_flat::AbstractMatrix{Float64}, N::I
 end
 
 # ╔═╡ 6a5c34ae-f358-40bd-8954-6d7e8fb0fa8f
-# --- Phase 2: dist-dependent (peak finding + assembly → returns Vector{MFTResult})
-function _run_phase2!(bank::MFTFilterBank, dists_flat::AbstractVector{Float64}, N::Int;
-                      compute_phase::Bool=false, phvel_correction::Float64=0.0)
-    bank.arrivals_buf[:, 1:N] .= NaN
-    bank.phases_buf[:, 1:N]   .= NaN
-    min_vel, max_vel = bank.velocity_range
-
-    all_peaks = [[Tuple{Float64,Float64}[] for _ in 1:bank.nfreq] for _ in 1:N]
-    for n in 1:N
-        dist  = dists_flat[n]
-        t_min = dist / max_vel
-        t_max = dist / min_vel
-        for ifreq in 1:bank.nfreq
-            env   = @view bank.envelopes_buf[:, ifreq, n]
-            peaks = find_group_arrivals(env, bank.time, (t_min, t_max); max_peaks=4)
-            all_peaks[n][ifreq] = peaks
-            t_g   = isempty(peaks) ? NaN : first(peaks)[1]
-            bank.arrivals_buf[ifreq, n] = t_g
-            if compute_phase && isfinite(t_g) && t_g > 0.0
-                i_g = clamp(round(Int, (t_g - bank.time[1]) / bank.dt) + 1, 1, bank.npts_original)
-                re      = bank.filtered_buf[i_g, ifreq, n]
-                env_val = bank.envelopes_buf[i_g, ifreq, n]
-                bank.phases_buf[ifreq, n] = atan(sqrt(max(env_val^2 - re^2, 0.0)), re)
-            end
-        end
-    end
-
-    results = Vector{MFTResult}(undef, N)
-    for n in 1:N
-        results[n] = _assemble_mft_result(bank, dists_flat[n], n, all_peaks[n];
-                                          compute_phase, phvel_correction)
-    end
-    return results
+begin
+	# --- Phase 2: dist-dependent (peak finding + assembly → returns Vector{MFTResult})
+	function _run_phase2!(bank::MFTFilterBank, dists_flat::AbstractVector{Float64}, N::Int;
+	                      compute_phase::Bool=false,
+	                      use_phtovel::Bool=false,
+	                      phvel_correction::Float64=0.0,
+	                      phvel_source_phase::Float64=phvel_correction,
+	                      min_anchor_quality::Float64=3.0,
+	                      phase_anchor_velocity::Float64=3.3,
+	                      phase_velocity_range::Tuple{Float64,Float64}=(2.5, 4.5),
+	                      phase_smoothness_jump::Float64=0.05,
+	                      phase_plausible_range::Tuple{Float64,Float64}=(0.5, 20.0),
+	                      phtovel_prior_periods=nothing,
+	                      phtovel_prior_velocities=nothing)
+	    bank.arrivals_buf[:, 1:N] .= NaN
+	    bank.phases_buf[:, 1:N]   .= NaN
+	    min_vel, max_vel = bank.velocity_range
+	
+	    all_peaks = [[Tuple{Float64,Float64}[] for _ in 1:bank.nfreq] for _ in 1:N]
+	    for n in 1:N
+	        dist  = dists_flat[n]
+	        t_min = dist / max_vel
+	        t_max = dist / min_vel
+	        for ifreq in 1:bank.nfreq
+	            if compute_phase
+	                @views @. bank.Z_buf[:, 1:N] = bank.H_full[:, ifreq] * bank.SPEC_buf[:, 1:N]
+	                mul!(bank.Z_time_buf, bank.plan_inv, bank.Z_buf)
+	            end
+	            env   = @view bank.envelopes_buf[:, ifreq, n]
+	            peaks = find_group_arrivals(env, bank.time, (t_min, t_max); max_peaks=4)
+	            all_peaks[n][ifreq] = peaks
+	            t_g   = isempty(peaks) ? NaN : first(peaks)[1]
+	            bank.arrivals_buf[ifreq, n] = t_g
+	            if compute_phase && isfinite(t_g) && t_g > 0.0
+	                i_g = clamp(round(Int, (t_g - bank.time[1]) / bank.dt) + 1, 1, bank.npts_original)
+	                bank.phases_buf[ifreq, n] = Float64(angle(bank.Z_time_buf[i_g, n]))
+	            end
+	        end
+	    end
+	
+	    results = Vector{MFTResult}(undef, N)
+	    for n in 1:N
+	        results[n] = _assemble_mft_result(bank, dists_flat[n], n, all_peaks[n];
+	                                          compute_phase=compute_phase,
+	                                          use_phtovel=use_phtovel,
+	                                          phvel_source_phase=phvel_source_phase,
+	                                          min_anchor_quality=min_anchor_quality,
+	                                          phase_anchor_velocity=phase_anchor_velocity,
+	                                          phase_velocity_range=phase_velocity_range,
+	                                          phase_smoothness_jump=phase_smoothness_jump,
+	                                          phase_plausible_range=phase_plausible_range,
+	                                          phtovel_prior_periods=phtovel_prior_periods,
+	                                          phtovel_prior_velocities=phtovel_prior_velocities)
+	    end
+	    return results
+	end
+	
+	# Picks-only banks keep only one filtered period in memory at a time.  The
+	# dispersion summaries are still Float64 so downstream tables and plots keep the
+	# same public shape as full-storage results.
+	function _empty_pick_result(bank::MFTFilterBank{T}, dist::Float64) where {T}
+	    nfreq = bank.nfreq
+	    phase_branch_numbers = copy(DEFAULT_PHASE_BRANCH_NUMBERS)
+	    return MFTResult(
+	        bank.periods, bank.frequencies,
+	        fill(NaN, nfreq), fill(NaN, nfreq),
+	        phase_branch_numbers, fill(NaN, nfreq, length(phase_branch_numbers)),
+	        fill(NaN, nfreq), fill(0, nfreq), falses(nfreq), fill(NaN, nfreq),
+	        zeros(Float64, nfreq), zeros(T, 0, 0), zeros(T, 0, 0),
+	        fill(NaN, nfreq), dist, zeros(Float64, nfreq),
+	        [Tuple{Float64,Float64}[] for _ in 1:nfreq], bank.time, :picks_only,
+	    )
+	end
+	
+	function _finish_phase_velocities!(res::MFTResult, measured_phases::Vector{Float64},
+	                                   phvel_source_phase::Float64;
+	                                   use_phtovel::Bool=false,
+	                                   min_anchor_quality::Float64=3.0,
+	                                   phase_anchor_velocity::Float64=3.3,
+	                                   phase_velocity_range::Tuple{Float64,Float64}=(2.5, 4.5),
+	                                   phase_smoothness_jump::Float64=0.05,
+	                                   phase_plausible_range::Tuple{Float64,Float64}=(0.5, 20.0),
+	                                   phtovel_prior_periods=nothing,
+	                                   phtovel_prior_velocities=nothing)
+	    res.measured_phases .= measured_phases
+	    if use_phtovel
+	        finish_phase_velocity_picks_phtovel!(res.phase_velocities, res.measured_phases,
+	                                             res.selected_phase_branches,
+	                                             res.phase_suspect, res.u_predicted_from_phase,
+	                                             res.periods, res.frequencies, res.arrival_times,
+	                                             res.distance, phvel_source_phase;
+	                                             phase_anchor_velocity=phase_anchor_velocity,
+	                                             phase_velocity_range=phase_velocity_range,
+	                                             phase_smoothness_jump=phase_smoothness_jump,
+	                                             phase_plausible_range=phase_plausible_range,
+	                                             phtovel_prior_periods=phtovel_prior_periods,
+	                                             phtovel_prior_velocities=phtovel_prior_velocities)
+	    else
+	        finish_phase_velocity_picks!(res.phase_velocities, res.phase_velocity_branches,
+	                                     res.measured_phases, res.selected_phase_branches,
+	                                     res.phase_suspect, res.u_predicted_from_phase,
+	                                     res.periods, res.frequencies, res.arrival_times,
+	                                     res.distance, res.quality_factors,
+	                                     res.phase_branch_numbers, phvel_source_phase;
+	                                     min_anchor_quality=min_anchor_quality,
+	                                     phase_anchor_velocity=phase_anchor_velocity,
+	                                     phase_velocity_range=phase_velocity_range,
+	                                     phase_smoothness_jump=phase_smoothness_jump,
+	                                     phase_plausible_range=phase_plausible_range)
+	    end
+	    return res
+	end
+	
+	function _zero_lag_correlation_vectors(a::AbstractVector{<:Real}, b::AbstractVector{<:Real})
+	    a0 = a .- mean(a)
+	    b0 = b .- mean(b)
+	    den = sqrt(sum(abs2, a0) * sum(abs2, b0))
+	    den > 0 || return NaN
+	    return clamp(Float64(sum(a0 .* b0) / den), -1.0, 1.0)
+	end
+	
+	function _prepare_fft_inputs!(bank::MFTFilterBank{T}, W_flat::AbstractMatrix{T}, N::Int) where {T}
+	    W_up = bank.upsample_factor == 1.0 ? W_flat :
+	        DSP.resample(W_flat, bank.upsample_factor; dims=1)
+	    @views bank.W_pad_buf[:, 1:N] .= 0
+	    @views bank.W_pad_buf[1:bank.npts_original, 1:N] .= W_up
+	    mul!(bank.SPEC_buf, bank.plan_fwd, bank.W_pad_buf)
+	    return nothing
+	end
+	
+	function _run_picks_only!(bank::MFTFilterBank{T}, W_flat::AbstractMatrix{T},
+	                          dists_flat::AbstractVector{Float64}, N::Int;
+	                          compute_phase::Bool=false,
+	                          use_phtovel::Bool=false,
+	                          phvel_correction::Float64=0.0,
+	                          phvel_source_phase::Float64=phvel_correction,
+	                          min_anchor_quality::Float64=3.0,
+	                          phase_anchor_velocity::Float64=3.3,
+	                          phase_velocity_range::Tuple{Float64,Float64}=(2.5, 4.5),
+	                          phase_smoothness_jump::Float64=0.05,
+	                          phase_plausible_range::Tuple{Float64,Float64}=(0.5, 20.0),
+	                          phtovel_prior_periods=nothing,
+	                          phtovel_prior_velocities=nothing,
+	                          correlation_pairs::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing) where {T}
+	    bank.storage_mode == :picks_only ||
+	        throw(ArgumentError("_run_picks_only! requires a :picks_only MFTFilterBank"))
+	    _prepare_fft_inputs!(bank, W_flat, N)
+	
+	    min_vel, max_vel = bank.velocity_range
+	    results = [_empty_pick_result(bank, dists_flat[n]) for n in 1:N]
+	    measured_phases = [fill(NaN, bank.nfreq) for _ in 1:N]
+	    correlations = isnothing(correlation_pairs) ? nothing :
+	        fill(NaN, bank.nfreq, length(correlation_pairs))
+	
+	    for ifreq in 1:bank.nfreq
+	        @views @. bank.Z_buf[:, 1:N] = bank.H_full[:, ifreq] * bank.SPEC_buf[:, 1:N]
+	        mul!(bank.Z_time_buf, bank.plan_inv, bank.Z_buf)
+	
+	        if !isnothing(correlations)
+	            for (ipair, (ia, ib)) in enumerate(correlation_pairs)
+	                correlations[ifreq, ipair] = _zero_lag_correlation_vectors(
+	                    real.(@view bank.Z_time_buf[1:bank.npts_original, ia]),
+	                    real.(@view bank.Z_time_buf[1:bank.npts_original, ib]),
+	                )
+	            end
+	        end
+	
+	        for n in 1:N
+	            res = results[n]
+	            envelope = abs.(@view bank.Z_time_buf[1:bank.npts_original, n])
+	            dist = res.distance
+	            peaks = find_group_arrivals(envelope, bank.time,
+	                                        (dist / max_vel, dist / min_vel); max_peaks=4)
+	            res.all_peaks[ifreq] = peaks
+	            t_g, amp_peak = isempty(peaks) ? (NaN, 0.0) : first(peaks)
+	            res.arrival_times[ifreq] = t_g
+	            if isfinite(t_g) && t_g > 0.0
+	                res.group_velocities[ifreq] = dist / t_g
+	            end
+	            res.amplitudes[ifreq] = isnan(t_g) ? Float64(maximum(envelope)) : amp_peak
+	            mean_env = mean(envelope)
+	            res.quality_factors[ifreq] =
+	                mean_env > 0.0 ? Float64(res.amplitudes[ifreq] / mean_env) : 0.0
+	
+	            if compute_phase && isfinite(t_g) && t_g > 0.0
+	                i_g = clamp(round(Int, (t_g - bank.time[1]) / bank.dt) + 1, 1, bank.npts_original)
+	                measured_phases[n][ifreq] = Float64(angle(bank.Z_time_buf[i_g, n]))
+	            end
+	        end
+	    end
+	
+	    if compute_phase
+	        for n in eachindex(results)
+	            _finish_phase_velocities!(results[n], measured_phases[n], phvel_source_phase;
+	                                       use_phtovel=use_phtovel,
+	                                       min_anchor_quality=min_anchor_quality,
+	                                       phase_anchor_velocity=phase_anchor_velocity,
+	                                       phase_velocity_range=phase_velocity_range,
+	                                       phase_smoothness_jump=phase_smoothness_jump,
+	                                       phase_plausible_range=phase_plausible_range,
+	                                       phtovel_prior_periods=phtovel_prior_periods,
+	                                       phtovel_prior_velocities=phtovel_prior_velocities)
+	        end
+	    end
+	    return results, correlations
+	end
 end
 
 # ╔═╡ 0a2beec9-fe91-4af8-8646-064ec215c1e6
@@ -4213,7 +4577,9 @@ end
     perform_mft_analysis_batch!(bank, W, dist; compute_phase=false) -> Vector{MFTResult}
     perform_mft_analysis_batch!(bank, W, dists; compute_phase=false) -> Array{MFTResult}
 
-Run MFT on a batch of waveforms using a pre-computed `MFTFilterBank`.
+Run MFT on a batch of waveforms using a pre-computed `MFTFilterBank`. The bang
+form never grows or replans `bank`; allocate it with `N_initial` large enough
+for the number of waveform columns in the call.
 
 **2-D form** — `W::AbstractMatrix{Float64}` of shape `(nt × N)`, `dist::Float64`:
 Returns `Vector{MFTResult}` of length N. One shared distance for all waveforms.
@@ -4229,353 +4595,184 @@ Scalar-dist convenience: passing `dist::Float64` to the N-D form broadcasts to
 `fill(dist, size(W)[2:end])` — equivalent to the 2-D form.
 """
 function perform_mft_analysis_batch!(bank::MFTFilterBank,
-                                     W::AbstractMatrix{Float64},
-                                     dist::Float64;
+                                     W::AbstractMatrix{<:Real},
+                                     dist::Real;
                                      compute_phase::Bool=false,
-                                     phvel_correction::Float64=0.0)
+                                     use_phtovel::Bool=false,
+                                     phvel_correction::Float64=0.0,
+                                     phvel_source_phase::Float64=phvel_correction,
+                                     min_anchor_quality::Float64=3.0,
+                                     phase_anchor_velocity::Float64=3.3,
+                                     phase_velocity_range::Tuple{Float64,Float64}=(2.5, 4.5),
+                                     phase_smoothness_jump::Float64=0.05,
+                                     phase_plausible_range::Tuple{Float64,Float64}=(0.5, 20.0),
+                                     phtovel_prior_periods=nothing,
+                                     phtovel_prior_velocities=nothing)
     N = size(W, 2)
-    _ensure_batch_size!(bank, N)
-    _run_phase1!(bank, W, N)
-    return _run_phase2!(bank, fill(dist, N), N; compute_phase, phvel_correction)
+    _require_batch_size(bank, N)
+    T = _bank_float_type(bank)
+    W_flat = T.(W)
+    dists = fill(Float64(dist), N)
+    if bank.storage_mode == :picks_only
+        results, _ = _run_picks_only!(bank, W_flat, dists, N;
+                                      compute_phase=compute_phase,
+                                      use_phtovel=use_phtovel,
+                                      phvel_source_phase=phvel_source_phase,
+                                      min_anchor_quality=min_anchor_quality,
+                                      phase_anchor_velocity=phase_anchor_velocity,
+                                      phase_velocity_range=phase_velocity_range,
+                                      phase_smoothness_jump=phase_smoothness_jump,
+                                      phase_plausible_range=phase_plausible_range,
+                                      phtovel_prior_periods=phtovel_prior_periods,
+                                      phtovel_prior_velocities=phtovel_prior_velocities)
+        return results
+    end
+    _run_phase1!(bank, W_flat, N)
+    return _run_phase2!(bank, dists, N;
+                        compute_phase=compute_phase,
+                        use_phtovel=use_phtovel,
+                        phvel_source_phase=phvel_source_phase,
+                        min_anchor_quality=min_anchor_quality,
+                        phase_anchor_velocity=phase_anchor_velocity,
+                        phase_velocity_range=phase_velocity_range,
+                        phase_smoothness_jump=phase_smoothness_jump,
+                        phase_plausible_range=phase_plausible_range,
+                        phtovel_prior_periods=phtovel_prior_periods,
+                        phtovel_prior_velocities=phtovel_prior_velocities)
 end
 
 # ╔═╡ f57cbf2e-5dcb-4e0a-90a5-5f2c363990cd
 function perform_mft_analysis_batch!(bank::MFTFilterBank,
-                                     W::AbstractArray{Float64},
-                                     dists::AbstractArray{Float64};
+                                     W::AbstractArray{<:Real},
+                                     dists::AbstractArray{<:Real};
                                      compute_phase::Bool=false,
-                                     phvel_correction::Float64=0.0)
+                                     use_phtovel::Bool=false,
+                                     phvel_correction::Float64=0.0,
+                                     phvel_source_phase::Float64=phvel_correction,
+                                     min_anchor_quality::Float64=3.0,
+                                     phase_anchor_velocity::Float64=3.3,
+                                     phase_velocity_range::Tuple{Float64,Float64}=(2.5, 4.5),
+                                     phase_smoothness_jump::Float64=0.05,
+                                     phase_plausible_range::Tuple{Float64,Float64}=(0.5, 20.0),
+                                     phtovel_prior_periods=nothing,
+                                     phtovel_prior_velocities=nothing)
     dims = size(W)[2:end]
     @assert size(dists) == dims "dists shape $(size(dists)) must match trailing dims of W $(dims)"
     N = prod(dims)
-    _ensure_batch_size!(bank, N)
-    _run_phase1!(bank, reshape(W, size(W, 1), N), N)
-    results_flat = _run_phase2!(bank, vec(dists), N; compute_phase, phvel_correction)
+    _require_batch_size(bank, N)
+    T = _bank_float_type(bank)
+    W_flat = reshape(T.(W), size(W, 1), N)
+    dists_flat = vec(Float64.(dists))
+    results_flat = if bank.storage_mode == :picks_only
+        first(_run_picks_only!(bank, W_flat, dists_flat, N;
+                               compute_phase=compute_phase,
+                               use_phtovel=use_phtovel,
+                               phvel_source_phase=phvel_source_phase,
+                               min_anchor_quality=min_anchor_quality,
+                               phase_anchor_velocity=phase_anchor_velocity,
+                               phase_velocity_range=phase_velocity_range,
+                               phase_smoothness_jump=phase_smoothness_jump,
+                               phase_plausible_range=phase_plausible_range,
+                               phtovel_prior_periods=phtovel_prior_periods,
+                               phtovel_prior_velocities=phtovel_prior_velocities))
+    else
+        _run_phase1!(bank, W_flat, N)
+        _run_phase2!(bank, dists_flat, N;
+                     compute_phase=compute_phase,
+                     use_phtovel=use_phtovel,
+                     phvel_source_phase=phvel_source_phase,
+                     min_anchor_quality=min_anchor_quality,
+                     phase_anchor_velocity=phase_anchor_velocity,
+                     phase_velocity_range=phase_velocity_range,
+                     phase_smoothness_jump=phase_smoothness_jump,
+                     phase_plausible_range=phase_plausible_range,
+                     phtovel_prior_periods=phtovel_prior_periods,
+                     phtovel_prior_velocities=phtovel_prior_velocities)
+    end
     return reshape(results_flat, dims)
 end
 
 # ╔═╡ f310a7fd-cab6-4d92-b54e-060e113ab2f1
-# Scalar-dist convenience for N-D arrays (broadcasts one distance to all positions)
-function perform_mft_analysis_batch!(bank::MFTFilterBank,
-                                     W::AbstractArray{Float64},
-                                     dist::Float64;
-                                     kwargs...)
-    dims = size(W)[2:end]
-    return perform_mft_analysis_batch!(bank, W, fill(dist, dims); kwargs...)
+begin
+	# Scalar-dist convenience for N-D arrays (broadcasts one distance to all positions)
+	function perform_mft_analysis_batch!(bank::MFTFilterBank,
+	                                     W::AbstractArray{<:Real},
+	                                     dist::Real;
+	                                     kwargs...)
+	    dims = size(W)[2:end]
+	    return perform_mft_analysis_batch!(bank, W, fill(Float64(dist), dims); kwargs...)
+	end
+	
+	"""
+	    perform_mft_analysis_batch(W, dt, dist, periods; ...) -> Vector{MFTResult}
+	    perform_mft_analysis_batch(W, dt, dists, periods; ...) -> Array{MFTResult}
+	
+	Allocating batch MFT entrypoint. A call-local `MFTFilterBank` is sized for the
+	waveform columns in `W`, then passed to `perform_mft_analysis_batch!`.
+	"""
+	function perform_mft_analysis_batch(W::AbstractArray{<:Real},
+	                                    dt::Real,
+	                                    dists::Union{Real,AbstractArray{<:Real}},
+	                                    periods::Vector{Float64};
+	                                    velocity_range::Tuple{Float64,Float64}=(2.0, 6.0),
+	                                    bandwidth_factor::Float64=sqrt(2.0 / 25.0),
+	                                    zero_pad_factor::Int=4,
+	                                    upsample_factor::Real=2.0,
+	                                    precision::Type{<:AbstractFloat}=Float32,
+	                                    storage_mode::Symbol=:picks_only,
+	                                    compute_phase::Bool=false,
+	                                    use_phtovel::Bool=false,
+	                                    phvel_correction::Float64=0.0,
+	                                    phvel_source_phase::Float64=phvel_correction,
+	                                    min_anchor_quality::Float64=3.0,
+	                                    phase_anchor_velocity::Float64=3.3,
+	                                    phase_velocity_range::Tuple{Float64,Float64}=(2.5, 4.5),
+	                                    phase_smoothness_jump::Float64=0.05,
+	                                    phase_plausible_range::Tuple{Float64,Float64}=(0.5, 20.0),
+	                                    phtovel_prior_periods=nothing,
+	                                    phtovel_prior_velocities=nothing)
+	    ndims(W) >= 2 || throw(ArgumentError("W must have shape (nt × trailing dims...)"))
+	    N = prod(size(W)[2:end])
+	    bank = MFTFilterBank(dt, size(W, 1), periods;
+	                         velocity_range=velocity_range,
+	                         bandwidth_factor=bandwidth_factor,
+	                         zero_pad_factor=zero_pad_factor,
+	                         upsample_factor=upsample_factor,
+	                         precision=precision,
+	                         storage_mode=storage_mode,
+	                         N_initial=N)
+	    return perform_mft_analysis_batch!(bank, W, dists;
+	                                       compute_phase=compute_phase,
+	                                       use_phtovel=use_phtovel,
+	                                       phvel_source_phase=phvel_source_phase,
+	                                       min_anchor_quality=min_anchor_quality,
+	                                       phase_anchor_velocity=phase_anchor_velocity,
+	                                       phase_velocity_range=phase_velocity_range,
+	                                       phase_smoothness_jump=phase_smoothness_jump,
+	                                       phase_plausible_range=phase_plausible_range,
+	                                       phtovel_prior_periods=phtovel_prior_periods,
+	                                       phtovel_prior_velocities=phtovel_prior_velocities)
+	end
 end
 
 # ╔═╡ 4c5a5106-95ab-4b29-9cd8-6def65e72b87
 """
-    perform_mft_analysis(trace, bank; compute_phase=true, phvel_correction=0.0)
+    perform_mft_analysis!(bank, trace; compute_phase=true, phvel_correction=0.0)
 
 Single-trace MFT using a pre-computed `MFTFilterBank`.
 Drop-in replacement for `perform_mft_analysis(trace, periods; ...)` with
 pre-planned FFTs and no per-call filter recomputation.
 """
-function perform_mft_analysis(trace::SeismicTrace, bank::MFTFilterBank;
+function perform_mft_analysis!(bank::MFTFilterBank, trace::SeismicTrace;
                                compute_phase::Bool=true,
-                               phvel_correction::Float64=0.0)
-    W = reshape(Float64.(trace.data), :, 1)
+                               phvel_correction::Float64=0.0,
+                               phvel_source_phase::Float64=phvel_correction,
+                               kwargs...)
+    W = reshape(trace.data, :, 1)
     return only(perform_mft_analysis_batch!(bank, W, trace.distance;
-                                            compute_phase, phvel_correction))
-end
-
-# ╔═╡ 2de6446f-d07c-4151-8e13-0719c3056826
-res = perform_mft_analysis(Xsynthetic, (period_min, period_max), n_periods;
-    bandwidth_factor = bandwidth_percent / 100.0,
-    zero_pad_factor = zero_pad_factor,
-	phvel_correction = phvel_mode == "noise_cc" ? π/4 : 0.0,
-	compute_phase    = phvel_mode != "none")
-
-# ╔═╡ 09d3b269-c8bd-425a-ad4a-1ecd29150507
-plot_envelopes(res, title="Envelopes")
-
-# ╔═╡ 1585e739-23c2-4a23-8e80-6f132d503765
-plot_dispersion_curve([res, res], title=string("Group Velocity"))
-
-# ╔═╡ 7b8ea90d-a09d-4952-bd66-943808dc9d3b
-res_synthetic_test = let
-	# plot(synthetic_data)
-			
-	       
-
-	        # Apply multi-band pre-filter if enabled
-	        filtered_components = nothing
-	        D = if apply_prefilter_flag
-
-	            filtered_components = multiple_narrow_band_filters(synthetic_test_data.data, synthetic_test_data.dt, log_period_bands, prefilter_bw)
-	            @info "Applied multi-band pre-filter: T=$(log_period_bands) s, BW=$(prefilter_bw)%"
-				mean(filtered_components)
-			else
-				synthetic_test_data.data
-	        end
-
-	 # Create seismic trace
-	        trace = SeismicTrace(
-	            data=D,
-	            dt=synthetic_test_data.dt,
-	            distance=synthetic_test_data.distance
-	        )
-
-	
-	        # Perform MFT analysis
-	        periods_analysis = synthetic_test_data.periods
-	        (; res=perform_mft_analysis(
-	            trace,
-	            periods_analysis,
-	            velocity_range = (2.0 - 0.5, 5.0 + 0.5),
-                bandwidth_factor = synth_bandwidth / 100.0,
-                zero_pad_factor = synth_zero_pad_factor,
-	            compute_phase  = true
-	        ), filtered_trace=trace, filtered_components=filtered_components)
-end
-
-# ╔═╡ c169578d-3dd2-42f8-8e57-4146a8dca2cd
-plot_dispersion_curve(res_synthetic_test.res)
-
-# ╔═╡ 9db0d269-d3ca-48fc-9583-91b5e11822d2
-WideCell(plot_phase_velocities(res_synthetic_test.res))
-
-# ╔═╡ 2ba1a355-d9fa-4268-b046-0b201191c11e
-plot_envelopes(res_synthetic_test.res)
-
-# ╔═╡ 44fad356-ff66-4bbc-a83b-5d8d996d95a5
-plot(res_synthetic_test.filtered_trace.data)
-
-# ╔═╡ 8dc0f4bc-00cb-11f1-9443-a59380edd23b
-let
-	# Show original vs pre-filtered data with individual components
-    if apply_prefilter_flag
-        trace_original = SeismicTrace(
-            data=synthetic_test_data.data,
-            dt=synthetic_test_data.dt,
-            distance=synthetic_test_data.distance
-        )
-        
-        central_periods = log_period_bands
-        
-        # Get filtered components and sum
-        filtered_trace = res_synthetic_test.filtered_trace
-        filtered_components = res_synthetic_test.filtered_components
-        
-        # Plot comparison
-        traces = [scatter()]
-        
-        # Original signal
-        push!(traces, scatter(
-            x = synthetic_test_data.t,
-            y = synthetic_test_data.data ./ maximum(abs.(synthetic_test_data.data)),
-            mode = "lines",
-            name = "Original",
-            line = attr(color = "lightgray", width = 1),
-            opacity = 0.3
-        ))
-        
-        # Individual filtered components
-        if !isnothing(filtered_components)
-            colors = ["blue", "green", "orange"]
-            for (i, (T, filt, color)) in enumerate(zip(central_periods, filtered_components, colors))
-                # Normalize for display
-                filt_norm = filt ./ maximum(abs.(filt)) .* 0.5
-                push!(traces, scatter(
-                    x = synthetic_test_data.t,
-                    y = filt_norm,
-                    mode = "lines",
-                    name = "T=$(T)s band",
-                    line = attr(color = color, width = 1.5, dash = "dot"),
-                    opacity = 0.6
-                ))
-            end
-        end
-        
-        # Summed filtered signal
-        push!(traces, scatter(
-            x = synthetic_test_data.t,
-            y = filtered_trace.data ./ maximum(abs.(filtered_trace.data)),
-            mode = "lines",
-            name = "Sum of 3 bands",
-            line = attr(color = "red", width = 2.5)
-        ))
-        
-        layout = Layout(
-            title = "Multi-band Pre-filtering: Individual Components + Sum",
-            xaxis = attr(title = "Time (s)"),
-            yaxis = attr(title = "Amplitude"),
-            width = 900,
-            height = 500,
-            plot_bgcolor = "white",
-            legend = attr(x = 0.02, y = 0.98)
-        )
-        
-        PlutoPlotly.plot(traces, layout)
-    else
-        md"**Pre-filter disabled.** Check the box above to enable."
-    end
-end
-
-# ╔═╡ 8dc0fc46-00cb-11f1-9407-453086ae541f
-let
-	if apply_prefilter_flag
-        # Compute FFT of original and filtered data
-        original_fft = fft(synthetic_test_data.data)
-        filtered_fft = fft(res_synthetic_test.filtered_trace.data)
-        
-        # Frequency vector
-        n = length(synthetic_test_data.data)
-        freqs = fftfreq(n, 1.0/synthetic_test_data.dt)
-        
-        # Only positive frequencies
-        pos_idx = freqs .> 0
-        freqs_pos = freqs[pos_idx]
-        
-        # Amplitude spectrum
-        amp_original = abs.(original_fft[pos_idx])
-        amp_filtered = abs.(filtered_fft[pos_idx])
-        
-        # Normalize
-        amp_original ./= maximum(amp_original)
-        amp_filtered ./= maximum(amp_filtered)
-        
-        traces_spec = [scatter()]
-        
-        push!(traces_spec, scatter(
-            x = freqs_pos,
-            y = amp_original,
-            mode = "lines",
-            name = "Original Spectrum",
-            line = attr(color = "gray", width = 2),
-            opacity = 0.5
-        ))
-        
-        push!(traces_spec, scatter(
-            x = freqs_pos,
-            y = amp_filtered,
-            mode = "lines",
-            name = "Filtered Spectrum (sum)",
-            line = attr(color = "red", width = 2.5)
-        ))
-        
-        # Mark center frequencies for all three periods
-        central_periods = log_period_bands
-        colors = ["blue", "green", "orange"]
-        for (T, color) in zip(central_periods, colors)
-            fc = 1.0 / T
-            push!(traces_spec, scatter(
-                x = [fc, fc],
-                y = [1e-4, 1],
-                mode = "lines",
-                name = "fc=$(round(fc, digits=3)) Hz (T=$(T)s)",
-                line = attr(color = color, width = 2, dash = "dash")
-            ))
-        end
-        
-        layout_spec = Layout(
-            title = "Frequency Domain: 3-Band Pre-filtering",
-            xaxis = attr(
-                title = "Frequency (Hz)",
-                range = [-2, log10(0.3)],
-                type = "log"
-            ),
-            yaxis = attr(
-                title = "Normalized Amplitude",
-                type = "log",
-                range = [-4, 0]
-            ),
-            width = 900,
-            height = 500,
-            plot_bgcolor = "white",
-            legend = attr(x = 0.65, y = 0.98, font=attr(size=10))
-        )
-        
-        PlutoPlotly.plot(traces_spec, layout_spec)
-    else
-        md"Enable pre-filter to see spectrum comparison."
-    end
-end
-
-# ╔═╡ 78a3288f-6b85-4ed1-a399-b4528799f95a
-let
-    run_synth_suite
-
-    distances = [100.0, 250.0, 500.0, 1000.0]
-    noises = [0.0, 5.0, 10.0]
-    freqs = collect(0.02:0.01:0.30)
-    periods = inv.(freqs)
-
-    rows = String[]
-    push!(rows, "Synthetic MFT benchmark (group + phase errors)")
-    push!(rows, "dist[km] noise[%] g_mean[%] g_max[%] p_mean[%] p_max[%] n_g n_p")
-
-    for dist in distances
-        for noise in noises
-            dt = inv(2.0 * maximum(freqs))
-            t = collect(0:dt:300)
-
-            u, cg, cp, tg = multi_frequency_cosine_sum(
-                t, dist;
-                freqs=freqs,
-                c0=3.5,
-                α=1.0
-            )
-            data = u ./ maximum(abs, u) .+ noise / 100.0 * randn(length(u))
-            trace = SeismicTrace(data=data, dt=dt, distance=dist)
-
-            res_case = perform_mft_analysis(
-                trace,
-                periods;
-                velocity_range=(1.5, 6.5),
-                bandwidth_factor=synth_bandwidth / 100.0,
-                zero_pad_factor=synth_zero_pad_factor,
-                compute_phase=true
-            )
-
-            m = compute_velocity_error_metrics(res_case, periods, cg, cp)
-            push!(rows,
-                @sprintf("%7.1f %8.1f %8.2f %8.2f %8.2f %8.2f %4d %4d",
-                         dist, noise, m.group_mean, m.group_max,
-                         m.phase_mean, m.phase_max, m.n_group, m.n_phase)
-            )
-        end
-    end
-
-    print("```\n" * join(rows, "\n") * "\n```")
-end
-
-# ╔═╡ 347f9eb0-3cdc-11f1-a7ce-4d4b3258205b
-"""
-    analyze_causal_acausal_branches(trace_causal::SeismicTrace, trace_acausal::SeismicTrace,
-                                   periods::Vector{Float64}; max_modes=4,
-                                   compute_correlation=true, kwargs...) -> BranchAnalysisResult
-
-Single-source-state branch analysis (backward-compatible API).
-"""
-function analyze_causal_acausal_branches(trace_causal::SeismicTrace,
-                                         trace_acausal::SeismicTrace,
-                                         periods::Vector{Float64};
-                                         max_modes::Int=4,
-                                         compute_correlation::Bool=true,
-                                         kwargs...)
-    # Validate input
-    @assert length(trace_causal.data) == length(trace_acausal.data) "Causal and acausal traces must have same length"
-    @assert trace_causal.dt ≈ trace_acausal.dt "Causal and acausal traces must have same sampling interval"
-    
-    # Perform MFT analysis on both branches
-    result_causal = perform_mft_analysis(trace_causal, periods; kwargs...)
-    result_acausal = perform_mft_analysis(trace_acausal, periods; kwargs...)
-    
-    # Extract modes from both branches
-    modes_causal = extract_all_modes(result_causal; distance=trace_causal.distance, max_modes=max_modes)
-    modes_acausal = extract_all_modes(result_acausal; distance=trace_causal.distance, max_modes=max_modes)
-    
-    # Compute branch correlation if requested
-    correlations = fill(NaN, length(periods))
-    if compute_correlation
-        correlations = zero_lag_correlation(result_causal.filtered_traces, result_acausal.filtered_traces)
-    end
-    
-    return BranchAnalysisResult(result_causal, result_acausal, 
-                               modes_causal, modes_acausal,
-                               correlations, periods, trace_causal.distance)
+                                            compute_phase=compute_phase,
+                                            phvel_source_phase=phvel_source_phase,
+                                            kwargs...))
 end
 
 # ╔═╡ fb000010-0000-0000-0000-000000000001
@@ -4583,52 +4780,81 @@ end
     analyze_causal_acausal_branches(W_c, W_ac, dists, bank; ...)
         -> BranchBatchAnalysisResult
 
-Array-based, bank-accelerated multi-state analysis. All 2·nstates waveforms
-are FFT'd in a single batch (one `_run_phase1!` call), then peak-finding and
-assembly run per-trace.
+Array-based, bank-accelerated multi-state analysis. `W_c` and `W_ac` may be
+2-D `(nt × nstates)` matrices or N-D arrays `(nt × d1 × d2 × ...)`; each
+trailing index is one waveform/state. `dists` is either a scalar distance or an
+array with shape `(d1 × d2 × ...)`. All 2·nstates waveforms are FFT'd in a
+single batch (one `_run_phase1!` call), then peak-finding and assembly use the
+per-state distances.
 
 # Arguments
-- `W_c`   : `(nt × nstates)` causal waveforms
-- `W_ac`  : `(nt × nstates)` acausal waveforms
-- `dists` : distances [km], either a scalar `Float64` or length-`nstates` vector
+- `W_c`   : causal waveforms, shape `(nt × trailing dims...)`
+- `W_ac`  : acausal waveforms, same shape as `W_c`
+- `dists` : distances [km], either scalar or shape `trailing dims`
 - `bank`  : pre-computed `MFTFilterBank` (sets periods, bandwidth, etc.)
 """
-function analyze_causal_acausal_branches(W_c::AbstractMatrix{<:Real},
-                                         W_ac::AbstractMatrix{<:Real},
-                                         dists::Union{Float64,AbstractVector{<:Real}},
+function analyze_causal_acausal_branches(W_c::AbstractArray{<:Real},
+                                         W_ac::AbstractArray{<:Real},
+                                         dists::Union{Real,AbstractArray{<:Real}},
                                          bank::MFTFilterBank;
                                          state_labels=nothing,
                                          max_modes::Int=4,
                                          compute_correlation::Bool=true,
                                          compute_phase::Bool=false,
-                                         phvel_correction::Float64=0.0)
-    nt, nstates = size(W_c)
-    @assert size(W_ac) == (nt, nstates) "W_c and W_ac must have the same shape"
-    dists_vec = dists isa Float64 ? fill(dists, nstates) : Float64.(dists)
-    @assert length(dists_vec) == nstates "dists length must equal nstates"
+                                         phvel_correction::Float64=0.0,
+                                         phvel_source_phase::Float64=phvel_correction,
+                                         kwargs...)
+    ndims(W_c) >= 2 || throw(ArgumentError("W_c must have shape (nt × trailing dims...)"))
+    size(W_ac) == size(W_c) || throw(ArgumentError("W_c and W_ac must have the same shape"))
+    nt = size(W_c, 1)
+    trailing_dims = size(W_c)[2:end]
+    nstates = prod(trailing_dims)
+    nstates > 0 || throw(ArgumentError("At least one waveform/state is required"))
+
+    dists_vec = if dists isa Real
+        fill(Float64(dists), nstates)
+    else
+        size(dists) == trailing_dims ||
+            throw(ArgumentError("dists shape $(size(dists)) must match waveform trailing dims $(trailing_dims)"))
+        vec(Float64.(dists))
+    end
 
     labels = if isnothing(state_labels)
         ["State $(i)" for i in 1:nstates]
     else
-        @assert length(state_labels) == nstates
-        string.(state_labels)
+        length(state_labels) == nstates ||
+            throw(ArgumentError("state_labels length must match number of waveform states"))
+        vec(string.(state_labels))
     end
 
     periods = bank.periods
-    W_all     = Matrix{Float64}(undef, nt, 2 * nstates)
-    dists_all = Vector{Float64}(undef, 2 * nstates)
-    for i in 1:nstates
-        W_all[:, i]           = Float64.(W_c[:, i])
-        W_all[:, nstates + i] = Float64.(W_ac[:, i])
-        dists_all[i]           = dists_vec[i]
-        dists_all[nstates + i] = dists_vec[i]
-    end
+    T = _bank_float_type(bank)
+    W_c_flat = reshape(T.(W_c), nt, nstates)
+    W_ac_flat = reshape(T.(W_ac), nt, nstates)
+    W_all = Matrix{T}(undef, nt, 2 * nstates)
+    W_all[:, 1:nstates] .= W_c_flat
+    W_all[:, nstates+1:2*nstates] .= W_ac_flat
+    dists_all = vcat(dists_vec, dists_vec)
 
-    _ensure_batch_size!(bank, 2 * nstates)
-    _run_phase1!(bank, W_all, 2 * nstates)
-    results_all = _run_phase2!(bank, dists_all, 2 * nstates;
-                               compute_phase=compute_phase,
-                               phvel_correction=phvel_correction)
+    _require_batch_size(bank, 2 * nstates)
+    correlations_picks = nothing
+    results_all = if bank.storage_mode == :picks_only
+        correlation_pairs = compute_correlation ?
+            [(i, nstates + i) for i in 1:nstates] : nothing
+        results, corr = _run_picks_only!(bank, W_all, dists_all, 2 * nstates;
+                                         compute_phase=compute_phase,
+                                         phvel_source_phase=phvel_source_phase,
+                                         correlation_pairs=correlation_pairs,
+                                         kwargs...)
+        correlations_picks = corr
+        results
+    else
+        _run_phase1!(bank, W_all, 2 * nstates)
+        _run_phase2!(bank, dists_all, 2 * nstates;
+                     compute_phase=compute_phase,
+                     phvel_source_phase=phvel_source_phase,
+                     kwargs...)
+    end
 
     state_results = BranchAnalysisResult[]
     corr_matrix   = fill(NaN, length(periods), nstates)
@@ -4640,7 +4866,9 @@ function analyze_causal_acausal_branches(W_c::AbstractMatrix{<:Real},
         modes_a = extract_all_modes(res_a; distance=d, max_modes=max_modes)
         correlations = fill(NaN, length(periods))
         if compute_correlation
-            correlations = zero_lag_correlation(res_c.filtered_traces, res_a.filtered_traces)
+            correlations = bank.storage_mode == :picks_only ?
+                correlations_picks[:, i] :
+                zero_lag_correlation(res_c.filtered_traces, res_a.filtered_traces)
         end
         push!(state_results,
               BranchAnalysisResult(res_c, res_a, modes_c, modes_a, correlations, periods, d))
@@ -4665,19 +4893,415 @@ together in a 2-column batch.
 """
 function analyze_causal_acausal_branches(w_c::AbstractVector{<:Real},
                                          w_ac::AbstractVector{<:Real},
-                                         dist::Float64,
+                                         dist::Real,
                                          bank::MFTFilterBank;
                                          max_modes::Int=4,
                                          compute_correlation::Bool=true,
                                          compute_phase::Bool=false,
-                                         phvel_correction::Float64=0.0)
-    W_c  = reshape(Float64.(w_c),  :, 1)
-    W_ac = reshape(Float64.(w_ac), :, 1)
+                                         phvel_correction::Float64=0.0,
+                                         phvel_source_phase::Float64=phvel_correction,
+                                         kwargs...)
+    W_c  = reshape(w_c,  :, 1)
+    W_ac = reshape(w_ac, :, 1)
     res = analyze_causal_acausal_branches(W_c, W_ac, dist, bank;
               max_modes=max_modes, compute_correlation=compute_correlation,
-              compute_phase=compute_phase, phvel_correction=phvel_correction,
-              state_labels=["state 1"])
+              compute_phase=compute_phase, phvel_source_phase=phvel_source_phase,
+              state_labels=["state 1"], kwargs...)
     return only(res.state_results)
+end
+
+# ╔═╡ fb000012-0000-0000-0000-000000000001
+"""
+    analyze_self_branches(W, dists, bank; ...)
+        -> BranchBatchAnalysisResult
+
+Analyze waveforms once and wrap each result as both causal and acausal branch.
+This is useful for synthetic/codebook mixture candidates where the two branches
+are intentionally identical and `analyze_causal_acausal_branches(W, W, ...)`
+would do twice the FFT/IFFT work for no new information.
+"""
+function analyze_self_branches(W::AbstractArray{<:Real},
+                               dists::Union{Real,AbstractArray{<:Real}},
+                               bank::MFTFilterBank;
+                               state_labels=nothing,
+                               max_modes::Int=4,
+                               compute_phase::Bool=false,
+                               phvel_correction::Float64=0.0,
+                               phvel_source_phase::Float64=phvel_correction,
+                               kwargs...)
+    ndims(W) >= 2 || throw(ArgumentError("W must have shape (nt × trailing dims...)"))
+    nt = size(W, 1)
+    trailing_dims = size(W)[2:end]
+    nstates = prod(trailing_dims)
+    nstates > 0 || throw(ArgumentError("At least one waveform/state is required"))
+
+    dists_vec = if dists isa Real
+        fill(Float64(dists), nstates)
+    else
+        size(dists) == trailing_dims ||
+            throw(ArgumentError("dists shape $(size(dists)) must match waveform trailing dims $(trailing_dims)"))
+        vec(Float64.(dists))
+    end
+
+    labels = if isnothing(state_labels)
+        ["State $(i)" for i in 1:nstates]
+    else
+        length(state_labels) == nstates ||
+            throw(ArgumentError("state_labels length must match number of waveform states"))
+        vec(string.(state_labels))
+    end
+
+    results = perform_mft_analysis_batch!(bank, reshape(W, nt, nstates), dists_vec;
+                                          compute_phase=compute_phase,
+                                          phvel_source_phase=phvel_source_phase,
+                                          kwargs...)
+
+    periods = bank.periods
+    state_results = BranchAnalysisResult[]
+    corr_matrix = ones(Float64, length(periods), nstates)
+    for i in 1:nstates
+        res = results[i]
+        d = dists_vec[i]
+        modes = extract_all_modes(res; distance=d, max_modes=max_modes)
+        push!(state_results,
+              BranchAnalysisResult(res, res, modes, modes, corr_matrix[:, i], periods, d))
+    end
+    return BranchBatchAnalysisResult(state_results, corr_matrix, periods, labels)
+end
+
+# ╔═╡ f4e12fc4-b775-4c17-9459-920ad3c8bbd6
+begin
+	"""
+	    wavelength_valid_period(period, distance; wavelength_ref_velocity=nothing,
+	                            wavelength_fraction=nothing)
+	
+	Return whether `period` passes the optional distance-dependent wavelength filter.
+	When filtering is requested, keep periods satisfying
+	`wavelength_ref_velocity * period < wavelength_fraction * distance`.
+	"""
+	function wavelength_valid_period(period::Real, distance::Real;
+	                                 wavelength_ref_velocity::Union{Nothing,Real}=nothing,
+	                                 wavelength_fraction::Union{Nothing,Real}=nothing)
+	    isnothing(wavelength_ref_velocity) && isnothing(wavelength_fraction) && return true
+	    (isnothing(wavelength_ref_velocity) || isnothing(wavelength_fraction)) && return false
+	
+	    period = Float64(period)
+	    distance = Float64(distance)
+	    ref_velocity = Float64(wavelength_ref_velocity)
+	    fraction = Float64(wavelength_fraction)
+	    all(isfinite, (period, distance, ref_velocity, fraction)) || return false
+	    (period > 0.0 && distance > 0.0 && ref_velocity > 0.0 && fraction > 0.0) || return false
+	    return ref_velocity * period < fraction * distance
+	end
+	
+	function _wavelength_valid_indices(periods::AbstractVector{<:Real}, distance::Real;
+	                                   wavelength_ref_velocity::Union{Nothing,Real}=nothing,
+	                                   wavelength_fraction::Union{Nothing,Real}=nothing)
+	    return findall(period -> wavelength_valid_period(period, distance;
+	                                                     wavelength_ref_velocity=wavelength_ref_velocity,
+	                                                     wavelength_fraction=wavelength_fraction),
+	                   periods)
+	end
+end
+
+# ╔═╡ b7000001-0000-0000-0000-000000000001
+function _uc_consistency_rows_from_mft_result(res::MFTResult;
+        pair_label::AbstractString="MFT result",
+        label::AbstractString="MFT result",
+        branch="")
+    u_pred = any(isfinite, res.u_predicted_from_phase) ?
+        res.u_predicted_from_phase : compute_group_velocity_from_phase(res)
+    rows = NamedTuple[]
+    for ip in eachindex(res.periods)
+        period = Float64(res.periods[ip])
+        u_meas = Float64(res.group_velocities[ip])
+        u_hat = Float64(u_pred[ip])
+        c = Float64(res.phase_velocities[ip])
+        quality = Float64(res.quality_factors[ip])
+        isfinite(period) && period > 0.0 || continue
+        isfinite(u_meas) && u_meas > 0.0 || continue
+        isfinite(u_hat) && u_hat > 0.0 || continue
+        isfinite(c) && c > 0.0 || continue
+        relerr = abs(u_meas - u_hat) / max(abs(u_hat), eps(Float64))
+        selected_phase_branch = ip <= length(res.selected_phase_branches) ?
+            Int(res.selected_phase_branches[ip]) : 0
+        phase_suspect = ip <= length(res.phase_suspect) ? Bool(res.phase_suspect[ip]) : false
+        push!(rows, (; pair_label=String(pair_label), label=String(label), branch,
+            period,
+            group_velocity=u_meas,
+            phase_velocity=c,
+            predicted_group_velocity=u_hat,
+            relative_error=relerr,
+            relative_agreement=1.0 / (1.0 + relerr),
+            quality,
+            selected_phase_branch,
+            phase_suspect))
+    end
+    sort(rows, by=r -> (String(r.label), String(r.branch), r.period))
+end
+
+# ╔═╡ b7000002-0000-0000-0000-000000000001
+function plot_uc_consistency_comparison(rows;
+        pair_label=nothing,
+        overlay_rows=NamedTuple[],
+        codebook_rows=overlay_rows,
+        velocity_range=nothing,
+        title::AbstractString="U-c Consistency",
+        error_cap::Float64=0.5,
+        width::Int=1100,
+        height::Int=680)
+    base_rows = isnothing(pair_label) ? collect(rows) :
+        [r for r in rows if hasproperty(r, :pair_label) && String(r.pair_label) == String(pair_label)]
+    overlay_all = isnothing(pair_label) ? collect(codebook_rows) :
+        [r for r in codebook_rows if hasproperty(r, :pair_label) && String(r.pair_label) == String(pair_label)]
+    isempty(base_rows) && isempty(overlay_all) &&
+        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No finite U-c rows"]))
+
+    branches = ["causal", "acausal"]
+    traces = AbstractTrace[]
+    colors = Dict("causal" => "#1f77b4", "acausal" => "#d62728")
+    symbols = Dict("causal" => "circle", "acausal" => "diamond")
+    error_scales = Dict("causal" => "Blues", "acausal" => "Reds")
+
+    for branch in branches
+        b = sort([r for r in base_rows
+            if hasproperty(r, :branch) && String(r.branch) == branch], by=r -> r.period)
+        isempty(b) && continue
+        selected_branch_text(r) = hasproperty(r, :selected_phase_branch) ?
+            "<br>phase branch=$(r.selected_phase_branch)" : ""
+        hover = ["$(branch)<br>T=$(round(r.period; digits=3)) s<br>U=$(round(r.group_velocity; digits=3)) km/s<br>c=$(round(r.phase_velocity; digits=3)) km/s<br>U_pred=$(round(r.predicted_group_velocity; digits=3)) km/s<br>rel err=$(round(r.relative_error; digits=3))$(selected_branch_text(r))<br>quality=$(round(r.quality; digits=2))" for r in b]
+        push!(traces, scatter(
+            x=[r.period for r in b], y=[r.group_velocity for r in b],
+            yaxis="y", mode="markers+lines", name="$(branch) U", legendgroup=branch,
+            marker=attr(size=8, color=[min(Float64(r.relative_error), error_cap) for r in b],
+                cmin=0.0, cmax=error_cap, colorscale=error_scales[branch], showscale=false,
+                symbol=symbols[branch], line=attr(color="black", width=0.8)),
+            line=attr(color=colors[branch], width=1.5), text=hover, hoverinfo="text"))
+        push!(traces, scatter(
+            x=[r.period for r in b], y=[r.predicted_group_velocity for r in b],
+            yaxis="y", mode="lines+markers", name="$(branch) U from c(T)", legendgroup=branch,
+            marker=attr(size=5, color=colors[branch], symbol="circle-open"),
+            line=attr(color=colors[branch], width=1.8, dash="dash"),
+            hovertemplate="$(branch) U_pred<br>T=%{x:.3f} s<br>U_pred=%{y:.3f} km/s<extra></extra>"))
+        push!(traces, scatter(
+            x=[r.period for r in b], y=[r.phase_velocity for r in b],
+            yaxis="y", mode="lines+markers", name="$(branch) c", legendgroup=branch,
+            marker=attr(size=4.5, color=colors[branch], symbol="square-open"),
+            line=attr(color=colors[branch], width=1.3, dash="dot"),
+            hovertemplate="$(branch) phase velocity<br>T=%{x:.3f} s<br>c=%{y:.3f} km/s<extra></extra>"))
+        push!(traces, scatter(
+            x=[r.period for r in b], y=[min(Float64(r.relative_error), error_cap) for r in b],
+            xaxis="x2", yaxis="y2", mode="lines+markers", name="$(branch) relative error",
+            legendgroup=branch, showlegend=false,
+            marker=attr(size=7, color=[min(Float64(r.relative_error), error_cap) for r in b],
+                cmin=0.0, cmax=error_cap, colorscale=error_scales[branch], showscale=false,
+                symbol=symbols[branch], line=attr(color="black", width=0.5)),
+            line=attr(color=colors[branch], width=1.4),
+            text=["$(branch)<br>T=$(round(r.period; digits=3)) s<br>relative error=$(round(r.relative_error; digits=3))$(r.relative_error > error_cap ? "<br>plotted at $(error_cap) cap" : "")" for r in b],
+            hoverinfo="text"))
+    end
+
+    unlabeled_base = sort([r for r in base_rows if !hasproperty(r, :branch) || isempty(String(r.branch))],
+        by=r -> (hasproperty(r, :label) ? String(r.label) : "", r.period))
+    append!(overlay_all, unlabeled_base)
+    overlay_labels = unique(String(hasproperty(r, :label) ? r.label : "overlay") for r in overlay_all)
+    overlay_title = isempty(overlay_labels) ? "" :
+        " | overlay: $(join(first(overlay_labels, min(2, length(overlay_labels))), " + "))$(length(overlay_labels) > 2 ? " + ..." : "")"
+    overlay_palette = ["#111111", "#7b3294", "#008837", "#e66101", "#5e3c99", "#4d4d4d"]
+    overlay_groups = NamedTuple[]
+    for label in overlay_labels
+        label_rows = [r for r in overlay_all if String(hasproperty(r, :label) ? r.label : "overlay") == label]
+        if any(r -> hasproperty(r, :branch) && !isempty(String(r.branch)), label_rows)
+            for branch in branches
+                rb = sort([r for r in label_rows
+                    if hasproperty(r, :branch) && String(r.branch) == branch], by=r -> r.period)
+                isempty(rb) || push!(overlay_groups, (; label, branch, rows=rb))
+            end
+        else
+            push!(overlay_groups, (; label, branch="", rows=sort(label_rows, by=r -> r.period)))
+        end
+    end
+    for (igroup, group) in enumerate(overlay_groups)
+        rs = group.rows
+        isempty(rs) && continue
+        branch = String(group.branch)
+        branch_suffix = isempty(branch) ? "" : " $(branch)"
+        line_color = overlay_palette[mod1(igroup, length(overlay_palette))]
+        marker_color = branch == "acausal" ? "#7b3294" : "#b8860b"
+        label = String(group.label)
+        hover = ["$(label)$(isempty(branch) ? "" : "<br>$(branch)")<br>T=$(round(r.period; digits=3)) s<br>U=$(round(r.group_velocity; digits=3)) km/s<br>c=$(round(r.phase_velocity; digits=3)) km/s<br>U_pred=$(round(r.predicted_group_velocity; digits=3)) km/s<br>rel err=$(round(r.relative_error; digits=3))<br>quality=$(round(r.quality; digits=2))" for r in rs]
+        push!(traces, scatter(
+            x=[r.period for r in rs], y=[r.group_velocity for r in rs],
+            yaxis="y", mode="markers+lines", name="overlay$(branch_suffix) U",
+            legendgroup="overlay $(igroup)",
+            marker=attr(size=8.5, color=marker_color, symbol="star",
+                line=attr(color=line_color, width=0.8)),
+            line=attr(color=line_color, width=2.0), text=hover, hoverinfo="text"))
+        push!(traces, scatter(
+            x=[r.period for r in rs], y=[r.predicted_group_velocity for r in rs],
+            yaxis="y", mode="lines+markers", name="overlay$(branch_suffix) U from c(T)",
+            legendgroup="overlay $(igroup)",
+            marker=attr(size=5, color=line_color, symbol="star-open"),
+            line=attr(color=line_color, width=1.8, dash="dash"),
+            hovertemplate="overlay$(branch_suffix) U_pred<br>T=%{x:.3f} s<br>U_pred=%{y:.3f} km/s<extra></extra>"))
+        push!(traces, scatter(
+            x=[r.period for r in rs], y=[r.phase_velocity for r in rs],
+            yaxis="y", mode="lines+markers", name="overlay$(branch_suffix) c",
+            legendgroup="overlay $(igroup)",
+            marker=attr(size=4.8, color=line_color, symbol="square-open"),
+            line=attr(color=line_color, width=1.3, dash="dot"),
+            hovertemplate="overlay$(branch_suffix) phase velocity<br>T=%{x:.3f} s<br>c=%{y:.3f} km/s<extra></extra>"))
+        push!(traces, scatter(
+            x=[r.period for r in rs], y=[min(Float64(r.relative_error), error_cap) for r in rs],
+            xaxis="x2", yaxis="y2", mode="lines+markers",
+            name="overlay$(branch_suffix) relative error", legendgroup="overlay $(igroup)",
+            showlegend=false,
+            marker=attr(size=7.5, color=marker_color, symbol="star",
+                line=attr(color=line_color, width=0.6)),
+            line=attr(color=line_color, width=1.5),
+            text=["$(label)$(isempty(branch) ? "" : "<br>$(branch)")<br>T=$(round(r.period; digits=3)) s<br>relative error=$(round(r.relative_error; digits=3))$(r.relative_error > error_cap ? "<br>plotted at $(error_cap) cap" : "")" for r in rs],
+            hoverinfo="text"))
+    end
+
+    all_vels = Float64[]
+    for r in base_rows
+        append!(all_vels, [Float64(r.group_velocity), Float64(r.phase_velocity), Float64(r.predicted_group_velocity)])
+    end
+    for r in overlay_all
+        append!(all_vels, [Float64(r.group_velocity), Float64(r.phase_velocity), Float64(r.predicted_group_velocity)])
+    end
+    filter!(v -> isfinite(v) && v > 0.0, all_vels)
+    y_range = isnothing(velocity_range) ?
+        (isempty(all_vels) ? nothing : [0.9 * minimum(all_vels), 1.1 * maximum(all_vels)]) :
+        [Float64(velocity_range[1]), Float64(velocity_range[2])]
+    title_pair = isnothing(pair_label) ? "" : ": $(pair_label)"
+    PlutoPlotly.plot(traces, Layout(
+        title="$(title)$(title_pair)$(overlay_title)",
+        xaxis=attr(type="log", domain=[0.0, 0.86], anchor="y",
+            showticklabels=false, showgrid=true, gridcolor="rgba(0,0,0,0.10)", zeroline=false),
+        xaxis2=attr(title="Period (s)", type="log", domain=[0.0, 0.86], anchor="y2",
+            matches="x", showgrid=true, gridcolor="rgba(0,0,0,0.10)", zeroline=false),
+        yaxis=attr(title="Velocity (km/s)", range=y_range, domain=[0.33, 1.0],
+            showgrid=true, gridcolor="rgba(0,0,0,0.10)", zeroline=false),
+        yaxis2=attr(title="relative |U - U(c)| / U(c) (capped at $(error_cap))",
+            range=[0.0, error_cap], domain=[0.0, 0.23],
+            showgrid=true, gridcolor="rgba(0,0,0,0.10)", zeroline=false),
+        width=width, height=height,
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=attr(l=78, r=145, t=78, b=72),
+        legend=attr(orientation="h", x=0.0, y=1.10,
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="rgba(0,0,0,0.15)", borderwidth=1)))
+end
+
+# ╔═╡ b7000003-0000-0000-0000-000000000001
+function plot_uc_consistency_comparison(res::MFTResult;
+        label::AbstractString="MFT result",
+        pair_label::AbstractString=label,
+        kwargs...)
+    rows = _uc_consistency_rows_from_mft_result(res; pair_label=pair_label, label=label)
+    plot_uc_consistency_comparison(rows; pair_label=pair_label, kwargs...)
+end
+
+# ╔═╡ b7000004-0000-0000-0000-000000000001
+function plot_uc_consistency_comparison(results::AbstractVector{<:MFTResult};
+        labels=nothing,
+        pair_label::AbstractString="MFT results",
+        kwargs...)
+    labels0 = isnothing(labels) ? ["MFT result $(i)" for i in eachindex(results)] : String.(labels)
+    rows = NamedTuple[]
+    for (i, res) in enumerate(results)
+        label = i <= length(labels0) ? labels0[i] : "MFT result $(i)"
+        append!(rows, _uc_consistency_rows_from_mft_result(res;
+            pair_label=pair_label, label=label))
+    end
+    plot_uc_consistency_comparison(rows; pair_label=pair_label, kwargs...)
+end
+
+# ╔═╡ 2de6446f-d07c-4151-8e13-0719c3056826
+res = perform_mft_analysis(Xsynthetic, (period_min, period_max), n_periods;
+    bandwidth_factor = bandwidth_percent / 100.0,
+    zero_pad_factor = zero_pad_factor,
+	phvel_source_phase = phvel_mode == "noise_cc" ? π/4 : 0.0,
+	compute_phase    = phvel_mode != "none",
+    storage_mode     = :full)
+
+# ╔═╡ 1585e739-23c2-4a23-8e80-6f132d503765
+plot_dispersion_curve([res, res], title=string("Group Velocity"))
+
+# ╔═╡ 09d3b269-c8bd-425a-ad4a-1ecd29150507
+plot_envelopes(res, title="Envelopes")
+
+# ╔═╡ 5b56a4a0-5818-11f1-925b-9572ef0ced7a
+function plot_group_phase_consistency(res::MFTResult;
+                                      width=900,
+                                      height=550,
+                                      font_family="Arial, sans-serif",
+                                      font_size=18,
+                                      title="Group and Phase Consistency",
+                                      velocity_range=nothing,
+                                      show_suspect=true)
+    u_pred = any(isfinite, res.u_predicted_from_phase) ?
+        res.u_predicted_from_phase : compute_group_velocity_from_phase(res)
+    valid_group = findall(i -> isfinite(res.group_velocities[i]), eachindex(res.periods))
+    valid_pred = findall(i -> isfinite(u_pred[i]), eachindex(res.periods))
+    isempty(valid_group) && isempty(valid_pred) &&
+        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No velocity data"]))
+
+    vals = Float64[]
+    append!(vals, res.group_velocities[valid_group])
+    append!(vals, u_pred[valid_pred])
+    if isnothing(velocity_range)
+        vel_min = 0.9 * minimum(vals)
+        vel_max = 1.1 * maximum(vals)
+    else
+        vel_min, vel_max = velocity_range
+    end
+
+    traces = [scatter()]
+    if !isempty(valid_group)
+        push!(traces, scatter(
+            x=res.periods[valid_group], y=res.group_velocities[valid_group],
+            mode="lines+markers",
+            marker=attr(size=8, color="black"),
+            line=attr(color="black", width=2),
+            name="Measured U",
+            hovertemplate="Period: %{x:.2f} s<br>U: %{y:.3f} km/s<extra></extra>"
+        ))
+    end
+    if !isempty(valid_pred)
+        push!(traces, scatter(
+            x=res.periods[valid_pred], y=u_pred[valid_pred],
+            mode="lines+markers",
+            marker=attr(size=8, color="firebrick", symbol="diamond"),
+            line=attr(color="firebrick", width=2, dash="dash"),
+            name="U from c(T)",
+            hovertemplate="Period: %{x:.2f} s<br>U_pred: %{y:.3f} km/s<extra></extra>"
+        ))
+    end
+    if show_suspect
+        suspect_idx = findall(i -> res.phase_suspect[i] && isfinite(u_pred[i]), eachindex(res.periods))
+        if !isempty(suspect_idx)
+            push!(traces, scatter(
+                x=res.periods[suspect_idx], y=u_pred[suspect_idx],
+                mode="markers",
+                marker=attr(size=13, color="orange", symbol="x"),
+                name="Phase suspect",
+                hovertemplate="Period: %{x:.2f} s<br>Suspect U_pred: %{y:.3f} km/s<extra></extra>"
+            ))
+        end
+    end
+
+    layout = Layout(
+        title=attr(text=title, font=attr(size=font_size + 2, family=font_family)),
+        xaxis=attr(title="Period (s)", type="linear", showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        yaxis=attr(title="Group Velocity (km/s)", range=[vel_min, vel_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        width=width, height=height,
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=attr(l=80, r=100, t=80, b=80),
+        showlegend=true
+    )
+    return PlutoPlotly.plot(traces, layout)
 end
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
@@ -4693,6 +5317,7 @@ Peaks = "18e31ff7-3703-566c-8e60-38913d67486b"
 PlutoPlotly = "8e989ff0-3d88-8e9f-f020-2b208a939ff0"
 PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Random = "9a3f8284-a2c9-5f02-9a11-845980c5968a"
 StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
@@ -5384,15 +6009,15 @@ version = "17.7.0+0"
 # ╟─161e84fc-db09-4a69-ab53-c73eaa4a1486
 # ╠═e4d5e20b-2bcc-4a22-a2d1-aae7974b02cf
 # ╠═8816d460-fa4d-4b46-803c-5e0c4b80fb9e
-# ╠═2de6446f-d07c-4151-8e13-0719c3056826
 # ╠═5ecefa6f-2a86-46bf-b91b-9ce4c0a32e08
-# ╠═09d3b269-c8bd-425a-ad4a-1ecd29150507
 # ╠═1585e739-23c2-4a23-8e80-6f132d503765
 # ╟─9ce67356-5ff7-4a22-b244-75e35350f959
 # ╠═b6d23222-ba2a-11f0-bcd7-8f110c4a4cd6
+# ╠═8134b82a-5817-11f1-9e07-07eb5ca6e1b3
 # ╠═cee98fdd-f0d9-4ea8-9256-2492a649a512
 # ╟─72db9d05-2714-4e86-bf36-a0c8ee13c040
-# ╠═7088299d-e267-42e3-9c87-1a238332f0f4
+# ╠═0108ca10-2346-432a-bac8-a57e8c0b4e6b
+# ╠═153fc403-0279-4c85-ba06-339f4ee4003e
 # ╠═fcf48627-0b80-4c6b-b204-f40da981aaa5
 # ╠═d5ca213a-b085-4d65-88fa-d221bf5826e1
 # ╠═4192fcef-4662-4944-b354-71e8e00285b1
@@ -5446,6 +6071,15 @@ version = "17.7.0+0"
 # ╠═4c915e4e-3cdc-11f1-9235-33f20a13a658
 # ╠═91b2f6bc-c0f9-4b84-a3d1-37ff6a4bf02d
 # ╠═60f8c1a1-5c76-4cda-a257-84bc5bf8c791
+# ╠═a2000001-0000-0000-0000-000000000001
+# ╠═a2000002-0000-0000-0000-000000000001
+# ╠═a2000003-0000-0000-0000-000000000001
+# ╠═a2000004-0000-0000-0000-000000000001
+# ╠═a2000005-0000-0000-0000-000000000001
+# ╠═a2000006-0000-0000-0000-000000000001
+# ╠═a2000007-0000-0000-0000-000000000001
+# ╠═a2000008-0000-0000-0000-000000000001
+# ╠═a2000009-0000-0000-0000-000000000001
 # ╠═7f0eb497-46c0-4a43-95d5-39f6af0d783e
 # ╠═5da0af71-cfbc-4598-bf6f-cf38f8fce6fe
 # ╠═c0fb74a4-5f74-4451-a097-b0ddb4e79f2e
@@ -5458,32 +6092,6 @@ version = "17.7.0+0"
 # ╠═d10d4b32-4e4e-4198-b08d-084dffeb3694
 # ╠═95f715de-a6aa-4ec5-a2ce-4f7bb241ce34
 # ╠═c9597868-5ae3-4629-b96d-d25f9a7d316d
-# ╠═a079a952-8252-4f56-a4c7-2a9ae58e0f11
-# ╠═f2c83612-d161-4fef-a728-c2dcbfa48b1c
-# ╠═1c36878c-f684-46a8-a2ab-4203a01d0169
-# ╠═7f9cbf19-46b3-403b-90f8-a4591fd5ef4f
-# ╠═f7f4e17f-0784-43db-9a6b-c2b07a963f94
-# ╠═c17d7f26-3d82-44b8-860c-b12df0bf9293
-# ╠═1a7d4cbb-a1ea-4319-a404-2293faf72069
-# ╠═c7600895-0b53-477d-aaca-19925dec0d91
-# ╠═07914f7d-70fb-477d-bb05-dfa2a68d03ff
-# ╠═2e76ea52-ad8e-4f32-9b01-b88d7d1163f9
-# ╠═bdccfc35-4436-4716-a868-bec5a18317d3
-# ╠═0eed3963-d6e2-4c6d-938b-7e233811364c
-# ╠═a669a82b-b147-45d8-bf4e-c2e4d97c1bd3
-# ╠═6e91e0bb-ef16-48bc-a9c9-f5b2d691ee1a
-# ╠═19ac99e3-f2b0-4d78-af7d-b688d548724b
-# ╠═c50a86d5-7f3e-4d03-9583-0a33a238e227
-# ╠═b2460f88-a89c-4402-a3ee-6f9190624932
-# ╠═9da0699a-8146-44b7-8eef-89f3e7cf6882
-# ╠═b67deee3-1244-4f49-81bd-05c86b0c9084
-# ╠═40e5fc55-8f4e-43fa-8ac7-eaa9608a18c7
-# ╠═f203a997-875b-42df-a0af-196d11e7c0af
-# ╠═a05f6476-568b-4c82-9512-f74ae6d6c8f3
-# ╠═730cd90e-9afe-413a-ae31-fe624a919bb8
-# ╠═eab08182-daca-4206-882b-e4fb24ae17a2
-# ╠═c6331917-8167-4dfa-9a50-6fe0888d16d5
-# ╠═3626d6ca-38f2-4b38-9398-9cd052f43950
 # ╠═a1000001-0000-0000-0000-000000000001
 # ╠═a1000002-0000-0000-0000-000000000001
 # ╠═a1000003-0000-0000-0000-000000000001
@@ -5491,9 +6099,7 @@ version = "17.7.0+0"
 # ╠═a1000005-0000-0000-0000-000000000001
 # ╠═a1000006-0000-0000-0000-000000000001
 # ╠═a1000007-0000-0000-0000-000000000001
-# ╠═a1000008-0000-0000-0000-000000000001
 # ╠═1f405df8-9fef-436a-a713-1e2cab48b541
-# ╠═c062cc38-7e5e-4df7-8a19-ae23191c343c
 # ╠═c9da28e0-64ae-491f-879e-47b2490babac
 # ╠═bdb2f320-c713-43aa-bb6b-98cca0606266
 # ╠═9a6cb7e1-6ea0-4dd1-97f3-47f3b8a717de
@@ -5504,5 +6110,14 @@ version = "17.7.0+0"
 # ╠═4c5a5106-95ab-4b29-9cd8-6def65e72b87
 # ╠═fb000010-0000-0000-0000-000000000001
 # ╠═fb000011-0000-0000-0000-000000000001
+# ╠═fb000012-0000-0000-0000-000000000001
+# ╠═f4e12fc4-b775-4c17-9459-920ad3c8bbd6
+# ╠═b7000001-0000-0000-0000-000000000001
+# ╠═b7000002-0000-0000-0000-000000000001
+# ╠═b7000003-0000-0000-0000-000000000001
+# ╠═b7000004-0000-0000-0000-000000000001
+# ╠═2de6446f-d07c-4151-8e13-0719c3056826
+# ╠═09d3b269-c8bd-425a-ad4a-1ecd29150507
+# ╠═5b56a4a0-5818-11f1-925b-9572ef0ced7a
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
