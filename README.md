@@ -54,38 +54,70 @@ SeismicAutoencoders/
 
 ## Installation
 
-Requires **Julia 1.10+** and an **NVIDIA GPU** with CUDA support.
+**Requirements:** Julia 1.10+, an NVIDIA GPU with CUDA support, bash.
+
+### 1. Clone the repository
 
 ```bash
 git clone https://github.com/pawbz/SeismicAutoencoders.jl
 cd SeismicAutoencoders.jl
+```
+
+### 2. Install Julia dependencies
+
+```bash
 julia --project=. -e 'import Pkg; Pkg.instantiate()'
 ```
 
-This installs all dependencies (Lux, Reactant, Enzyme, CUDA, etc.).
+This resolves and precompiles all dependencies (Lux, Reactant, Enzyme, CUDA, UnicodePlots, etc.)
+from the pinned `Manifest.toml`. Takes a few minutes on first run.
+
+### 3. Add the CLI to your shell
+
+Add the following line to your `~/.bashrc` (or `~/.zshrc`), replacing the path with wherever
+you cloned the repo:
+
+```bash
+export SEISMIC_AE_DIR="$HOME/SeismicAutoencoders.jl"
+alias train_vqvae="$SEISMIC_AE_DIR/vqvae/train_vqvae.sh"
+```
+
+Then reload your shell:
+
+```bash
+source ~/.bashrc
+```
+
+### 4. Verify
+
+```bash
+train_vqvae --help
+```
 
 ---
 
 ## Quick start
 
+Once the alias is set up, `train_vqvae` works from any directory:
+
 ```bash
 # List available station pairs in your data directory
-./vqvae/train_vqvae.sh --list-pairs --data-dir /path/to/jld2/files
+train_vqvae --list-pairs --data-dir /path/to/jld2/files
 
-# Inspect a random pair (prints stats + terminal plots of waveforms and PSD)
-./vqvae/train_vqvae.sh --sample-pair --data-dir /path/to/jld2/files
+# Inspect a random pair — prints waveform and PSD plots in the terminal
+train_vqvae --sample-pair --data-dir /path/to/jld2/files
 
-# Train all pairs on GPU 0, background (default)
-./vqvae/train_vqvae.sh --data-dir /path/to/jld2/files --nepoch 100
+# Train all pairs on GPU 0, background (default) — logs to file
+train_vqvae --data-dir /path/to/jld2/files --nepoch 100
 
 # Train all pairs on GPU 0, print to terminal
-./vqvae/train_vqvae.sh --foreground --data-dir /path/to/jld2/files --nepoch 100
+train_vqvae --foreground --data-dir /path/to/jld2/files --nepoch 100
 
-# Train across two GPUs in parallel
-./vqvae/train_vqvae.sh --gpus 0,1 --data-dir /path/to/jld2/files --nepoch 100
+# Train across two GPUs in parallel, stream to terminal
+train_vqvae --gpus 0,1 --foreground --data-dir /path/to/jld2/files --nepoch 100
 
-# Train specific pairs
-./vqvae/train_vqvae.sh AP-BK,AP-CL --data-dir /path/to/jld2/files
+# Train specific pairs only
+train_vqvae AP-BK,AP-CL --data-dir /path/to/jld2/files
 ```
 
 ---
