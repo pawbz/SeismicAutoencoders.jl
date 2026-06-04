@@ -19,8 +19,7 @@ SeismicAutoencoders/
 ├── vqvae/                    Primary VQ-VAE v9 code
 │   ├── VQVAE_architecture_v9.jl   Model, training loop, XLA compilation
 │   ├── train_vqvae.jl             CLI training entry point
-│   ├── train_vqvae.sh             Single-GPU background launcher
-│   ├── train_vqvae_parallel.sh    Multi-GPU parallel launcher
+│   ├── train_vqvae.sh             Launcher (single or multi-GPU, background or foreground)
 │   ├── data_generators.jl         Data loading and preprocessing
 │   ├── Prepare_Tomography_v9.jl   Post-training tomography preparation
 │   ├── TomographySelection_v9.jl  Station-pair selection for tomography
@@ -76,11 +75,14 @@ This installs all dependencies (Lux, Reactant, Enzyme, CUDA, etc.).
 # Inspect a random pair (prints stats + terminal plots of waveforms and PSD)
 ./vqvae/train_vqvae.sh --sample-pair --data-dir /path/to/jld2/files
 
-# Train all pairs on GPU 0 (100 epochs, 2 seeds)
+# Train all pairs on GPU 0, background (default)
 ./vqvae/train_vqvae.sh --data-dir /path/to/jld2/files --nepoch 100
 
-# Train pairs in parallel across two GPUs
-./vqvae/train_vqvae_parallel.sh --data-dir /path/to/jld2/files --nepoch 100
+# Train all pairs on GPU 0, print to terminal
+./vqvae/train_vqvae.sh --foreground --data-dir /path/to/jld2/files --nepoch 100
+
+# Train across two GPUs in parallel
+./vqvae/train_vqvae.sh --gpus 0,1 --data-dir /path/to/jld2/files --nepoch 100
 
 # Train specific pairs
 ./vqvae/train_vqvae.sh AP-BK,AP-CL --data-dir /path/to/jld2/files
@@ -121,20 +123,23 @@ See `vqvae/VQVAE_readme.md` for the full architecture evolution from v1 to v9.
 
 ---
 
-## Parallel training
+## Multi-GPU training
 
-The `train_vqvae_parallel.sh` script splits station pairs round-robin across N GPUs.
+`train_vqvae.sh` splits station pairs round-robin across N GPUs via `--gpus`.
 Each GPU gets its own Julia process, compiles XLA once, and trains its assigned pairs
-and seeds sequentially.
+and seeds sequentially. Use `--foreground` to stream all GPU logs to the terminal live.
 
 ```bash
-# Use both GPUs (default: 0,1)
-./vqvae/train_vqvae_parallel.sh --data-dir /path/to/data --nepoch 100
+# Two GPUs, background
+./vqvae/train_vqvae.sh --gpus 0,1 --data-dir /path/to/data --nepoch 100
 
-# Use four GPUs
-./vqvae/train_vqvae_parallel.sh --gpus 0,1,2,3 --data-dir /path/to/data --nepoch 100
+# Two GPUs, stream to terminal
+./vqvae/train_vqvae.sh --gpus 0,1 --foreground --data-dir /path/to/data --nepoch 100
 
-# Monitor all GPU logs
+# Four GPUs
+./vqvae/train_vqvae.sh --gpus 0,1,2,3 --data-dir /path/to/data --nepoch 100
+
+# Monitor logs manually
 tail -f train_vqvae_gpu*_<timestamp>.out
 ```
 

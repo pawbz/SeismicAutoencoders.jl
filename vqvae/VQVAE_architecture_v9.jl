@@ -2201,6 +2201,33 @@ function train_selected_pairs_lazy(selected_pairs, compiled_model;
         pd_raw = (; pair, data, data_bundle=bundle)
         @info "Whitening pair" pair
         pd = whiten_pair_entry(pd_raw; bp_filter, per_waveform_whitening_kernel_length)
+        let D_ac = pd.data.D_ac_all, D_c = pd.data.D_c_all
+            nt      = size(D_ac, 1)
+            lags_s  = collect((1:nt) .* dt)
+            mean_ac = vec(mean(D_ac, dims=2))
+            mean_c  = vec(mean(D_c,  dims=2))
+            plt_w = UnicodePlots.lineplot(
+                lags_s, mean_ac;
+                name="acausal", xlabel="lag (s)", ylabel="amplitude",
+                title="$(pair[1])-$(pair[2])  whitened waveforms  ($(size(D_ac,2)) ac / $(size(D_c,2)) c)",
+                width=80, height=10,
+            )
+            UnicodePlots.lineplot!(plt_w, lags_s, mean_c; name="causal")
+            println(plt_w)
+            psd_ac = _positive_period_psd(D_ac, dt)
+            psd_c  = _positive_period_psd(D_c,  dt)
+            mean_pow_ac = vec(mean(10 .* log10.(max.(psd_ac.psd, 1f-30)), dims=2))
+            mean_pow_c  = vec(mean(10 .* log10.(max.(psd_c.psd,  1f-30)), dims=2))
+            plt_p = UnicodePlots.lineplot(
+                psd_ac.periods, mean_pow_ac;
+                name="acausal", xlabel="period (s)", ylabel="PSD (dB)",
+                title="$(pair[1])-$(pair[2])  input PSD",
+                width=80, height=10,
+                xscale=:log10,
+            )
+            UnicodePlots.lineplot!(plt_p, psd_c.periods, mean_pow_c; name="causal")
+            println(plt_p)
+        end
         for (run_index, seed) in enumerate(seeds)
             @info "Training pair" pair run_index seed
             reset_start = time()
