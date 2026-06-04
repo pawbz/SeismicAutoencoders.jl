@@ -1,6 +1,17 @@
-/.DS_Store
-/.vscode
-/CatVAE_SymAE_style backup 1.jl
-/CatVAE_SymAE_style backup 2.jl
-/CatVAE_backupo.jl
-/SymAE_architecture_backup.jl
+# Computational output — do not commit run results
+DSurfTomo_runs/
+
+# External dependencies (large, contain their own git repos)
+External/
+
+# Julia build artifacts
+*.jl.bak*
+
+# OS artifacts
+.DS_Store
+gmt.history
+htop
+
+# Editor
+.vscode/
+*.code-workspace
