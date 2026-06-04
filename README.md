@@ -54,7 +54,7 @@ SeismicAutoencoders/
 
 ## Installation
 
-**Requirements:** Julia 1.10+, an NVIDIA GPU with CUDA support, bash.
+**Requirements:** Julia 1.12.6 (tested), an NVIDIA GPU with CUDA support, bash.
 
 ### 1. Clone the repository
 
