@@ -255,7 +255,7 @@ inspect PAIR [options]
                 periods_filtered, pow_raw_filtered;
                 name="raw", xlabel="period (s)", ylabel="PSD (dB)",
                 title="$(pair_obj[1])-$(pair_obj[2])  PSD: raw vs whitened",
-                width=80, height=12, xscale=:log10,
+                width=80, height=12,
             )
             # Overlay whitened PSD
             UnicodePlots.lineplot!(plt_psd, periods_filtered, pow_whitened_filtered; name="whitened")
