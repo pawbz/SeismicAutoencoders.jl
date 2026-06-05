@@ -754,15 +754,8 @@ function rebuild_latent_index!(idx::LatentIndex, model, ps, st, X;
     Mnn::Int=idx.Mnn, device=identity, cdev=default_cdev(), encode_compiled=nothing,
     knn_search_chunk_size_fraction::Float64=1.0, n_compiled::Union{Nothing,Int}=nothing)
     X_cpu = Float32.(cdev(flatten_batch(X)))
-    _, N_full = size(X_cpu)
-    # truncate to compiled size if needed
-    N = if !isnothing(n_compiled) && N_full > n_compiled
-        @info "Latent index: truncating pair to compiled size" N_full n_compiled ignored=N_full - n_compiled
-        n_compiled
-    else
-        N_full
-    end
-    X_cpu = X_cpu[:, 1:N]
+    _, N = size(X_cpu)
+    # Use all waveforms - batching with padding handles variable-N inference
     Mnn >= 1 || error("Mnn must be >= 1.")
     N >= Mnn + 1 || error("Need at least Mnn + 1 samples; got N=$N and Mnn=$Mnn.")
     D = model.d
@@ -779,8 +772,27 @@ function rebuild_latent_index!(idx::LatentIndex, model, ps, st, X;
         enc, _ = encode(model, ps_dev, st_eval, device(X_cpu); training=false)
         embeddings .= Float32.(cdev(enc.z_e))
     else
-        z_dev = encode_compiled(model, ps_dev, st_eval, device(X_cpu))
-        embeddings .= Float32.(cdev(z_dev))
+        # Use batch_inference_with_padding to handle variable-N with fixed-size compiled executor
+        batch_size = n_compiled  # Compiled at batchsize
+        z_list = Vector{Matrix{Float32}}()
+        for start_idx in 1:batch_size:N
+            end_idx = min(start_idx + batch_size - 1, N)
+            n_batch = end_idx - start_idx + 1
+
+            # Extract batch and pad if needed
+            X_batch = X_cpu[:, start_idx:end_idx]
+            if n_batch < batch_size
+                pad_size = batch_size - n_batch
+                X_batch = hcat(X_batch, randn(Float32, size(X_cpu, 1), pad_size))
+            end
+
+            # Run compiled inference
+            z_batch = Float32.(cdev(encode_compiled(model, ps_dev, st_eval, device(X_batch))))
+            z_valid = z_batch[:, 1:n_batch]
+            push!(z_list, z_valid)
+        end
+        z_cpu = hcat(z_list...)
+        embeddings .= z_cpu
     end
     embedding_time = time() - embedding_start
     normalize_start = time()
@@ -1086,7 +1098,9 @@ Run inference on variable-N data using a fixed batch-size compiled executable.
 Splits X into batch_size chunks, pads last chunk with randn if needed, runs compiled inference,
 and extracts only the valid outputs (discarding padding).
 
-Returns latent codes with shape (latent_dim, N_original)
+Function signature: compiled_encode(X_batch_on_device) -> z_batch_on_device
+
+Returns latent codes with shape (latent_dim, N_original) on CPU
 """
 function batch_inference_with_padding(X_cpu::AbstractMatrix{Float32}, compiled_encode::Function,
                                        batch_size::Int)
@@ -1108,11 +1122,13 @@ function batch_inference_with_padding(X_cpu::AbstractMatrix{Float32}, compiled_e
             X_batch = hcat(X_batch, randn(Float32, nt, pad_size))  # Pad with noise
         end
 
-        # Run compiled inference
-        z_batch = compiled_encode(X_batch)  # shape: (latent_dim, batch_size)
+        # Run compiled inference (function handles device transfer)
+        z_batch = compiled_encode(X_batch)  # shape: (latent_dim, batch_size) on device
+        z_batch_cpu = Float32.(vec(z_batch))  # Move to CPU and flatten
 
         # Extract only valid outputs (discard padding)
-        z_valid = z_batch[:, 1:n_batch]
+        latent_dim = size(z_batch, 1)
+        z_valid = reshape(z_batch_cpu[1:latent_dim * n_batch], latent_dim, n_batch)
         push!(latent_codes, vec(z_valid))
     end
 
@@ -1298,7 +1314,6 @@ function trim_training_bundle(bundle; n_max::Union{Nothing,Integer}=nothing,
         @warn "n_max parameter deprecated: XLA compiles at batchsize now. Training on all available waveforms."
     end
     return bundle
-    end
 end
 
 # ╔═╡ 8dd1c50c-587c-471d-bc80-cd77012302a9
@@ -1620,12 +1635,8 @@ function update(model, ps, st, loss_history, train_data, test_data,
 
     setup_start = time()
     train_x_cpu_full = Float32.(cdev(flatten_batch(train_data)))
-    # Clamp training set to compiled size so batch indices never exceed ensemble_targets_cpu columns
-    train_x_cpu = if !isnothing(n_compiled) && size(train_x_cpu_full, 2) > n_compiled
-        train_x_cpu_full[:, 1:n_compiled]
-    else
-        train_x_cpu_full
-    end
+    # Use all waveforms - batching with padding in rebuild_latent_index handles variable-N
+    train_x_cpu = train_x_cpu_full
     test_x_cpu = Float32.(cdev(flatten_batch(test_data)))
     opt = Optimisers.AdamW(; eta=Float64(training_para.initial_learning_rate),
         lambda=Float64(training_para.weight_decay))
@@ -1670,7 +1681,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
                 if compile_missing
                     latent_compiled = maybe_compile_inference(
                         train_state.model, train_state.parameters, train_state.states,
-                        device(train_x_cpu),
+                        device(train_x_cpu[:, 1:training_para.batchsize]),
                         training_para;
                         device,
                         sample_batch_x=device(train_x_cpu[:, 1:training_para.batchsize]),

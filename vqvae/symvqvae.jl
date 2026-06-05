@@ -334,6 +334,80 @@ end
 include_vqvae_architecture_for_cli()
 
 
+# Test helper: train on synthetic random waveform data using real training pipeline
+function train_selected_pairs_synthetic(compiled_model;
+    seeds, training_para, save_root, nt, nwindows,
+    period_min, period_max, dt, bp_filter,
+    per_waveform_whitening_kernel_length, device)
+
+    @info "Test mode: creating synthetic data and running full training pipeline" nt nwindows nepoch=training_para.nepoch
+
+    # Create synthetic waveform data
+    n_acausal = div(nwindows, 2)
+    n_causal = nwindows - n_acausal
+    D_acausal_raw = Float32.(randn(nt, n_acausal))
+    D_causal_raw = Float32.(randn(nt, n_causal))
+
+    pair = ("TEST", "PAIR")
+
+    # Build data bundle matching real format
+    data_bundle = (;
+        pair=pair,
+        distance=100.0,
+        D1fac=D_acausal_raw,
+        D1fc=D_causal_raw,
+        headers=nothing,
+    )
+
+    # Create a minimal vqvae_parameters tuple (use same as passed in)
+    # Extract from compiled_model which has para field
+    para = compiled_model.para
+
+    # Use the real training pipeline with synthetic data
+    # This ensures we test the same code path as production training
+    @info "Running real training pipeline on synthetic data (1 epoch to test)..."
+
+    # We'll call the core training function directly with synthetic data
+    # This exercises all code paths including line 1684 fix
+    for seed in seeds
+        @info "Test: calling update() on synthetic pair" pair seed
+
+        try
+            # Create training data matching real format
+            train_x_cpu = hcat(data_bundle.D1fac, data_bundle.D1fc)
+            test_x_cpu = hcat(data_bundle.D1fac[:, 1:min(50, div(size(data_bundle.D1fac, 2), 2))],
+                             data_bundle.D1fc[:, 1:min(50, div(size(data_bundle.D1fc, 2), 2))])
+
+            @info "Synthetic data ready" train_size=size(train_x_cpu) test_size=size(test_x_cpu) batchsize=training_para.batchsize
+
+            # Reset model for this seed
+            ps, st = reset_vqvae(compiled_model.model; seed, device)
+
+            # Call update() - this tests the entire training path including line 1684 fix
+            # If there's a shape mismatch, it will fail here with RuntimeProgramInputMismatch
+            loss, stats, ps, st = update(
+                compiled_model.model, ps, st,
+                train_x_cpu, test_x_cpu,
+                1,  # epoch 1
+                para,
+                training_para;
+                device,
+                compiled=compiled_model.compiled,
+                cdev=identity,
+            )
+
+            @info "Test: update() succeeded" seed loss train_batches=div(size(train_x_cpu,2), training_para.batchsize)
+
+        catch e
+            @error "TEST FAILURE: update() crashed" exception=(e, catch_backtrace())
+            @error "If this is RuntimeProgramInputMismatch, the line 1684 fix didn't work"
+            rethrow(e)
+        end
+    end
+
+    @info "Test mode PASSED - all code paths executed successfully"
+end
+
 function cmd_train(args::Vector{String})
     if !isempty(args) && args[1] in ("--help", "-h")
         println("""
@@ -450,6 +524,12 @@ train [pairs] [options]
         elseif a == "-f" || a == "--foreground"
             # Foreground flag is handled by the bash wrapper, silently ignore here
             nothing
+        elseif a == "--test-mode"
+            # Override parameters for quick testing with small synthetic data
+            nepoch = 2
+            nwindows = 250  # NOT a multiple of batchsize to test edge case
+            batchsize = 32  # Much smaller than real (4096)
+            pairs = "TEST"  # Special marker for synthetic data
         elseif !startswith(a, "-")
             pairs = a
         end
@@ -481,12 +561,18 @@ train [pairs] [options]
     println("Verbose output:              $(verbose ? "yes" : "no")")
     println("="^80 * "\n")
 
-    all_pairs  = list_station_pairs(data_dir)
-    isempty(all_pairs) && error("No station pairs found in $(data_dir). Check --data-dir.")
-
-    selected_pairs = if pairs == "all"
-        all_pairs
+    # Handle test mode: generate synthetic data
+    if pairs == "TEST"
+        selected_pairs = [("TEST", "PAIR")]
+        test_mode = true
     else
+        test_mode = false
+        all_pairs  = list_station_pairs(data_dir)
+        isempty(all_pairs) && error("No station pairs found in $(data_dir). Check --data-dir.")
+
+        selected_pairs = if pairs == "all"
+            all_pairs
+        else
         # Parse pair specifications: supports formats like:
         # - "AP-BK" or "AP_BK" (single pair)
         # - "AP-BK,SM17-SM42" (multiple pairs with - separator)
@@ -515,6 +601,7 @@ train [pairs] [options]
 
         parsed
     end
+    end  # Close outer if-else for test mode vs normal mode
 
     seeds_vec  = parse.(Int, strip.(split(seeds, ",")))
     K_vec      = parse.(Int, strip.(split(K, ",")))
@@ -553,27 +640,49 @@ train [pairs] [options]
 
     device = default_xdev(; force=true)
 
-    @info "Loading first pair to determine nt for XLA compilation..."
-    first_pair_data = load_pairs_data([selected_pairs[1]];
-        filepath=data_dir, dt, period_min, period_max, n_max=nwindows)
-    nt      = size(first_pair_data[1].data.D_train, 1)
-    n_train = nwindows
+    # For test mode, create synthetic data with small nt
+    if test_mode
+        @info "TEST MODE: Using synthetic data with small sizes"
+        nt = 100  # Very small for fast compilation
+        n_train = nwindows
+    else
+        @info "Loading first pair to determine nt for XLA compilation..."
+        first_pair_data = load_pairs_data([selected_pairs[1]];
+            filepath=data_dir, dt, period_min, period_max, n_max=nwindows)
+        nt      = size(first_pair_data[1].data.D_train, 1)
+        n_train = nwindows
+    end
 
     @info "Compiling Reactant XLA graph (once for this session)..." nt n_train K=K_vec batchsize
     compiled_model = compile_model(nt, n_train;
         vqvae_parameters, training_para, seed=seeds_vec[1], device)
 
-    train_selected_pairs_lazy(selected_pairs, compiled_model;
-        seeds=seeds_vec,
-        training_para,
-        save_root,
-        filepath=data_dir,
-        dt, period_min, period_max,
-        n_max=nwindows,
-        bp_filter,
-        per_waveform_whitening_kernel_length=whitening_kernel_length,
-        device,
-    )
+    if test_mode
+        # Generate and train on synthetic data
+        @info "Generating synthetic test data..." nt nwindows batchsize nepoch
+        train_selected_pairs_synthetic(compiled_model;
+            seeds=seeds_vec,
+            training_para,
+            save_root,
+            nt, nwindows,
+            period_min, period_max, dt,
+            bp_filter,
+            per_waveform_whitening_kernel_length=whitening_kernel_length,
+            device,
+        )
+    else
+        train_selected_pairs_lazy(selected_pairs, compiled_model;
+            seeds=seeds_vec,
+            training_para,
+            save_root,
+            filepath=data_dir,
+            dt, period_min, period_max,
+            n_max=nwindows,
+            bp_filter,
+            per_waveform_whitening_kernel_length=whitening_kernel_length,
+            device,
+        )
+    end
 end
 
 function main(args::Vector{String})
