@@ -416,6 +416,31 @@ train [pairs] [options]
         i += 1
     end
 
+    # Print all parameters for user verification
+    println("\n" * "="^80)
+    println("Training Configuration:")
+    println("="^80)
+    println("Pair(s):                     $(pairs == "all" ? "all" : pairs)")
+    println("Data directory:              $data_dir")
+    println("Save directory:              $(isempty(save_dir) ? "$(data_dir)/SavedModels/vqvae_v9_..." : save_dir)")
+    println("Number of epochs:            $nepoch")
+    println("Batch size:                  $batchsize")
+    println("Learning rate:               $lr")
+    println("Seeds:                       $seeds")
+    println("Number of waveforms/pair:    $nwindows")
+    println("Period range (bandpass):     $period_min — $period_max s")
+    println("Sample interval (dt):        $dt s")
+    println("Codebook sizes (K):          $K")
+    println("Latent dimension (d):        $d")
+    println("Encoder filters:             $n_filters")
+    println("Stride ratios:               $ratios")
+    println("Residual layers:             $n_residual_layers")
+    println("Entropy weight:              $entropy_weight")
+    println("Whitening kernel length:     $whitening_kernel_length")
+    println("Autodiff backend:            $autodiff_backend")
+    println("Verbose output:              $(verbose ? "yes" : "no")")
+    println("="^80 * "\n")
+
     all_pairs  = list_station_pairs(data_dir)
     isempty(all_pairs) && error("No station pairs found in $(data_dir). Check --data-dir.")
 
