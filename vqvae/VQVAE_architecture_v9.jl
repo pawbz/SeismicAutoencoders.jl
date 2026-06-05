@@ -1077,6 +1077,49 @@ function maybe_compile_inference(model, ps, st, sample_x, training_para::VQVAE_T
     return (; encode_z_e=encode_z_e_compiled, encode_z_e_train=encode_z_e_train_compiled)
 end
 
+# ╔═╡ batch_inference_with_padding helper
+"""
+    batch_inference_with_padding(X_cpu::AbstractMatrix{Float32}, compiled_encode::Function,
+                                  batch_size::Int)
+
+Run inference on variable-N data using a fixed batch-size compiled executable.
+Splits X into batch_size chunks, pads last chunk with randn if needed, runs compiled inference,
+and extracts only the valid outputs (discarding padding).
+
+Returns latent codes with shape (latent_dim, N_original)
+"""
+function batch_inference_with_padding(X_cpu::AbstractMatrix{Float32}, compiled_encode::Function,
+                                       batch_size::Int)
+    nt, N = size(X_cpu)
+    if isnothing(compiled_encode)
+        error("compiled_encode cannot be nothing")
+    end
+
+    latent_codes = Vector{Float32}[]
+
+    for start_idx in 1:batch_size:N
+        end_idx = min(start_idx + batch_size - 1, N)
+        n_batch = end_idx - start_idx + 1
+
+        # Extract batch and pad if needed
+        X_batch = X_cpu[:, start_idx:end_idx]
+        if n_batch < batch_size
+            pad_size = batch_size - n_batch
+            X_batch = hcat(X_batch, randn(Float32, nt, pad_size))  # Pad with noise
+        end
+
+        # Run compiled inference
+        z_batch = compiled_encode(X_batch)  # shape: (latent_dim, batch_size)
+
+        # Extract only valid outputs (discard padding)
+        z_valid = z_batch[:, 1:n_batch]
+        push!(latent_codes, vec(z_valid))
+    end
+
+    # Concatenate all valid latent codes
+    return hcat(latent_codes...)
+end
+
 # ╔═╡ 81ffa3b4-8a3c-4571-a494-6108378fff4a
 function compute_whitening_fir(X_cpu::AbstractMatrix{Float32}, dt::Float64;
     kernel_length::Int=64, min_power_fraction::Float64=0.05)
@@ -2331,9 +2374,9 @@ function compile_model(nt::Int, n_train::Int; vqvae_parameters::NamedTuple,
     rng = Xoshiro(seed)
     para = VQVAE_Para(; merge(vqvae_parameters, (; nt, seed))...)
     model, ps, st, _ = get_vqvae(para; rng, device=xdev)
-    # latent-index encoder compiled at n_train (minimum across all pairs)
-    # batch encoder compiled at batchsize — these are separate XLA graphs
-    dummy_full_cpu = randn(rng, Float32, nt, n_train)
+    # XLA compile at batchsize (not n_train) to fix RuntimeProgramInputMismatch errors
+    # Allows inference with any N via batching + padding to batchsize
+    dummy_full_cpu = randn(rng, Float32, nt, training_para.batchsize)
     dummy_batch_cpu = dummy_full_cpu[:, 1:training_para.batchsize]
     compiled = compile_vqvae_helpers(model, ps, st, dummy_full_cpu, training_para;
         device=xdev, sample_batch_x=xdev(dummy_batch_cpu))
