@@ -9,16 +9,22 @@ if [ ! -x "$JULIA" ]; then
     JULIA="julia"  # fallback to system julia if julialauncher not found
 fi
 
-# Check if this is a trivial operation (--help, inspect)
+# Check if this is a trivial operation (--help, inspect, or -f/--foreground flag)
+FOREGROUND=false
 for arg in "$@"; do
-    if [[ "$arg" == "--help" ]] || [[ "$arg" == "-h" ]] || [[ "$arg" == "inspect" ]]; then
-        # Run info/inspect operations in foreground
-        "$JULIA" --project="${SCRIPT_DIR}/.." "${SCRIPT_DIR}/symvqvae.jl" "$@"
-        exit $?
+    if [[ "$arg" == "--help" ]] || [[ "$arg" == "-h" ]] || [[ "$arg" == "inspect" ]] || [[ "$arg" == "-f" ]] || [[ "$arg" == "--foreground" ]]; then
+        FOREGROUND=true
+        break
     fi
 done
 
-# For training, run in background with logging
+if [[ "$FOREGROUND" == true ]]; then
+    # Run in foreground
+    "$JULIA" --project="${SCRIPT_DIR}/.." "${SCRIPT_DIR}/symvqvae.jl" "$@"
+    exit $?
+fi
+
+# For training without -f/--foreground, run in background with logging
 LOG_FILE="${RUN_DIR}/symvqvae_$(date +%Y%m%d_%H%M%S).out"
 
 "$JULIA" --project="${SCRIPT_DIR}/.." "${SCRIPT_DIR}/symvqvae.jl" "$@" > "$LOG_FILE" 2>&1 &

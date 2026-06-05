@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(julia --version)",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(juliaup default *)",
+      "Bash(juliaup status *)",
+      "Bash(bash -c 'julia --version')",
+      "Bash(~/.juliaup/bin/julia --version)",
+      "Bash(~/.juliaup/bin/julialauncher --version)",
+      "Bash(sudo ln -sf ~/.juliaup/bin/julialauncher /usr/local/bin/julia)",
+      "Bash(/mnt/NAS/CACHEDEV1_DATA/EQData/SeismicAutoencoders/vqvae/train_vqvae.sh --help)",
+      "Bash(/mnt/NAS/CACHEDEV1_DATA/EQData/SeismicAutoencoders/vqvae/symvqvae.sh --help)",
+      "Bash(time /mnt/NAS/CACHEDEV1_DATA/EQData/SeismicAutoencoders/vqvae/symvqvae.sh inspect)",
+      "Bash(/mnt/NAS/CACHEDEV1_DATA/EQData/SeismicAutoencoders/vqvae/symvqvae.sh inspect *)",
+      "Bash(~/.juliaup/bin/julialauncher --project=/mnt/NAS/CACHEDEV1_DATA/EQData/SeismicAutoencoders -e ' *)",
+      "Bash(~/.juliaup/bin/julialauncher -e ' *)",
+      "Bash(/mnt/NAS/CACHEDEV1_DATA/EQData/SeismicAutoencoders/vqvae/symvqvae.sh train *)",
+      "Bash(git commit -m ' *)",
+      "Bash(julia --project=/mnt/NAS/CACHEDEV1_DATA/EQData/SeismicAutoencoders /mnt/NAS/CACHEDEV1_DATA/EQData/SeismicAutoencoders/vqvae/symvqvae.jl train SM17-SM42 --data-dir /mnt/NAS2/Sanket_data/Minneapolis_pairs_SM_29052026 --help)",
+      "Bash(pkill -f \"symvqvae\")",
+      "Bash(wait)"
+    ]
+  }
+}

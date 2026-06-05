@@ -5,6 +5,32 @@
 include("io_utils.jl")
 include("whitening_utils.jl")
 
+# Helper function for parsing pair specifications (shared by train and inspect)
+function parse_pair_spec(pair_str::AbstractString)
+    """
+    Parse a single pair specification in any of these formats:
+    - "STA1-STA2"  (dash separator)
+    - "STA1_STA2"  (underscore separator)
+    - "STA1,STA2"  (comma separator)
+
+    Returns (sta1, sta2) as strings
+    """
+    pair_str = strip(pair_str)
+
+    parts = if contains(pair_str, "-")
+        split(pair_str, "-", limit=2)
+    elseif contains(pair_str, "_")
+        split(pair_str, "_", limit=2)
+    elseif contains(pair_str, ",")
+        split(pair_str, ",", limit=2)
+    else
+        error("Pair format error: '$pair_str'. Expected 'STA1-STA2', 'STA1_STA2', or 'STA1,STA2'")
+    end
+
+    length(parts) == 2 || error("Pair format error: '$pair_str'. Expected 'STA1-STA2', 'STA1_STA2', or 'STA1,STA2'")
+    (String(strip(parts[1])), String(strip(parts[2])))
+end
+
 # Check for help/info flags BEFORE loading expensive packages
 if isempty(ARGS) || ARGS[1] in ("--help", "-h")
     println("""
@@ -31,8 +57,8 @@ Commands:
       --lr FLOAT                    Learning rate (default: 0.001)
       --seeds LIST                  Seeds per model (default: "1234,1235")
       --nwindows INT                Waveforms per pair (default: 20000)
-      --period-min FLOAT            Min period (default: 10.0s)
-      --period-max FLOAT            Max period (default: 75.0s)
+      --period-min FLOAT            Min period (default: 3.0s)
+      --period-max FLOAT            Max period (default: 10.0s)
       --dt FLOAT                    Sample interval (default: 1.0s)
       --K LIST                      Codebook sizes (default: "5,3")
       --d INT                       Latent dimension (default: 40)
@@ -52,8 +78,8 @@ Commands:
 
     Options:
       --data-dir DIR                JLD2 files directory (default: pwd)
-      --period-min FLOAT            Min period (default: 10.0s)
-      --period-max FLOAT            Max period (default: 75.0s)
+      --period-min FLOAT            Min period (default: 3.0s)
+      --period-max FLOAT            Max period (default: 10.0s)
       --dt FLOAT                    Sample interval (default: 1.0s)
       --whitening-kernel-length INT FIR taps for whitening (default: 128)
 
@@ -83,8 +109,8 @@ inspect PAIR [options]
 
   Options:
     --data-dir DIR                JLD2 files directory (default: pwd)
-    --period-min FLOAT            Min period (default: 10.0s)
-    --period-max FLOAT            Max period (default: 75.0s)
+    --period-min FLOAT            Min period (default: 3.0s)
+    --period-max FLOAT            Max period (default: 10.0s)
     --dt FLOAT                    Sample interval (default: 1.0s)
     --whitening-kernel-length INT FIR taps for whitening (default: 128)
 """)
@@ -93,8 +119,8 @@ inspect PAIR [options]
 
         pair = args[1]
         data_dir = pwd()
-        period_min = 10.0
-        period_max = 75.0
+        period_min = 3.0
+        period_max = 10.0
         dt = 1.0
         whitening_kernel_length = 128
 
@@ -129,7 +155,9 @@ inspect PAIR [options]
             end
         end
 
-        pair_normalized = replace(pair, "-" => "_")
+        # Parse the pair specification (handles "-", "_", and "," separators)
+        pair_parsed = parse_pair_spec(pair)
+        pair_normalized = "$(pair_parsed[1])_$(pair_parsed[2])"
         matched_pair = filter(p -> "$(p[1])_$(p[2])" == pair_normalized, all_pairs)
 
         if isempty(matched_pair)
@@ -173,9 +201,8 @@ inspect PAIR [options]
             println("  Data range: [$(minimum(correlations)), $(maximum(correlations))]")
 
             if haskey(jld2_data, "dist")
-                dist_m = jld2_data["dist"]
-                dist_km = dist_m / 1000
-                println("  Interstation distance: $(round(dist_km, digits=2)) km")
+                dist_km = jld2_data["dist"]  # distance is always in km
+                println("  Interstation distance: $dist_km km")
             end
 
             if haskey(jld2_data, "latitudes") && haskey(jld2_data, "longitudes")
@@ -324,8 +351,8 @@ train [pairs] [options]
     --lr FLOAT                    Learning rate (default: 0.001)
     --seeds LIST                  Seeds per model (default: "1234,1235")
     --nwindows INT                Waveforms per pair (default: 20000)
-    --period-min FLOAT            Min period (default: 10.0s)
-    --period-max FLOAT            Max period (default: 75.0s)
+    --period-min FLOAT            Min period (default: 3.0s)
+    --period-max FLOAT            Max period (default: 10.0s)
     --dt FLOAT                    Sample interval (default: 1.0s)
     --K LIST                      Codebook sizes (default: "5,3")
     --d INT                       Latent dimension (default: 40)
@@ -348,8 +375,8 @@ train [pairs] [options]
     batchsize = 4096
     lr = 0.001
     nwindows = 20000
-    period_min = 10.0
-    period_max = 75.0
+    period_min = 3.0
+    period_max = 10.0
     dt = 1.0
     K = "5,3"
     d = 40
@@ -420,6 +447,9 @@ train [pairs] [options]
             i <= length(args) && (autodiff_backend = args[i])
         elseif a == "--verbose" || a == "-v"
             verbose = true
+        elseif a == "-f" || a == "--foreground"
+            # Foreground flag is handled by the bash wrapper, silently ignore here
+            nothing
         elseif !startswith(a, "-")
             pairs = a
         end
@@ -457,8 +487,33 @@ train [pairs] [options]
     selected_pairs = if pairs == "all"
         all_pairs
     else
-        [(String(parts[1]), String(parts[2])) for parts in
-            [split(pr, "-", limit=2) for pr in split(pairs, ",")]]
+        # Parse pair specifications: supports formats like:
+        # - "AP-BK" or "AP_BK" (single pair)
+        # - "AP-BK,SM17-SM42" (multiple pairs with - separator)
+        # - "AP_BK,SM17_SM42" (multiple pairs with _ separator)
+        # - "AP,BK" (single pair with , separator)
+        # - "AP-BK SM17-SM42" (space-separated pairs)
+
+        parsed = []
+
+        # Check if format is "STA1,STA2" (single pair with comma separator, no dashes/underscores)
+        if count(',', pairs) == 1 && !contains(pairs, '-') && !contains(pairs, '_')
+            push!(parsed, parse_pair_spec(pairs))
+        else
+            # Multiple pairs separated by commas or spaces
+            pair_strs = if contains(pairs, ',')
+                split(pairs, ",")
+            else
+                split(pairs)
+            end
+
+            for pr in pair_strs
+                isempty(strip(pr)) && continue
+                push!(parsed, parse_pair_spec(pr))
+            end
+        end
+
+        parsed
     end
 
     seeds_vec  = parse.(Int, strip.(split(seeds, ",")))
