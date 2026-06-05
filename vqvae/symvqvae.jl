@@ -139,6 +139,16 @@ inspect PAIR [options]
         pair_obj = matched_pair[1]
         println("Inspecting pair: $(pair_obj[1])-$(pair_obj[2])")
 
+        # Print inspection parameters for user verification
+        println("\n" * "="^80)
+        println("Inspection Parameters:")
+        println("="^80)
+        println("Data directory:              $data_dir")
+        println("Period range:               $period_min — $period_max s")
+        println("Sample interval (dt):       $dt s")
+        println("Whitening kernel length:    $whitening_kernel_length")
+        println("="^80 * "\n")
+
         all_files = readdir(data_dir, join=true)
         jld2_files = filter(f -> endswith(f, ".jld2") && startswith(basename(f), "$(pair_obj[1])_$(pair_obj[2])"), all_files)
 
