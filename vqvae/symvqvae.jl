@@ -1,7 +1,8 @@
 #!/usr/bin/env julia
 
-# Include lightweight whitening utilities (NO Lux/Reactant dependencies)
-# This loads before early-exit checks so it's available for inspect command
+# Include lightweight utility modules (NO Lux/Reactant dependencies)
+# These load before early-exit checks for CLI parsing and inspect visualization
+include("io_utils.jl")
 include("whitening_utils.jl")
 
 # Check for help/info flags BEFORE loading expensive packages
@@ -67,23 +68,27 @@ if !isempty(ARGS) && ARGS[1] == "inspect"
     using DSP, Statistics
     import JLD2, UnicodePlots
 
-    function list_station_pairs(filepath::String)
-        files = readdir(filepath)
-        pairs = Set{Tuple{String,String}}()
-        for f in files
-            endswith(f, ".jld2") || continue
-            m = match(r"^([A-Za-z0-9]+)_([A-Za-z0-9]+)", basename(f))
-            m === nothing && continue
-            sta1 = uppercase(m.captures[1])
-            sta2 = uppercase(m.captures[2])
-            push!(pairs, (sta1, sta2))
-        end
-        return sort!(collect(pairs), by=x -> (x[1], x[2]))
-    end
-
     function cmd_inspect(args::Vector{String})
         if isempty(args)
             error("inspect: PAIR argument required")
+        end
+
+        if args[1] in ("--help", "-h")
+            println("""
+inspect PAIR [options]
+  Inspect a station pair: print metadata, unified waveform, and PSD comparison.
+
+  Arguments:
+    PAIR    Station pair e.g. "AP-BK" or "AP_BK"
+
+  Options:
+    --data-dir DIR                JLD2 files directory (default: pwd)
+    --period-min FLOAT            Min period (default: 10.0s)
+    --period-max FLOAT            Max period (default: 75.0s)
+    --dt FLOAT                    Sample interval (default: 1.0s)
+    --whitening-kernel-length INT FIR taps for whitening (default: 128)
+""")
+            return
         end
 
         pair = args[1]
@@ -293,6 +298,38 @@ include_vqvae_architecture_for_cli()
 
 
 function cmd_train(args::Vector{String})
+    if !isempty(args) && args[1] in ("--help", "-h")
+        println("""
+train [pairs] [options]
+  Train VQ-VAE models on station pairs.
+
+  Arguments:
+    pairs    Comma-separated pairs e.g. "AP-BK,AP-CL" (default: all)
+
+  Options:
+    --data-dir DIR                JLD2 files directory (default: pwd)
+    --save-dir DIR                Output directory
+    --nepoch INT                  Training epochs (default: 100)
+    --batchsize INT               Minibatch size (default: 4096)
+    --lr FLOAT                    Learning rate (default: 0.001)
+    --seeds LIST                  Seeds per model (default: "1234,1235")
+    --nwindows INT                Waveforms per pair (default: 20000)
+    --period-min FLOAT            Min period (default: 10.0s)
+    --period-max FLOAT            Max period (default: 75.0s)
+    --dt FLOAT                    Sample interval (default: 1.0s)
+    --K LIST                      Codebook sizes (default: "5,3")
+    --d INT                       Latent dimension (default: 40)
+    --n-filters INT               Encoder filters (default: 32)
+    --ratios LIST                 Stride ratios (default: "2,5")
+    --n-residual-layers INT       Residual blocks (default: 3)
+    --entropy-weight FLOAT        Entropy weight (default: 0.1)
+    --whitening-kernel-length INT FIR taps (default: 128)
+    --autodiff-backend STR        "zygote", "enzyme", "auto" (default: "auto")
+    --verbose, -v                 Print per-epoch metrics
+""")
+        return
+    end
+
     pairs = "all"
     data_dir = pwd()
     save_dir = ""
