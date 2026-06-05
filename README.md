@@ -18,8 +18,10 @@ coherent seismic arrivals when averaged within each quantized state.
 SeismicAutoencoders/
 ├── vqvae/                    Primary VQ-VAE v9 code
 │   ├── VQVAE_architecture_v9.jl   Model, training loop, XLA compilation
-│   ├── train_vqvae.jl             CLI training entry point
-│   ├── train_vqvae.sh             Launcher (single or multi-GPU, background or foreground)
+│   ├── symvqvae.jl                CLI entry point (train, inspect)
+│   ├── symvqvae.sh                Launcher (background/foreground)
+│   ├── train_vqvae.jl             Legacy CLI (deprecated)
+│   ├── train_vqvae.sh             Legacy launcher (deprecated)
 │   ├── data_generators.jl         Data loading and preprocessing
 │   ├── Prepare_Tomography_v9.jl   Post-training tomography preparation
 │   ├── TomographySelection_v9.jl  Station-pair selection for tomography
@@ -78,8 +80,9 @@ Add the following line to your `~/.bashrc` (or `~/.zshrc`), replacing the path w
 you cloned the repo:
 
 ```bash
-export SEISMIC_AE_DIR="$HOME/SeismicAutoencoders.jl"
-alias train_vqvae="$SEISMIC_AE_DIR/vqvae/train_vqvae.sh"
+export SEISMIC_AE_DIR="/path/to/SeismicAutoencoders"
+alias symvqvae="$SEISMIC_AE_DIR/vqvae/symvqvae.sh"
+alias train_vqvae="symvqvae train"  # backward compatibility
 ```
 
 Then reload your shell:
@@ -91,33 +94,36 @@ source ~/.bashrc
 ### 4. Verify
 
 ```bash
-train_vqvae --help
+symvqvae --help
 ```
 
 ---
 
 ## Quick start
 
-Once the alias is set up, `train_vqvae` works from any directory:
+Once the alias is set up, `symvqvae` works from any directory:
 
 ```bash
-# List available station pairs in your data directory
-train_vqvae --list-pairs --data-dir /path/to/jld2/files
+# Show all commands and options
+symvqvae --help
 
-# Inspect a random pair — prints waveform and PSD plots in the terminal
-train_vqvae --sample-pair --data-dir /path/to/jld2/files
+# Inspect a specific station pair (unified waveform axis, raw+whitened PSD comparison)
+symvqvae inspect AP_BK --data-dir /path/to/jld2/files
 
-# Train all pairs on GPU 0, background (default) — logs to file
-train_vqvae --data-dir /path/to/jld2/files --nepoch 100
+# Customize period range and whitening kernel for inspection
+symvqvae inspect AP_BK --data-dir /path/to/jld2/files --period-min 3 --period-max 100 --whitening-kernel-length 256
 
-# Train all pairs on GPU 0, print to terminal
-train_vqvae --foreground --data-dir /path/to/jld2/files --nepoch 100
-
-# Train across two GPUs in parallel, stream to terminal
-train_vqvae --gpus 0,1 --foreground --data-dir /path/to/jld2/files --nepoch 100
+# Train all pairs, background (default) — logs to file
+symvqvae train --data-dir /path/to/jld2/files --nepoch 100
 
 # Train specific pairs only
-train_vqvae AP-BK,AP-CL --data-dir /path/to/jld2/files
+symvqvae train AP-BK,AP-CL --data-dir /path/to/jld2/files --nepoch 50
+
+# Train with custom parameters
+symvqvae train --data-dir /path/to/jld2/files --nepoch 200 --lr 0.0005 --K 8,5 --d 64
+
+# Backward compatibility: old alias still works
+train_vqvae --data-dir /path/to/jld2/files --nepoch 100
 ```
 
 ---
@@ -155,24 +161,20 @@ See `vqvae/VQVAE_readme.md` for the full architecture evolution from v1 to v9.
 
 ---
 
-## Multi-GPU training
+## Training
 
-`train_vqvae.sh` splits station pairs round-robin across N GPUs via `--gpus`.
-Each GPU gets its own Julia process, compiles XLA once, and trains its assigned pairs
-and seeds sequentially. Use `--foreground` to stream all GPU logs to the terminal live.
+By default, `symvqvae train` runs in **background** with automatic logging to a dated file:
 
 ```bash
-# Two GPUs, background
-./vqvae/train_vqvae.sh --gpus 0,1 --data-dir /path/to/data --nepoch 100
+symvqvae train --data-dir /path/to/data --nepoch 100
+# Logs to: symvqvae_20260605_143022.out in the current directory
+```
 
-# Two GPUs, stream to terminal
-./vqvae/train_vqvae.sh --gpus 0,1 --foreground --data-dir /path/to/data --nepoch 100
+To run in the **foreground** (blocking, output to terminal):
 
-# Four GPUs
-./vqvae/train_vqvae.sh --gpus 0,1,2,3 --data-dir /path/to/data --nepoch 100
-
-# Monitor logs manually
-tail -f train_vqvae_gpu*_<timestamp>.out
+```bash
+# Run the Julia script directly for foreground output
+julia --project=. vqvae/symvqvae.jl train --data-dir /path/to/data --nepoch 100 --foreground
 ```
 
 ---
