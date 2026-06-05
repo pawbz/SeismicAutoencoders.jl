@@ -1292,29 +1292,12 @@ end
 
 function trim_training_bundle(bundle; n_max::Union{Nothing,Integer}=nothing,
     rng=Random.default_rng())
-    isnothing(n_max) && return bundle
-    n_max >= 2 || error("n_max must be at least 2 so both acausal and causal branches are represented.")
-    n_windows_max = n_max ÷ 2
-    n_windows = min(size(bundle.D1fac, 2), size(bundle.D1fc, 2))
-    n_windows == n_windows_max && return bundle
-    if n_windows > n_windows_max
-        @info "Trimming v10 pair waveforms to n_max" pair=bundle.pair n_original=2n_windows n_kept=2n_windows_max n_max
-        trim_headers(headers) = headers === nothing ? nothing :
-            (length(headers) == n_windows ? headers[1:n_windows_max] : headers)
-        return merge(bundle, (;
-            D1fac=bundle.D1fac[:, 1:n_windows_max],
-            D1fc=bundle.D1fc[:, 1:n_windows_max],
-            headers=trim_headers(bundle.headers),
-        ))
-    else
-        @info "Upsampling v10 pair waveforms to n_max" pair=bundle.pair n_original=2n_windows n_target=2n_windows_max n_max
-        idx_ac = rand(rng, 1:n_windows, n_windows_max)
-        idx_c  = rand(rng, 1:n_windows, n_windows_max)
-        return merge(bundle, (;
-            D1fac=bundle.D1fac[:, idx_ac],
-            D1fc=bundle.D1fc[:, idx_c],
-            headers=nothing,
-        ))
+    # n_max parameter DEPRECATED: XLA compilation now uses batchsize (not n_train)
+    # All pairs train on their full waveform count, no trimming needed
+    if !isnothing(n_max)
+        @warn "n_max parameter deprecated: XLA compiles at batchsize now. Training on all available waveforms."
+    end
+    return bundle
     end
 end
 
@@ -2195,9 +2178,6 @@ function train_selected_pairs(pairs_data, compiled_model;
             training_para.verbose && @info "Reset v10 model parameters" pair run_index seed reset_time_s=round(time() - reset_start; digits=3)
             loss_history = fresh_loss_history()
             train_start = time()
-            n_pair = size(pair_entry.data.D_train, 2)
-            n_ignored = max(0, n_pair - compiled_model.n_train)
-            n_ignored > 0 && @info "Pair has more waveforms than compiled size; excess ignored" pair n_pair n_compiled=compiled_model.n_train ignored=n_ignored
             ps, st, loss_history = update(
                 compiled_model.model, ps, st, loss_history,
                 pair_entry.data.D_train, pair_entry.data.D_test,
@@ -2276,9 +2256,6 @@ function train_selected_pairs_lazy(selected_pairs, compiled_model;
             reset_start = time()
             ps, st = reset_vqvae(compiled_model.model; seed, device=xdev)
             loss_history = fresh_loss_history()
-            n_pair = size(pd.data.D_train, 2)
-            n_ignored = max(0, n_pair - compiled_model.n_train)
-            n_ignored > 0 && @info "Excess waveforms ignored" pair n_pair n_compiled=compiled_model.n_train ignored=n_ignored
             ps, st, loss_history = update(
                 compiled_model.model, ps, st, loss_history,
                 pd.data.D_train, pd.data.D_test,
@@ -2382,7 +2359,7 @@ function compile_model(nt::Int, n_train::Int; vqvae_parameters::NamedTuple,
         device=xdev, sample_batch_x=xdev(dummy_batch_cpu))
     train_step_cache = compile_train_step(model, xdev(ps), xdev(st),
         dummy_batch_cpu, para, training_para; device=xdev, cdev)
-    @info "compile_model complete" nt n_train batchsize=training_para.batchsize
+    @info "compile_model complete (using batchsize for variable-N inference)" nt batchsize=training_para.batchsize
     return (; model, para, compiled, train_step_cache, compile_seed=seed, n_train)
 end
 
