@@ -20,7 +20,9 @@
       "Bash(git commit -m ' *)",
       "Bash(julia --project=/mnt/NAS/CACHEDEV1_DATA/EQData/SeismicAutoencoders /mnt/NAS/CACHEDEV1_DATA/EQData/SeismicAutoencoders/vqvae/symvqvae.jl train SM17-SM42 --data-dir /mnt/NAS2/Sanket_data/Minneapolis_pairs_SM_29052026 --help)",
       "Bash(pkill -f \"symvqvae\")",
-      "Bash(wait)"
+      "Bash(wait)",
+      "Bash(git commit -m 'Add ProgressMeter to project dependencies *)",
+      "Bash(julia --project=. -e 'import Pkg; Pkg.instantiate\\(\\)')"
     ]
   }
 }

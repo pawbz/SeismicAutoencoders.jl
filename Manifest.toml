@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "6695228bd1fa1d8a3ca2afe83c2480047889ab30"
+project_hash = "be95088e36f0f64ec469584dbf7944e98ab1307f"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "bbc22a9a08a0ef6460041086d8a7b27940ed4ffd"
@@ -680,9 +680,9 @@ version = "1.11.0"
 
 [[deps.GPUArrays]]
 deps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LLVM", "LinearAlgebra", "Printf", "Random", "Reexport", "ScopedValues", "Serialization", "SparseArrays", "Statistics"]
-git-tree-sha1 = "cf230532c7871ce9bfa5812dd699cb68da888364"
+git-tree-sha1 = "62ad1fd3c217acaf6d39615866e16a529b406aeb"
 uuid = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
-version = "11.5.4"
+version = "11.5.5"
 weakdeps = ["JLD2"]
 
     [deps.GPUArrays.extensions]
@@ -696,9 +696,12 @@ version = "0.2.0"
 
 [[deps.GPUCompiler]]
 deps = ["ExprTools", "InteractiveUtils", "LLVM", "Libdl", "Logging", "PrecompileTools", "Preferences", "Scratch", "Serialization", "TOML", "Tracy", "UUIDs"]
-git-tree-sha1 = "e9817f6e11bf985b4da0f16fd61476438776f3d2"
+git-tree-sha1 = "ab3559d3a3e1880269b21c3278984136fd9f3dd8"
 uuid = "61eb1bfa-7361-4325-ad38-22787b887f55"
-version = "1.13.1"
+version = "1.17.0"
+
+    [deps.GPUCompiler.weakdeps]
+    LLVMDowngrader_jll = "f52de702-fb25-5922-94ba-81dd59b07444"
 
 [[deps.GPUToolbox]]
 deps = ["LLVM"]
@@ -730,9 +733,9 @@ version = "0.0.5"
 
 [[deps.HypertextLiteral]]
 deps = ["Tricks"]
-git-tree-sha1 = "7134810b1afce04bbc1045ca1985fbe81ce17653"
+git-tree-sha1 = "d1a86724f81bcd184a38fd284ce183ec067d71a0"
 uuid = "ac1192a8-f4b3-4bfe-ba22-af5b92cd3ab2"
-version = "0.9.5"
+version = "1.0.0"
 
 [[deps.IRTools]]
 deps = ["InteractiveUtils", "MacroTools"]
@@ -1348,9 +1351,9 @@ version = "0.12.3"
 
 [[deps.Parsers]]
 deps = ["Dates", "PrecompileTools", "UUIDs"]
-git-tree-sha1 = "5d5e0a78e971354b1c7bff0655d11fdc1b0e12c8"
+git-tree-sha1 = "468dbe2b510c876dc091b2c74ed52c7c34f48b9b"
 uuid = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
-version = "2.8.4"
+version = "2.8.5"
 
 [[deps.Pkg]]
 deps = ["Artifacts", "Dates", "Downloads", "FileWatching", "LibGit2", "Libdl", "Logging", "Markdown", "Printf", "Random", "SHA", "TOML", "Tar", "UUIDs", "p7zip_jll"]
@@ -1381,9 +1384,9 @@ version = "0.8.23"
 
 [[deps.PlutoPlotly]]
 deps = ["AbstractPlutoDingetjes", "Artifacts", "ColorSchemes", "Colors", "Dates", "Downloads", "HypertextLiteral", "InteractiveUtils", "LaTeXStrings", "Markdown", "Pkg", "PlotlyBase", "PrecompileTools", "Reexport", "ScopedValues", "Scratch", "TOML"]
-git-tree-sha1 = "8acd04abc9a636ef57004f4c2e6f3f6ed4611099"
+git-tree-sha1 = "2b9e3d771adfe535a4fdda855f4741fdaacd3f7f"
 uuid = "8e989ff0-3d88-8e9f-f020-2b208a939ff0"
-version = "0.6.5"
+version = "0.6.6"
 
     [deps.PlutoPlotly.extensions]
     PlotlyKaleidoExt = "PlotlyKaleido"
@@ -1453,6 +1456,12 @@ git-tree-sha1 = "f0803bc1171e455a04124affa9c21bba5ac4db32"
 uuid = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
 version = "0.1.6"
 
+[[deps.ProgressMeter]]
+deps = ["Distributed", "Printf"]
+git-tree-sha1 = "fbb92c6c56b34e1a2c4c36058f68f332bec840e7"
+uuid = "92933f4c-e287-5a05-a399-4b506db050ca"
+version = "1.11.0"
+
 [[deps.ProtoBuf]]
 deps = ["BufferedStreams", "EnumX", "TOML"]
 git-tree-sha1 = "da18083a52d9d57bbe6dadaacad39731e5f7be39"
@@ -1488,9 +1497,9 @@ version = "1.6.0"
 
 [[deps.Reactant]]
 deps = ["Adapt", "BFloat16s", "CEnum", "Crayons", "Downloads", "EnumX", "Enzyme", "EnzymeCore", "FileWatching", "Functors", "GPUArraysCore", "GPUCompiler", "HTTP", "JSON", "LLVM", "LLVMOpenMP_jll", "Libdl", "LinearAlgebra", "OrderedCollections", "PrecompileTools", "Preferences", "PrettyTables", "ProtoBuf", "Random", "ReactantCore", "Reactant_jll", "ScopedValues", "Scratch", "Serialization", "Setfield", "Sockets", "StableRNGs", "StructUtils", "StyledStrings", "UUIDs", "p7zip_jll"]
-git-tree-sha1 = "34cde6a3f9e36aa438401b0f1d719151437b39b9"
+git-tree-sha1 = "4869749d6b29f3fac8baf4c61bd7a6cd4724fd17"
 uuid = "3c362404-f566-11ee-1572-e11a4b42c853"
-version = "0.2.262"
+version = "0.2.263"
 
     [deps.Reactant.extensions]
     ReactantAbstractFFTsExt = "AbstractFFTs"
@@ -1611,7 +1620,7 @@ uuid = "6c6a2e73-6563-6170-7368-637461726353"
 version = "1.3.0"
 
 [[deps.SeismicAutoencoders]]
-deps = ["Bonito", "CUDA", "Comonicon", "ConcreteStructs", "DSP", "Dates", "Distances", "Enzyme", "EnzymeCore", "FFTW", "InlineStrings", "JLD2", "LaTeXStrings", "Lux", "MLUtils", "NNlib", "Optimisers", "PGFPlotsX", "PlutoPlotly", "ProgressLogging", "Reactant", "Statistics", "StatsBase", "UnicodePlots", "Zygote"]
+deps = ["Bonito", "CUDA", "Comonicon", "ConcreteStructs", "DSP", "Dates", "Distances", "Enzyme", "EnzymeCore", "FFTW", "InlineStrings", "JLD2", "LaTeXStrings", "Lux", "MLUtils", "NNlib", "Optimisers", "PGFPlotsX", "PlutoPlotly", "ProgressLogging", "ProgressMeter", "Reactant", "Statistics", "StatsBase", "UnicodePlots", "Zygote"]
 path = "."
 uuid = "90309bf1-287b-40f7-991f-ec62af67eb3d"
 version = "0.1.0"

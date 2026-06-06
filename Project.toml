@@ -1,6 +1,6 @@
 name = "SeismicAutoencoders"
 uuid = "90309bf1-287b-40f7-991f-ec62af67eb3d"
-version = "0.1.0"
+version = "2026.06"
 authors = ["Pawan Bharadwaj <bharadwaj.pawan@gmail.com>"]
 
 [deps]
@@ -24,7 +24,7 @@ Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
 PGFPlotsX = "8314cec4-20b6-5062-9cdb-752b83310925"
 PlutoPlotly = "8e989ff0-3d88-8e9f-f020-2b208a939ff0"
 ProgressLogging = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
-ProgressMeter = "92933f4c-e287-5a05-a649-6ca70f02a8d6"
+ProgressMeter = "92933f4c-e287-5a05-a399-4b506db050ca"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"

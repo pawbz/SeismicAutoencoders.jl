@@ -31,6 +31,9 @@ begin
 end
 
 # ╔═╡ 330652f1-0754-48a4-9a0f-4fb9d6824222
+# Load version information
+include("version.jl")
+
 using Distances
 
 # ╔═╡ 10000002-0000-0000-0000-000000000001
@@ -46,6 +49,9 @@ and x2_hat; reconstruction is additive: x_hat = x1_hat + x2_hat, forcing special
 # ╔═╡ 10000003-0000-0000-0000-000000000001
 begin
     const activation = x -> NNlib.leakyrelu(x, 0.1f0)
+
+    # Load version information
+    include("version.jl")
 
     function ensure_reactant_xla_flags!()
         xla_flags = get(ENV, "XLA_FLAGS", "")
@@ -2202,7 +2208,7 @@ function train_selected_pairs(pairs_data, compiled_model;
         pbar_seeds = Progress(length(seeds); desc="Seeds", parent=pbar_pairs, showspeed=true, output=stdout)
         for (run_index, seed) in enumerate(seeds)
             pair = pair_entry.pair
-            @info "Training v10 pair run" pair run_index seed
+            @info "$(version_string()) — Training v10 pair run" pair run_index seed
             reset_start = time()
             ps, st = reset_vqvae(compiled_model.model; seed, device=xdev)
             training_para.verbose && @info "Reset v10 model parameters" pair run_index seed reset_time_s=round(time() - reset_start; digits=3)
@@ -2396,7 +2402,7 @@ function compile_model(nt::Int, n_train::Int; vqvae_parameters::NamedTuple,
         device=xdev, sample_batch_x=xdev(dummy_batch_cpu))
     train_step_cache = compile_train_step(model, xdev(ps), xdev(st),
         dummy_batch_cpu, para, training_para; device=xdev, cdev)
-    @info "compile_model complete (using batchsize for variable-N inference)" nt batchsize=training_para.batchsize
+    @info "$(version_string()) — compile_model complete (using batchsize for variable-N inference)" nt batchsize=training_para.batchsize
     return (; model, para, compiled, train_step_cache, compile_seed=seed, n_train=training_para.batchsize)
 end
 

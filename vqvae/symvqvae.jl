@@ -2,6 +2,7 @@
 
 # Include lightweight utility modules (NO Lux/Reactant dependencies)
 # These load before early-exit checks for CLI parsing and inspect visualization
+include("version.jl")
 include("io_utils.jl")
 include("whitening_utils.jl")
 
@@ -34,7 +35,7 @@ end
 # Check for help/info flags BEFORE loading expensive packages
 if isempty(ARGS) || ARGS[1] in ("--help", "-h")
     println("""
-symvqvae — Symmetric VQ-VAE training and inspection CLI.
+$(version_string()) — Symmetric VQ-VAE training and inspection CLI.
 
 Usage:
   symvqvae train [pairs] [options]      Train models
@@ -538,7 +539,7 @@ train [pairs] [options]
 
     # Print all parameters for user verification
     println("\n" * "="^80)
-    println("Training Configuration:")
+    println("$(version_string()) — Training Configuration:")
     println("="^80)
     println("Pair(s):                     $(pairs == "all" ? "all" : pairs)")
     println("Data directory:              $data_dir")
