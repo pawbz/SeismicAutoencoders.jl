@@ -637,7 +637,7 @@ train [pairs] [options]
     end
 
     save_root = isempty(save_dir) ?
-        joinpath(data_dir, "SavedModels", "vqvae_v9_K=$(K_vec)") : save_dir
+        joinpath(data_dir, "SavedModels", "vqvae_$(VERSION)_K=$(K_vec)") : save_dir
 
     device = default_xdev(; force=true)
 

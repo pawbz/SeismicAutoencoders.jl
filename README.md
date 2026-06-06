@@ -218,7 +218,8 @@ bandpass filtering, and train/test splitting.
 
 ## Output
 
-Trained models are saved under `--save-dir` (default: `<data-dir>/SavedModels/vqvae_v9_K=[...]`).
+Trained models are saved under `--save-dir` (default: `<data-dir>/SavedModels/vqvae_YYYY.MM_K=[...]`).
+The version number indicates which release trained the model (e.g., `vqvae_2026.06_K=[5,3]`).
 Each run creates a timestamped directory per pair and seed containing:
 
 - `run_summary.jld2` — hyperparameters and loss history
