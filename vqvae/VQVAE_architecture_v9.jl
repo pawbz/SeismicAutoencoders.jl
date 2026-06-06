@@ -1678,7 +1678,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
     end
     training_para.verbose && @info "Prepared v10 update loop" setup_time_s=round(time() - setup_start; digits=3) N=size(train_x_cpu, 2) batchsize=training_para.batchsize compiled_helpers=!isnothing(compiled)
 
-    pbar_epochs = Progress(training_para.nepoch; desc="Epochs", parent=pbar_seed, showspeed=true, output=stdout)
+    pbar_epochs = Progress(training_para.nepoch; desc="Epochs", showspeed=true)
     for epoch in 1:training_para.nepoch
         phase = ensemble_phase(epoch, training_para)
         if phase.post_epoch > 0 &&
@@ -1735,7 +1735,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
         state_swap_time = 0.0
         step_time = 0.0
         metric_sync_time = 0.0
-        pbar = Progress(length(batches); desc="Epoch $epoch", showspeed=true, output=stdout)
+        pbar = Progress(length(batches); desc="Epoch $epoch", showspeed=true)
         for (batch_idx, batch) in enumerate(batches)
             prep_start = time()
             bdev, st_updated, prep_stats = prepare_vq_training_batch(
@@ -1789,10 +1789,13 @@ function update(model, ps, st, loss_history, train_data, test_data,
             end
             # Update progress bar with metrics
             elapsed = time() - start
+            loss_display = isfinite(last_loss) ? round(last_loss; digits=4) : "pending"
+            recon_display = isfinite(last_recon) ? round(last_recon; digits=4) : "pending"
+            commit_display = isfinite(last_commit) ? round(last_commit; digits=4) : "pending"
             next!(pbar; showvalues=[
-                (:loss, round(last_loss; digits=4)),
-                (:recon, round(last_recon; digits=4)),
-                (:commit, round(last_commit; digits=4)),
+                (:loss, loss_display),
+                (:recon, recon_display),
+                (:commit, commit_display),
             ])
         end
         epoch_time = time() - start
@@ -2203,9 +2206,9 @@ function train_selected_pairs(pairs_data, compiled_model;
     xdev = isnothing(device) ? default_xdev(; force=true) : device
     cdev = default_cdev()
     results = Any[]
-    pbar_pairs = Progress(length(pairs_data); desc="Pairs", showspeed=true, output=stdout)
+    pbar_pairs = Progress(length(pairs_data); desc="Pairs", showspeed=true)
     for pair_entry in pairs_data
-        pbar_seeds = Progress(length(seeds); desc="Seeds", parent=pbar_pairs, showspeed=true, output=stdout)
+        pbar_seeds = Progress(length(seeds); desc="Seeds", showspeed=true)
         for (run_index, seed) in enumerate(seeds)
             pair = pair_entry.pair
             @info "$(version_string()) — Training v10 pair run" pair run_index seed

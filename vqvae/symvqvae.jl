@@ -383,18 +383,18 @@ function train_selected_pairs_synthetic(compiled_model;
 
             # Reset model for this seed
             ps, st = reset_vqvae(compiled_model.model; seed, device)
+            loss_history = fresh_loss_history()
 
             # Call update() - this tests the entire training path including line 1684 fix
             # If there's a shape mismatch, it will fail here with RuntimeProgramInputMismatch
-            loss, stats, ps, st = update(
-                compiled_model.model, ps, st,
+            ps, st, loss_history = update(
+                compiled_model.model, ps, st, loss_history,
                 train_x_cpu, test_x_cpu,
-                1,  # epoch 1
-                para,
-                training_para;
-                device,
+                para, training_para;
+                device=device,
                 compiled=compiled_model.compiled,
                 cdev=identity,
+                n_compiled=compiled_model.n_train,
             )
 
             @info "Test: update() succeeded" seed loss train_batches=div(size(train_x_cpu,2), training_para.batchsize)
