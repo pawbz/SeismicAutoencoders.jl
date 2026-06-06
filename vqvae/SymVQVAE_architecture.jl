@@ -38,9 +38,9 @@ using Distances
 
 # ╔═╡ 10000002-0000-0000-0000-000000000001
 md"""
-# VQ-VAE v10 Architecture — Split-Decoder Interferometric Mixture VQ
+# SymVQVAE Architecture
 
-Lux/Reactant single-pair Interferometric Split-Decoder VQ-VAE with SEANet-style encoder/decoder.
+Lux/Reactant single-pair Interferometric Split-Decoder SymVQVAE with SEANet-style encoder/decoder.
 Each station pair trains an independent model. Two separate encoder heads map shared features
 to z_e1 and z_e2 (each d÷2), quantized independently. Two separate decoders produce x1_hat
 and x2_hat; reconstruction is additive: x_hat = x1_hat + x2_hat, forcing specialization.
@@ -81,14 +81,11 @@ Base.@kwdef struct VQVAE_Para
     residual_kernel_size::Int = 3
     enc_kernel_size::Int = 7
     dec_kernel_size::Int = 7
-    use_bn::Bool = false
     K::Vector{Int} = [5, 5]
     ema_decay::Float32 = 0.99f0
     epsilon::Float32 = 1f-5
     dead_threshold::Int = 50
     entropy_weight::Float32 = 0.01f0
-    codebook_exclusivity_weight::Float32 = 0.1f0
-    reconstruction_loss::Symbol = :l2
     seed::Int = 1234
 end
 
@@ -100,7 +97,6 @@ Base.@kwdef struct VQVAE_Training_Para
     initial_learning_rate::Float64 = 0.001
     weight_decay::Float64 = 0.0
     stop_on_recon_loss::Union{Nothing,Float64} = nothing
-    Mnn::Union{Nothing,Int} = nothing
     Mnn_schedule::Vector{Tuple{Int,Int}} = [(1, 5), (6, 10), (26, 25)]
     warmup_epochs::Int = 5
     index_refresh_every::Int = 1
@@ -448,7 +444,7 @@ begin
 end
 
 # ╔═╡ 10000010-0000-0000-0000-000000000002
-md"## Split VQ (v10)"
+md"## Split VQ"
 
 # ╔═╡ 10000010-0000-0000-0000-000000000003
 begin
@@ -569,7 +565,7 @@ begin
 end
 
 # ╔═╡ 1000000e-0000-0000-0000-000000000001
-md"## VQ-VAE Model"
+md"## SymVQVAE Model"
 
 # ╔═╡ 1000000f-0000-0000-0000-000000000001
 begin
@@ -672,35 +668,13 @@ md"## Losses and kNN Targets"
 
 # ╔═╡ 13634a6c-abda-4084-9b5b-f6761fd728ad
 begin
-    function _normalize_codebook_waveforms(waves)
-        x = waves .- mean(waves; dims=1)
-        den = sqrt.(sum(abs2, x; dims=1) .+ 1f-8)
-        x ./ den
-    end
-
-    function codebook_component_exclusivity_loss(model, ps, st)
-        z1 = st.rvq.stages[1].embedding
-        z2 = st.rvq.stages[2].embedding
-        x1hat, _ = model.decoder1(z1, ps.decoder1, st.decoder1)
-        x2hat, _ = model.decoder2(z2, ps.decoder2, st.decoder2)
-        x1 = _normalize_codebook_waveforms(x1hat)
-        x2 = _normalize_codebook_waveforms(x2hat)
-        corr = transpose(x1) * x2
-        return mean(abs2, corr)
-    end
-
 	function vqvae_loss(model, ps, st, x, target, para; training::Bool)
 	    result, st_new = model(x, ps, st; beta_commit=para.beta_commit, training)
 	    recon_loss = mse_loss(result.xhat, target)
-        w_excl = para.codebook_exclusivity_weight
-        codebook_exclusivity_loss = iszero(w_excl) ?
-            zero(recon_loss) : codebook_component_exclusivity_loss(model, ps, st_new)
 	    total = recon_loss + result.commit_loss +
-            para.entropy_weight * result.entropy_loss +
-            w_excl * codebook_exclusivity_loss
+            para.entropy_weight * result.entropy_loss
 	    return total, st_new, (; result, recon_loss,
 	        commit_loss=result.commit_loss, entropy_loss=result.entropy_loss,
-            codebook_exclusivity_loss,
 	        perplexity=result.perplexity, stage_perplexities=result.stage_perplexities)
 	end
 
@@ -709,15 +683,10 @@ begin
 	        model, batch.x, ps, st, batch.vq_payload; beta_commit=para.beta_commit
 	    )
 	    recon_loss = mse_loss(result.xhat, batch.target)
-        w_excl = para.codebook_exclusivity_weight
-        codebook_exclusivity_loss = iszero(w_excl) ?
-            zero(recon_loss) : codebook_component_exclusivity_loss(model, ps, st_new)
 	    total = recon_loss + result.commit_loss +
-            para.entropy_weight * result.entropy_loss +
-            w_excl * codebook_exclusivity_loss
+            para.entropy_weight * result.entropy_loss
 	    return total, st_new, (; result, recon_loss,
 	        commit_loss=result.commit_loss, entropy_loss=result.entropy_loss,
-            codebook_exclusivity_loss,
 	        perplexity=result.perplexity, stage_perplexities=result.stage_perplexities)
 	end
 end
@@ -731,7 +700,7 @@ begin
 	    para
 	end
 	function (l::VQVAELoss)(model, ps, st, batch)
-	    return vqvae_precomputed_loss(model, ps, st, batch, l.para)
+	    return vqvae_loss(model, ps, st, batch.x, batch.target, l.para; training=true)
 	end
 end
 
@@ -779,8 +748,8 @@ function rebuild_latent_index!(idx::LatentIndex, model, ps, st, X;
         enc, _ = encode(model, ps_dev, st_eval, device(X_cpu); training=false)
         embeddings .= Float32.(cdev(enc.z_e))
     else
-        # Use batch_inference_with_padding to handle variable-N with fixed-size compiled executor
-        batch_size = n_compiled  # Compiled at batchsize
+        batch_size = isnothing(n_compiled) ? N : n_compiled
+        batch_size > 0 || error("n_compiled must be positive; got $batch_size.")
         z_list = Vector{Matrix{Float32}}()
         for start_idx in 1:batch_size:N
             end_idx = min(start_idx + batch_size - 1, N)
@@ -790,7 +759,7 @@ function rebuild_latent_index!(idx::LatentIndex, model, ps, st, X;
             X_batch = X_cpu[:, start_idx:end_idx]
             if n_batch < batch_size
                 pad_size = batch_size - n_batch
-                X_batch = hcat(X_batch, randn(Float32, size(X_cpu, 1), pad_size))
+                X_batch = hcat(X_batch, zeros(Float32, size(X_cpu, 1), pad_size))
             end
 
             # Run compiled inference
@@ -913,7 +882,7 @@ end
 
 # ╔═╡ 5c9d71d1-c6a6-4968-814d-66506a78b516
 max_Mnn(training_para::VQVAE_Training_Para) =
-    isnothing(training_para.Mnn) ? maximum(p[2] for p in training_para.Mnn_schedule) : training_para.Mnn
+    maximum(p[2] for p in training_para.Mnn_schedule)
 
 # ╔═╡ 10000013-0000-0000-0000-000000000001
 md"## Training"
@@ -1031,7 +1000,6 @@ begin
             train_target_mse=Float32[],
             train_commit=Float32[],
             train_entropy=Float32[],
-            train_codebook_exclusivity=Float32[],
             train_perplexity=Float32[],
             test_recon_mse=Float32[],
             epoch_time_s=Float32[],
@@ -1057,7 +1025,6 @@ begin
 	    push!(loss_history.train_target_mse, train_m.recon_loss)
 	    push!(loss_history.train_commit, train_m.commit_loss)
 	    push!(loss_history.train_entropy, train_m.entropy_loss)
-	    push!(loss_history.train_codebook_exclusivity, train_m.codebook_exclusivity_loss)
 	    push!(loss_history.train_perplexity, train_m.perplexity)
 	    push!(loss_history.test_recon_mse, Float32(test_recon_mse))
 	    push!(loss_history.epoch_time_s, Float32(epoch_time))
@@ -1204,17 +1171,13 @@ end
 function compile_vqvae_helpers(model, ps, st, train_x_cpu, training_para::VQVAE_Training_Para;
     device=identity, sample_batch_x=nothing)
     train_x_cpu = Float32.(flatten_batch(train_x_cpu))
-    size(train_x_cpu, 2) >= training_para.batchsize ||
-        error("Training set N=$(size(train_x_cpu, 2)) is smaller than batchsize=$(training_para.batchsize).")
-    sample_batch_x = isnothing(sample_batch_x) ?
-        device(train_x_cpu[:, 1:training_para.batchsize]) : sample_batch_x
-    @info "Compiling v10 pair helpers" N=size(train_x_cpu, 2) batchsize=training_para.batchsize
+    @info "Compiling SymVQVAE encoder helper" N=size(train_x_cpu, 2)
     return maybe_compile_inference(
         model, ps, st, device(train_x_cpu), training_para;
         device,
         sample_batch_x,
         compile_latent_index=true,
-        compile_train_encoder=true,
+        compile_train_encoder=false,
     )
 end
 
@@ -1236,26 +1199,20 @@ end
 # ╔═╡ 7f8c942b-1957-4721-8c21-37f9278e342d
 function compile_train_step(model, ps, st, train_x_cpu, para, training_para::VQVAE_Training_Para;
     device=identity, cdev=default_cdev())
-    @info "Compiling v10 training step (forward+backward+optimizer)"
+    @info "Compiling SymVQVAE training step (forward+backward+optimizer)"
     start = time()
     opt = Optimisers.AdamW(; eta=Float64(training_para.initial_learning_rate),
         lambda=Float64(training_para.weight_decay))
     loss_fn = VQVAELoss(para)
     ad_backend = training_backend(training_para, device)
     dummy_batch_cpu = train_x_cpu[:, 1:training_para.batchsize]
-    dummy_target_cpu = Float32.(MLUtils.normalise(dummy_batch_cpu; dims=1))
-    ps_cpu = cdev(ps); st_cpu = Lux.testmode(cdev(st))
-    lat, _ = encoder_latents(model, dummy_batch_cpu, ps_cpu, st_cpu)
-    payload_cpu, rvq_cpu = prepare_split_payload(lat.z_e1, lat.z_e2, st_cpu.rvq, model.K;
-        ema_decay=para.ema_decay, epsilon=para.epsilon,
-        dead_threshold=para.dead_threshold, training=true)
-    st_dev = merge(st, (; rvq=device(rvq_cpu)))
+    dummy_target_cpu = training_para.normalize_target ?
+        Float32.(MLUtils.normalise(dummy_batch_cpu; dims=1)) : Float32.(dummy_batch_cpu)
     dummy_bdev = (;
         x=device(Float32.(dummy_batch_cpu)),
         target=device(dummy_target_cpu),
-        vq_payload=device(payload_cpu),
     )
-    ts = Training.TrainState(model, ps, Lux.trainmode(st_dev), opt)
+    ts = Training.TrainState(model, ps, Lux.trainmode(st), opt)
     (_, _, _, ts_warmed) = Training.single_train_step!(
         ad_backend, loss_fn, dummy_bdev, ts; return_gradients=Val(false))
     @info "Training step compile complete" compile_time_s=round(time() - start; digits=3)
@@ -1351,12 +1308,12 @@ function load_pairs_data(selected_pairs; filepath::String,
     pairs_data = Any[]
     for pair_raw in selected_pairs
         pair = (String(pair_raw[1]), String(pair_raw[2]))
-        @info "Loading v10 pair data" pair
+        @info "Loading SymVQVAE pair data" pair
         bundle = build_training_bundle(pair; filepath, dt, period_min, period_max)
         bundle = trim_training_bundle(bundle; n_max, rng)
-        @info "Loaded v10 pair bundle" pair distance=bundle.distance D1fac_size=size(bundle.D1fac) D1fc_size=size(bundle.D1fc)
+        @info "Loaded SymVQVAE pair bundle" pair distance=bundle.distance D1fac_size=size(bundle.D1fac) D1fc_size=size(bundle.D1fc)
         data = make_pooled_split(bundle.D1fac, bundle.D1fc; rng)
-        @info "Built v10 train/test split" pair train_size=size(data.D_train) test_size=size(data.D_test)
+        @info "Built SymVQVAE train/test split" pair train_size=size(data.D_train) test_size=size(data.D_test)
         push!(pairs_data, (; pair, data, data_bundle=bundle))
     end
     return pairs_data
@@ -1541,12 +1498,11 @@ function marginal_decomposition(averages::AbstractMatrix{Float32}, counts::Abstr
 end
 
 # ╔═╡ 70a460bf-b3e4-4e7c-aa4d-2674a450379a
-function plot_training_dashboard(loss_history; title="VQ-VAE v10 Training")
+function plot_training_dashboard(loss_history; title="SymVQVAE Training")
     epochs = collect(1:length(loss_history.train_target_mse))
     traces = [
         PlutoPlotly.scatter(x=epochs, y=loss_history.train_objective, mode="lines", name="train_objective"),
         PlutoPlotly.scatter(x=epochs, y=loss_history.train_target_mse, mode="lines", name="train_target_mse"),
-        PlutoPlotly.scatter(x=epochs, y=loss_history.train_codebook_exclusivity, mode="lines", name="train_codebook_exclusivity"),
         PlutoPlotly.scatter(x=epochs, y=loss_history.test_recon_mse, mode="lines", name="test_recon_mse"),
         PlutoPlotly.scatter(x=epochs, y=loss_history.train_perplexity, mode="lines", name="Train perplexity", yaxis="y2"),
     ]
@@ -1676,7 +1632,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
             inference_compiled = (; encode_z_e=nothing, encode_z_e_train=nothing)
         end
     end
-    training_para.verbose && @info "Prepared v10 update loop" setup_time_s=round(time() - setup_start; digits=3) N=size(train_x_cpu, 2) batchsize=training_para.batchsize compiled_helpers=!isnothing(compiled)
+    training_para.verbose && @info "Prepared SymVQVAE update loop" setup_time_s=round(time() - setup_start; digits=3) N=size(train_x_cpu, 2) batchsize=training_para.batchsize compiled_helpers=!isnothing(compiled)
 
     pbar_epochs = Progress(training_para.nepoch; desc="Epochs", showspeed=true)
     for epoch in 1:training_para.nepoch
@@ -1699,7 +1655,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
                     )
                     inference_compiled = (;
                         encode_z_e=latent_compiled.encode_z_e,
-                        encode_z_e_train=inference_compiled.encode_z_e_train,
+                        encode_z_e_train=nothing,
                     )
                 end
             end
@@ -1725,68 +1681,60 @@ function update(model, ps, st, loss_history, train_data, test_data,
         last_recon = NaN32
         last_commit = NaN32
         last_entropy = NaN32
-        last_codebook_exclusivity = NaN32
         last_perplexity = NaN32
-        epoch_counts = zeros(Float32, sum(para.K))   # accumulated codebook counts across all batches
         prep_time = 0.0
         target_time = 0.0
         pack_time = 0.0
-        payload_time = 0.0
-        state_swap_time = 0.0
         step_time = 0.0
         metric_sync_time = 0.0
+        total_sum = 0f0
+        recon_sum = 0f0
+        commit_sum = 0f0
+        entropy_sum = 0f0
+        perplexity_sum = 0f0
+        nbatches_seen = 0
         pbar = Progress(length(batches); desc="Epoch $epoch", showspeed=true)
         for (batch_idx, batch) in enumerate(batches)
             prep_start = time()
-            bdev, st_updated, prep_stats = prepare_vq_training_batch(
-                train_state.model, train_state.parameters, train_state.states,
-                batch, train_x_cpu, phase.post_epoch == 0 ? nothing : idx,
-                epoch, para, training_para; device, cdev,
-                encode_compiled=inference_compiled.encode_z_e_train,
-                ensemble_targets_cpu=ensemble_targets_cpu
-            )
+            target_start = time()
+            target_cpu = make_batch_target(batch, train_x_cpu,
+                phase.post_epoch == 0 ? nothing : idx,
+                epoch, training_para, ensemble_targets_cpu)
+            target_time += time() - target_start
+            pack_start = time()
+            if training_para.normalize_target
+                target_cpu = Float32.(MLUtils.normalise(target_cpu; dims=1))
+            end
+            bdev = (; x=device(batch.x), target=device(Float32.(target_cpu)))
+            pack_time += time() - pack_start
             prep_time += time() - prep_start
-            target_time += prep_stats.target_time
-            pack_time += prep_stats.pack_time
-            payload_time += prep_stats.payload_time
-            state_swap_start = time()
-            train_state = replace_train_state_states(train_state, st_updated)
-            state_swap_time += time() - state_swap_start
             step_start = time()
             (_, loss, stats, train_state) = Training.single_train_step!(
                 ad_backend, loss_fn, bdev, train_state; return_gradients=Val(false)
             )
-            # Reactant's compiled step overwrites ts.states with the XLA-traced st (which
-            # has the old rvq frozen in). Re-inject the CPU-side EMA-updated rvq so it
-            # survives into the next batch's prepare_vq_training_batch call.
-            train_state = replace_train_state_states(train_state,
-                merge(train_state.states, (; rvq=st_updated.rvq)))
             step_time += time() - step_start
             total_seen += size(batch.x, 2)
-            # accumulate per-stage EMA cluster sizes for epoch-level perplexity
-            offset = 0
-            for stage in st_updated.rvq.stages
-                cs = Float32.(cdev(stage.ema_cluster_size))
-                epoch_counts[offset+1:offset+length(cs)] .+= cs
-                offset += length(cs)
-            end
-            if batch_idx == length(batches)
-                metric_sync_start = time()
-                batch_metrics = cdev((;
-                    loss,
-                    recon_loss=stats.recon_loss,
-                    commit_loss=stats.commit_loss,
-                    entropy_loss=stats.entropy_loss,
-                    codebook_exclusivity_loss=stats.codebook_exclusivity_loss,
-                ))
-                metric_sync_time += time() - metric_sync_start
-                last_loss = Float32(batch_metrics.loss)
-                isnan(last_loss) && error("NaN loss encountered.")
-                last_recon = Float32(batch_metrics.recon_loss)
-                last_commit = Float32(batch_metrics.commit_loss)
-                last_entropy = Float32(batch_metrics.entropy_loss)
-                last_codebook_exclusivity = Float32(batch_metrics.codebook_exclusivity_loss)
-            end
+            metric_sync_start = time()
+            batch_metrics = cdev((;
+                loss,
+                recon_loss=stats.recon_loss,
+                commit_loss=stats.commit_loss,
+                entropy_loss=stats.entropy_loss,
+                perplexity=stats.perplexity,
+            ))
+            metric_sync_time += time() - metric_sync_start
+            last_loss = Float32(batch_metrics.loss)
+            isnan(last_loss) && error("NaN loss encountered.")
+            last_recon = Float32(batch_metrics.recon_loss)
+            last_commit = Float32(batch_metrics.commit_loss)
+            last_entropy = Float32(batch_metrics.entropy_loss)
+            last_perplexity = Float32(batch_metrics.perplexity)
+            total_sum += last_loss
+            recon_sum += last_recon
+            commit_sum += last_commit
+            entropy_sum += last_entropy
+            perplexity_sum += last_perplexity
+            nbatches_seen += 1
             # Update progress bar with metrics
             elapsed = time() - start
             loss_display = isfinite(last_loss) ? round(last_loss; digits=4) : "pending"
@@ -1800,36 +1748,13 @@ function update(model, ps, st, loss_history, train_data, test_data,
         end
         epoch_time = time() - start
         throughput = total_seen / max(epoch_time, 1e-8)
-        # epoch perplexity from accumulated counts across all batches
-        nstages = length(para.K)
-        epoch_perplexity = 0f0
-        offset = 0
-        for k in para.K
-            stage_counts = epoch_counts[offset+1:offset+k]
-            p = stage_counts ./ max(sum(stage_counts), 1f-8)
-            psafe = clamp.(p, 1f-10, 1f0)
-            epoch_perplexity += exp(-sum(psafe .* log.(psafe)))
-            offset += k
-        end
-        last_perplexity = epoch_perplexity / nstages
-        # recompute entropy from same accumulated counts so it matches perplexity
-        epoch_entropy = 0f0
-        offset2 = 0
-        for k in para.K
-            stage_counts = epoch_counts[offset2+1:offset2+k]
-            p = stage_counts ./ max(sum(stage_counts), 1f-8)
-            psafe = clamp.(p, 1f-10, 1f0)
-            epoch_entropy += sum(psafe .* log.(psafe))  # negative value, consistent with entropy_loss convention
-            offset2 += k
-        end
-        last_entropy = epoch_entropy / nstages
+        denom = Float32(max(nbatches_seen, 1))
         train_m = (;
-            total=last_loss,
-            recon_loss=last_recon,
-            commit_loss=last_commit,
-            entropy_loss=last_entropy,
-            codebook_exclusivity_loss=last_codebook_exclusivity,
-            perplexity=last_perplexity,
+            total=total_sum / denom,
+            recon_loss=recon_sum / denom,
+            commit_loss=commit_sum / denom,
+            entropy_loss=entropy_sum / denom,
+            perplexity=perplexity_sum / denom,
         )
         test_recon_mse = recon_mse_inference(
             train_state.model, cdev(train_state.parameters), cdev(train_state.states), test_eval_x_cpu;
@@ -1839,10 +1764,9 @@ function update(model, ps, st, loss_history, train_data, test_data,
         if training_para.verbose && mod(epoch, training_para.nprint) == 0
             r(x) = round(x; digits=4)
             weighted_entropy = para.entropy_weight * train_m.entropy_loss
-            weighted_codebook_exclusivity = para.codebook_exclusivity_weight * train_m.codebook_exclusivity_loss
-            objective_str = "$(r(train_m.recon_loss)) + $(r(train_m.commit_loss)) + $(r(weighted_entropy)) [raw_entropy=$(r(train_m.entropy_loss))] + $(r(weighted_codebook_exclusivity)) [raw_codebook_excl=$(r(train_m.codebook_exclusivity_loss))] = $(r(train_m.total))"
-            @info "Epoch $epoch" objective="mse+commit+w_entropy+w_codebook_exclusivity = $objective_str" test_recon_mse=r(test_recon_mse) perplexity=r(train_m.perplexity) post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn throughput=round(throughput; digits=1) epoch_time_s=round(epoch_time; digits=3)
-            @info "Epoch timing breakdown" epoch post_warmup_epoch=phase.post_epoch prep_time_s=round(prep_time; digits=3) target_time_s=round(target_time; digits=3) pack_time_s=round(pack_time; digits=3) payload_time_s=round(payload_time; digits=3) state_swap_time_s=round(state_swap_time; digits=3) step_time_s=round(step_time; digits=3) metric_sync_time_s=round(metric_sync_time; digits=3) other_time_s=round(epoch_time - prep_time - state_swap_time - step_time - metric_sync_time; digits=3)
+            objective_str = "$(r(train_m.recon_loss)) + $(r(train_m.commit_loss)) + $(r(weighted_entropy)) [raw_entropy=$(r(train_m.entropy_loss))] = $(r(train_m.total))"
+            @info "Epoch $epoch" objective="mse+commit+w_entropy = $objective_str" test_recon_mse=r(test_recon_mse) perplexity=r(train_m.perplexity) post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn throughput=round(throughput; digits=1) epoch_time_s=round(epoch_time; digits=3)
+            @info "Epoch timing breakdown" epoch post_warmup_epoch=phase.post_epoch prep_time_s=round(prep_time; digits=3) target_time_s=round(target_time; digits=3) pack_time_s=round(pack_time; digits=3) step_time_s=round(step_time; digits=3) metric_sync_time_s=round(metric_sync_time; digits=3) other_time_s=round(epoch_time - prep_time - step_time - metric_sync_time; digits=3)
         end
         if !isnothing(training_para.stop_on_recon_loss) && train_m.recon_loss < training_para.stop_on_recon_loss
             training_para.verbose && @info "Early stopping" epoch train_target_mse=train_m.recon_loss threshold=training_para.stop_on_recon_loss
@@ -2050,7 +1974,7 @@ end
 
 # ╔═╡ a1b2c3d4-0000-0000-0000-000000000002
 # Decode every codebook entry through the separate decoders on CPU.
-# For v10 (split-decoder) returns:
+# For SymVQVAE split-decoder models returns:
 #   joint    : (nt, K1*K2)  — decoder1(e1[:,k1]) + decoder2(e2[:,k2]), col order (k2-1)*K1+k1
 #   stage1   : (nt, K1)     — decoder1(e1[:,k1]) alone
 #   stage2   : (nt, K2)     — decoder2(e2[:,k2]) alone
@@ -2193,7 +2117,7 @@ function save_vqvae_run(run_dir; model, ps, st, para, training_para, loss_histor
         longitudes=data_bundle.longitudes,
         loss_history=loss_history)
     jldsave(joinpath(run_dir, "loss_history.jld2"); loss_history)
-    @info "Saved v10 source-state analysis artifact" run_dir
+    @info "Saved SymVQVAE source-state analysis artifact" run_dir
     return run_dir
 end
 
@@ -2211,10 +2135,10 @@ function train_selected_pairs(pairs_data, compiled_model;
         pbar_seeds = Progress(length(seeds); desc="Seeds", showspeed=true)
         for (run_index, seed) in enumerate(seeds)
             pair = pair_entry.pair
-            @info "$(version_string()) — Training v10 pair run" pair run_index seed
+            @info "$(version_string()) — Training SymVQVAE pair run" pair run_index seed
             reset_start = time()
             ps, st = reset_vqvae(compiled_model.model; seed, device=xdev)
-            training_para.verbose && @info "Reset v10 model parameters" pair run_index seed reset_time_s=round(time() - reset_start; digits=3)
+            training_para.verbose && @info "Reset SymVQVAE model parameters" pair run_index seed reset_time_s=round(time() - reset_start; digits=3)
             loss_history = fresh_loss_history()
             train_start = time()
             ps, st, loss_history = update(
@@ -2224,12 +2148,12 @@ function train_selected_pairs(pairs_data, compiled_model;
                 device=xdev, cdev,
                 compiled=compiled_model.compiled,
                 train_step_cache=compiled_model.train_step_cache,
-                n_compiled=compiled_model.n_train,
+                n_compiled=compiled_model.n_compiled_encoder,
                 compile_missing=false,
                 pbar_pair=pbar_pairs,
                 pbar_seed=pbar_seeds,
             )
-            @info "Finished v10 pair run" pair run_index seed time_s=round(time() - train_start; digits=3)
+            @info "Finished SymVQVAE pair run" pair run_index seed time_s=round(time() - train_start; digits=3)
             run_dir = run_dir_for_seed(save_root, pair, seed)
             save_vqvae_run(run_dir; model=compiled_model.model, ps, st,
                 para=compiled_model.para, training_para, loss_history, pair,
@@ -2239,7 +2163,7 @@ function train_selected_pairs(pairs_data, compiled_model;
                 training_para, loss_history, data=pair_entry.data,
                 data_bundle=pair_entry.data_bundle))
             # Update seed progress bar
-            final_loss = loss_history.record[:, 1][end]  # Get final epoch loss
+            final_loss = last(loss_history.train_objective)
             next!(pbar_seeds; showvalues=[(:final_loss, round(final_loss; digits=4))])
         end
         # Update pair progress bar
@@ -2309,7 +2233,7 @@ function train_selected_pairs_lazy(selected_pairs, compiled_model;
                 device=xdev, cdev,
                 compiled=compiled_model.compiled,
                 train_step_cache=compiled_model.train_step_cache,
-                n_compiled=compiled_model.n_train,
+                n_compiled=compiled_model.n_compiled_encoder,
                 compile_missing=false,
             )
             @info "Finished pair run" pair run_index seed time_s=round(time() - reset_start; digits=3)
@@ -2357,9 +2281,9 @@ end
 
 # ╔═╡ 10000010-0000-0000-0000-000000000001
 function get_vqvae(para; rng=Random.default_rng(), device=identity)
-    length(para.K) == 2 || error("v10 requires exactly 2 codebook stages (length(K) must be 2). Got K=$(para.K).")
+    length(para.K) == 2 || error("SymVQVAE requires exactly 2 codebook stages (length(K) must be 2). Got K=$(para.K).")
     all(>(1), para.K) || error("All K entries must be > 1.")
-    iseven(para.d) || error("d must be even for v10 (required for split heads). Got d=$(para.d).")
+    iseven(para.d) || error("d must be even for SymVQVAE split heads. Got d=$(para.d).")
     Random.seed!(rng, para.seed)
 
     encoder = make_encoder(para)
@@ -2384,41 +2308,42 @@ function get_vqvae(para; rng=Random.default_rng(), device=identity)
     ps, st = (ps, st) |> device
 
     loss_history = fresh_loss_history()
-    @info "VQ-VAE v10 geometry" nt=para.nt d=para.d half=para.d÷2 latent_len K=para.K enc_channels
+    @info "SymVQVAE geometry" nt=para.nt d=para.d half=para.d÷2 latent_len K=para.K enc_channels
     return model, ps, st, loss_history
 end
 
 # ╔═╡ a74f1dab-d658-4f37-9d26-4ddd9097d15e
 function compile_model(nt::Int, n_train::Int; vqvae_parameters::NamedTuple,
-    training_para::VQVAE_Training_Para, seed::Int=1234, device=nothing)
+    training_para::VQVAE_Training_Para, seed::Int=1234, device=nothing,
+    Nmax::Int=25_000)
     ensure_reactant_xla_flags!()
+    Nmax > 0 || error("Nmax must be positive; got $Nmax.")
     xdev = isnothing(device) ? default_xdev(; force=true) : device
     cdev = default_cdev()
     rng = Xoshiro(seed)
     para = VQVAE_Para(; merge(vqvae_parameters, (; nt, seed))...)
     model, ps, st, _ = get_vqvae(para; rng, device=xdev)
-    # XLA compile at batchsize (not n_train) to fix RuntimeProgramInputMismatch errors
-    # Allows inference with any N via batching + padding to batchsize
-    dummy_full_cpu = randn(rng, Float32, nt, training_para.batchsize)
-    dummy_batch_cpu = dummy_full_cpu[:, 1:training_para.batchsize]
+    dummy_full_cpu = zeros(Float32, nt, Nmax)
+    dummy_batch_cpu = zeros(Float32, nt, training_para.batchsize)
     compiled = compile_vqvae_helpers(model, ps, st, dummy_full_cpu, training_para;
         device=xdev, sample_batch_x=xdev(dummy_batch_cpu))
     train_step_cache = compile_train_step(model, xdev(ps), xdev(st),
         dummy_batch_cpu, para, training_para; device=xdev, cdev)
-    @info "$(version_string()) — compile_model complete (using batchsize for variable-N inference)" nt batchsize=training_para.batchsize
-    return (; model, para, compiled, train_step_cache, compile_seed=seed, n_train=training_para.batchsize)
+    @info "$(version_string()) — compile_model complete" nt Nmax batchsize=training_para.batchsize n_train_metadata=n_train
+    return (; model, para, compiled, train_step_cache, compile_seed=seed,
+        n_train, n_compiled_encoder=Nmax)
 end
 
 # ╔═╡ a848319e-7bda-4844-a916-2bbdef1d5417
 function train_one_pair(pair::Tuple{<:AbstractString,<:AbstractString}; filepath::String,
     vqvae_parameters::NamedTuple, training_para::VQVAE_Training_Para,
-    save_root::String=joinpath(filepath, "SavedModels", "vqvae_v10"),
+    save_root::String=joinpath(filepath, "SavedModels", "symvqvae"),
     seed::Int=1234, dt::Real=1.0, period_min::Real=10, period_max::Real=50,
-    device=nothing, n_max::Union{Nothing,Integer}=nothing)
+    device=nothing, n_max::Union{Nothing,Integer}=nothing, Nmax::Int=25_000)
     pairs_data = load_pairs_data([pair]; filepath, seed, dt, period_min, period_max, n_max=n_max)
     nt = size(pairs_data[1].data.D_train, 1)
     n_train = size(pairs_data[1].data.D_train, 2)
-    compiled_model = compile_model(nt, n_train; vqvae_parameters, training_para, seed, device)
+    compiled_model = compile_model(nt, n_train; vqvae_parameters, training_para, seed, device, Nmax)
     return only(train_selected_pairs(pairs_data, compiled_model; seeds=[seed],
         training_para, save_root, device))
 end

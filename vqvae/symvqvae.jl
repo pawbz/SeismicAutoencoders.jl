@@ -35,7 +35,7 @@ end
 # Check for help/info flags BEFORE loading expensive packages
 if isempty(ARGS) || ARGS[1] in ("--help", "-h")
     println("""
-$(version_string()) — Symmetric VQ-VAE training and inspection CLI.
+$(version_string()) — SymVQVAE training and inspection CLI.
 
 Usage:
   symvqvae train [pairs] [options]      Train models
@@ -45,7 +45,7 @@ Usage:
 Commands:
 
   train [pairs] [options]
-    Train VQ-VAE models on station pairs.
+    Train SymVQVAE models on station pairs.
 
     Arguments:
       pairs    Comma-separated pairs e.g. "AP-BK,AP-CL" (default: all)
@@ -55,6 +55,7 @@ Commands:
       --save-dir DIR                Output directory
       --nepoch INT                  Training epochs (default: 100)
       --batchsize INT               Minibatch size (default: 4096)
+      --Nmax INT                    Compiled encoder inference width (default: 25000)
       --lr FLOAT                    Learning rate (default: 0.001)
       --seeds LIST                  Seeds per model (default: "1234,1235")
       --nwindows INT                Waveforms per pair (default: 20000)
@@ -326,7 +327,7 @@ using Lux, Reactant, DSP, Statistics
 import JLD2
 
 function include_vqvae_architecture_for_cli()
-    arch_path = joinpath(@__DIR__, "VQVAE_architecture_v9.jl")
+    arch_path = joinpath(@__DIR__, "SymVQVAE_architecture.jl")
     src = read(arch_path, String)
     src = replace(src, "gpu_device(force=true)" => "nothing # skipped CLI include-time GPU probe")
     return include_string(Main, src, arch_path * " (CLI patched: no include-time GPU probe)")
@@ -393,11 +394,12 @@ function train_selected_pairs_synthetic(compiled_model;
                 para, training_para;
                 device=device,
                 compiled=compiled_model.compiled,
-                cdev=identity,
-                n_compiled=compiled_model.n_train,
+                cdev=default_cdev(),
+                n_compiled=compiled_model.n_compiled_encoder,
             )
 
-            @info "Test: update() succeeded" seed loss train_batches=div(size(train_x_cpu,2), training_para.batchsize)
+            final_loss = isempty(loss_history.train_objective) ? missing : last(loss_history.train_objective)
+            @info "Test: update() succeeded" seed final_loss train_batches=div(size(train_x_cpu,2), training_para.batchsize)
 
         catch e
             @error "TEST FAILURE: update() crashed" exception=(e, catch_backtrace())
@@ -413,7 +415,7 @@ function cmd_train(args::Vector{String})
     if !isempty(args) && args[1] in ("--help", "-h")
         println("""
 train [pairs] [options]
-  Train VQ-VAE models on station pairs.
+  Train SymVQVAE models on station pairs.
 
   Arguments:
     pairs    Comma-separated pairs e.g. "AP-BK,AP-CL" (default: all)
@@ -423,6 +425,7 @@ train [pairs] [options]
     --save-dir DIR                Output directory
     --nepoch INT                  Training epochs (default: 100)
     --batchsize INT               Minibatch size (default: 4096)
+    --Nmax INT                    Compiled encoder inference width (default: 25000)
     --lr FLOAT                    Learning rate (default: 0.001)
     --seeds LIST                  Seeds per model (default: "1234,1235")
     --nwindows INT                Waveforms per pair (default: 20000)
@@ -448,6 +451,7 @@ train [pairs] [options]
     seeds = "1234,1235"
     nepoch = 100
     batchsize = 4096
+    Nmax = 25_000
     lr = 0.001
     nwindows = 20000
     period_min = 3.0
@@ -481,6 +485,9 @@ train [pairs] [options]
         elseif a == "--batchsize"
             i += 1
             i <= length(args) && (batchsize = parse(Int, args[i]))
+        elseif a == "--Nmax"
+            i += 1
+            i <= length(args) && (Nmax = parse(Int, args[i]))
         elseif a == "--lr"
             i += 1
             i <= length(args) && (lr = parse(Float64, args[i]))
@@ -530,6 +537,7 @@ train [pairs] [options]
             nepoch = 2
             nwindows = 250  # NOT a multiple of batchsize to test edge case
             batchsize = 32  # Much smaller than real (4096)
+            Nmax = max(Nmax, 512)
             pairs = "TEST"  # Special marker for synthetic data
         elseif !startswith(a, "-")
             pairs = a
@@ -543,9 +551,10 @@ train [pairs] [options]
     println("="^80)
     println("Pair(s):                     $(pairs == "all" ? "all" : pairs)")
     println("Data directory:              $data_dir")
-    println("Save directory:              $(isempty(save_dir) ? "$(data_dir)/SavedModels/vqvae_v9_..." : save_dir)")
+    println("Save directory:              $(isempty(save_dir) ? "$(data_dir)/SavedModels/symvqvae_..." : save_dir)")
     println("Number of epochs:            $nepoch")
     println("Batch size:                  $batchsize")
+    println("Encoder compile Nmax:        $Nmax")
     println("Learning rate:               $lr")
     println("Seeds:                       $seeds")
     println("Number of waveforms/pair:    $nwindows")
@@ -615,9 +624,7 @@ train [pairs] [options]
         beta_commit=0.25f0, ema_decay=0.99f0,
         dilation_base=2, residual_kernel_size=3,
         enc_kernel_size=7, dec_kernel_size=7,
-        use_bn=false, dead_threshold=50,
-        codebook_exclusivity_weight=0.0f0,
-        reconstruction_loss=:l1,
+        dead_threshold=50,
     )
     training_para = VQVAE_Training_Para(;
         batchsize,
@@ -654,9 +661,9 @@ train [pairs] [options]
         n_train = nwindows
     end
 
-    @info "Compiling Reactant XLA graph (once for this session)..." nt n_train K=K_vec batchsize
+    @info "Compiling Reactant XLA graph (once for this session)..." nt n_train K=K_vec batchsize Nmax
     compiled_model = compile_model(nt, n_train;
-        vqvae_parameters, training_para, seed=seeds_vec[1], device)
+        vqvae_parameters, training_para, seed=seeds_vec[1], device, Nmax)
 
     if test_mode
         # Generate and train on synthetic data

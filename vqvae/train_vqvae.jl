@@ -19,6 +19,7 @@ Training Options:
   --seeds LIST           Comma-separated seeds, trains separate model per seed (default: "1234,1235")
   --nepoch INT           Training epochs (default: 100)
   --batchsize INT        Minibatch size (default: 4096)
+  --Nmax INT             Compiled encoder inference width (default: 25000)
   --lr FLOAT             Learning rate (default: 0.001)
   --verbose, -v          Print per-epoch metrics
 
@@ -26,7 +27,7 @@ Data Processing Options:
   --period-min FLOAT     Minimum period in seconds (default: 10.0)
   --period-max FLOAT     Maximum period in seconds (default: 75.0)
   --dt FLOAT             Sample interval in seconds (default: 1.0)
-  --nwindows INT         Waveforms/windows per pair and XLA compile shape (default: 20000)
+  --nwindows INT         Waveforms/windows per pair to load (default: 20000)
   --whitening-kernel-length INT  FIR tap count (default: 128)
 
 Model Architecture Options:
@@ -139,7 +140,7 @@ append_xla_flags!([
 using Lux, Reactant
 
 function include_vqvae_architecture_for_cli()
-    arch_path = joinpath(@__DIR__, "VQVAE_architecture_v9.jl")
+    arch_path = joinpath(@__DIR__, "SymVQVAE_architecture.jl")
     src = read(arch_path, String)
     src = replace(src, "gpu_device(force=true)" => "nothing # skipped CLI include-time GPU probe")
     return include_string(Main, src, arch_path * " (CLI patched: no include-time GPU probe)")
@@ -260,6 +261,7 @@ end
         "period-max"               => 75.0,
         "dt"                       => 1.0,
         "nwindows"                 => 20000,
+        "Nmax"                     => 25_000,
         "K"                        => "5,3",
         "d"                        => 40,
         "n-filters"                => 32,
@@ -308,7 +310,7 @@ end
             end
             if key in ("period-min","period-max","dt","entropy-weight","lr")
                 opts[key] = parse(Float64, val)
-            elseif key in ("nwindows","d","n-filters","n-residual-layers","batchsize","nepoch","whitening-kernel-length")
+            elseif key in ("nwindows","Nmax","d","n-filters","n-residual-layers","batchsize","nepoch","whitening-kernel-length")
                 opts[key] = parse(Int, val)
             else
                 opts[key] = val
@@ -331,9 +333,7 @@ function dummy_parameters()
         beta_commit=0.25f0, ema_decay=0.99f0,
         dilation_base=2, residual_kernel_size=3,
         enc_kernel_size=7, dec_kernel_size=7,
-        use_bn=false, dead_threshold=50,
-        codebook_exclusivity_weight=0.0f0,
-        reconstruction_loss=:l1,
+        dead_threshold=50,
     )
     training_para = VQVAE_Training_Para(;
         batchsize=8,
@@ -368,32 +368,21 @@ function make_dummy_training_objects()
     dummy_batch_cpu = train_x_cpu[:, 1:problem.training_para.batchsize]
     dummy_target_cpu = Float32.(MLUtils.normalise(dummy_batch_cpu; dims=1))
 
-    ps_cpu = cdev(ps)
-    st_cpu = Lux.testmode(cdev(st))
-    lat, _ = encoder_latents(model, dummy_batch_cpu, ps_cpu, st_cpu)
-    payload_cpu, rvq_cpu = prepare_split_payload(lat.z_e1, lat.z_e2, st_cpu.rvq, model.K;
-        ema_decay=para.ema_decay,
-        epsilon=para.epsilon,
-        dead_threshold=para.dead_threshold,
-        training=true)
-    st_dev = merge(st, (; rvq=device(rvq_cpu)))
     batch_dev = (;
         x=device(Float32.(dummy_batch_cpu)),
         target=device(dummy_target_cpu),
-        vq_payload=device(payload_cpu),
     )
     loss_fn = VQVAELoss(para)
     opt = Optimisers.AdamW(; eta=Float64(problem.training_para.initial_learning_rate),
         lambda=Float64(problem.training_para.weight_decay))
-    train_state = Training.TrainState(model, ps, Lux.trainmode(st_dev), opt)
+    train_state = Training.TrainState(model, ps, Lux.trainmode(st), opt)
     ad_backend = training_backend(problem.training_para, device)
-    return merge(problem, (; device, cdev, para, model, ps, st=st_dev, batch_dev,
+    return merge(problem, (; device, cdev, para, model, ps, st, batch_dev,
         loss_fn, train_state, ad_backend, train_x_cpu))
 end
 
 function dummy_forward_objective(model, ps, st, batch, para)
-    result, st_new = forward_with_precomputed_vq(
-        model, batch.x, ps, st, batch.vq_payload; beta_commit=para.beta_commit)
+    result, st_new = model(batch.x, ps, st; beta_commit=para.beta_commit, training=true)
     return result.xhat, st_new
 end
 
@@ -409,26 +398,19 @@ function dummy_encoder_norm_objective(model, ps, st, batch)
 end
 
 function dummy_decoder_recon_objective(model, ps, st, batch)
-    z_q1 = EnzymeCore.ignore_derivatives(batch.vq_payload.z_q_stages[1])
-    z_q2 = EnzymeCore.ignore_derivatives(batch.vq_payload.z_q_stages[2])
-    x1hat, st_dec1 = model.decoder1(z_q1, ps.decoder1, st.decoder1)
-    x2hat, st_dec2 = model.decoder2(z_q2, ps.decoder2, st.decoder2)
-    xhat = x1hat .+ x2hat
-    loss = mse_loss(xhat, batch.target)
-    st_new = merge(st, (; decoder1=st_dec1, decoder2=st_dec2))
-    return loss, st_new, (; recon_loss=loss, commit_loss=zero(loss))
+    result, st_new = model(batch.x, ps, st; beta_commit=model.beta_commit, training=true)
+    loss = mse_loss(result.xhat, batch.target)
+    return loss, st_new, (; recon_loss=loss, commit_loss=result.commit_loss)
 end
 
 function dummy_recon_only_objective(model, ps, st, batch)
-    result, st_new = forward_with_precomputed_vq(
-        model, batch.x, ps, st, batch.vq_payload; beta_commit=model.beta_commit)
+    result, st_new = model(batch.x, ps, st; beta_commit=model.beta_commit, training=true)
     loss = mse_loss(result.xhat, batch.target)
     return loss, st_new, (; recon_loss=loss, commit_loss=result.commit_loss)
 end
 
 function dummy_commit_only_objective(model, ps, st, batch)
-    result, st_new = forward_with_precomputed_vq(
-        model, batch.x, ps, st, batch.vq_payload; beta_commit=model.beta_commit)
+    result, st_new = model(batch.x, ps, st; beta_commit=model.beta_commit, training=true)
     loss = result.commit_loss
     return loss, st_new, (; recon_loss=mse_loss(result.xhat, batch.target), commit_loss=loss)
 end
@@ -505,14 +487,15 @@ end
 
 function run_dummy_compile_test()
     problem = dummy_problem()
-    @info "Running dummy compile test" nt=problem.nt n_train=problem.n_train batchsize=problem.training_para.batchsize
+    @info "Running dummy compile test" nt=problem.nt n_train=problem.n_train batchsize=problem.training_para.batchsize Nmax=512
     compiled_model = compile_model(problem.nt, problem.n_train;
         vqvae_parameters=problem.vqvae_parameters,
         training_para=problem.training_para,
         seed=problem.seed,
-        device=default_xdev(; force=true))
-    @info "Dummy compile test complete" n_train=compiled_model.n_train
-    println("dummy compile_model OK: n_train=$(compiled_model.n_train)")
+        device=default_xdev(; force=true),
+        Nmax=512)
+    @info "Dummy compile test complete" n_train=compiled_model.n_train n_compiled_encoder=compiled_model.n_compiled_encoder
+    println("dummy compile_model OK: n_train=$(compiled_model.n_train), n_compiled_encoder=$(compiled_model.n_compiled_encoder)")
     return compiled_model
 end
 
@@ -583,9 +566,7 @@ function main(args)
         beta_commit=0.25f0, ema_decay=0.99f0,
         dilation_base=2, residual_kernel_size=3,
         enc_kernel_size=7, dec_kernel_size=7,
-        use_bn=false, dead_threshold=50,
-        codebook_exclusivity_weight=0.0f0,
-        reconstruction_loss=:l1,
+        dead_threshold=50,
     )
     training_para = VQVAE_Training_Para(;
         batchsize=opts["batchsize"],
@@ -605,7 +586,7 @@ function main(args)
     end
 
     save_root = isempty(opts["save-dir"]) ?
-        joinpath(data_dir, "SavedModels", "vqvae_v9_K=$(K_vec)") : opts["save-dir"]
+        joinpath(data_dir, "SavedModels", "symvqvae_K=$(K_vec)") : opts["save-dir"]
 
     device = default_xdev(; force=true)
 
@@ -615,9 +596,9 @@ function main(args)
     nt      = size(first_pair_data[1].data.D_train, 1)
     n_train = nwindows
 
-    @info "Compiling Reactant XLA graph (once for this session)..." nt n_train K=K_vec batchsize=opts["batchsize"]
+    @info "Compiling Reactant XLA graph (once for this session)..." nt n_train K=K_vec batchsize=opts["batchsize"] Nmax=opts["Nmax"]
     compiled_model = compile_model(nt, n_train;
-        vqvae_parameters, training_para, seed=seeds_vec[1], device)
+        vqvae_parameters, training_para, seed=seeds_vec[1], device, Nmax=opts["Nmax"])
 
     train_selected_pairs_lazy(selected_pairs, compiled_model;
         seeds=seeds_vec,

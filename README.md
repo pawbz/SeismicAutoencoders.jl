@@ -16,8 +16,9 @@ coherent seismic arrivals when averaged within each quantized state.
 
 ```
 SeismicAutoencoders/
-├── vqvae/                    Primary VQ-VAE v9 code
-│   ├── VQVAE_architecture_v9.jl   Model, training loop, XLA compilation
+├── vqvae/                    Primary SymVQVAE code
+│   ├── SymVQVAE_architecture.jl   Model, training loop, XLA compilation
+│   ├── Training_SymVQVAE.jl       Pluto notebook for real-pair training
 │   ├── symvqvae.jl                CLI entry point (train, inspect)
 │   ├── symvqvae.sh                Launcher (background/foreground)
 │   ├── train_vqvae.jl             Legacy CLI (deprecated)
@@ -144,20 +145,20 @@ This scheme makes it immediately clear when a version was released, without ambi
 Check your version:
 ```bash
 symvqvae --help
-# Shows "SeismicAutoencoders v2026.06" in the header
+# Shows "SymVQVAE v2026.06" in the header
 
 julia --project=. -e 'include("vqvae/version.jl"); println(version_string())'
-# Prints: SeismicAutoencoders v2026.06
+# Prints: SymVQVAE v2026.06
 ```
 
 See [releases](https://github.com/pawbz/SeismicAutoencoders/releases) for release notes and changelog.
 
 ---
 
-## VQ-VAE v9 architecture
+## SymVQVAE architecture
 
-The v9 model (internally called "v10 Split-Decoder") is a **Split-Decoder Interferometric
-Mixture VQ-VAE** built with Lux.jl and compiled to XLA via Reactant.jl.
+SymVQVAE is a **Split-Decoder Interferometric Mixture VQ-VAE** built with Lux.jl
+and compiled to XLA via Reactant.jl.
 
 **Design:**
 - Single shared SEANet-style encoder → shared latent features

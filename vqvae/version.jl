@@ -7,5 +7,5 @@ function get_version()::String
 end
 
 function version_string()::String
-    "Symmetric VQ-VAE v$(VERSION)"
+    "SymVQVAE v$(VERSION)"
 end
