@@ -19,6 +19,7 @@ begin
         NNlib,
         Optimisers,
         ProgressLogging,
+        ProgressMeter,
         PlutoPlotly,
         Random,
         Reactant,
@@ -1631,7 +1632,8 @@ end
 function update(model, ps, st, loss_history, train_data, test_data,
     para, training_para;
     device=identity, cdev=default_cdev(), compiled=nothing, compile_missing::Bool=false,
-    train_step_cache=nothing, n_compiled::Union{Nothing,Int}=nothing)
+    train_step_cache=nothing, n_compiled::Union{Nothing,Int}=nothing,
+    pbar_pair=nothing, pbar_seed=nothing)
 
     setup_start = time()
     train_x_cpu_full = Float32.(cdev(flatten_batch(train_data)))
@@ -1670,7 +1672,8 @@ function update(model, ps, st, loss_history, train_data, test_data,
     end
     training_para.verbose && @info "Prepared v10 update loop" setup_time_s=round(time() - setup_start; digits=3) N=size(train_x_cpu, 2) batchsize=training_para.batchsize compiled_helpers=!isnothing(compiled)
 
-    @progress name = "VQ-VAE training" for epoch in 1:training_para.nepoch
+    pbar_epochs = Progress(training_para.nepoch; desc="Epochs"; parent=pbar_seed, showspeed=true, output=stdout)
+    for epoch in 1:training_para.nepoch
         phase = ensemble_phase(epoch, training_para)
         if phase.post_epoch > 0 &&
            (phase.Mnn != last_index_Mnn || mod(phase.post_epoch - 1, training_para.index_refresh_every) == 0)
@@ -1726,6 +1729,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
         state_swap_time = 0.0
         step_time = 0.0
         metric_sync_time = 0.0
+        pbar = Progress(length(batches); desc="Epoch $epoch", showspeed=true, output=stdout)
         for (batch_idx, batch) in enumerate(batches)
             prep_start = time()
             bdev, st_updated, prep_stats = prepare_vq_training_batch(
@@ -1777,6 +1781,13 @@ function update(model, ps, st, loss_history, train_data, test_data,
                 last_entropy = Float32(batch_metrics.entropy_loss)
                 last_codebook_exclusivity = Float32(batch_metrics.codebook_exclusivity_loss)
             end
+            # Update progress bar with metrics
+            elapsed = time() - start
+            next!(pbar; showvalues=[
+                (:loss, round(last_loss; digits=4)),
+                (:recon, round(last_recon; digits=4)),
+                (:commit, round(last_commit; digits=4)),
+            ])
         end
         epoch_time = time() - start
         throughput = total_seen / max(epoch_time, 1e-8)
@@ -1828,6 +1839,12 @@ function update(model, ps, st, loss_history, train_data, test_data,
             training_para.verbose && @info "Early stopping" epoch train_target_mse=train_m.recon_loss threshold=training_para.stop_on_recon_loss
             break
         end
+        # Update epoch progress bar
+        next!(pbar_epochs; showvalues=[
+            (:loss, round(train_m.total; digits=4)),
+            (:recon, round(train_m.recon_loss; digits=4)),
+            (:test_mse, round(test_recon_mse; digits=4)),
+        ])
     end
     return train_state.parameters, train_state.states, loss_history
 end
@@ -2180,7 +2197,9 @@ function train_selected_pairs(pairs_data, compiled_model;
     xdev = isnothing(device) ? default_xdev(; force=true) : device
     cdev = default_cdev()
     results = Any[]
+    pbar_pairs = Progress(length(pairs_data); desc="Pairs"; showspeed=true, output=stdout)
     for pair_entry in pairs_data
+        pbar_seeds = Progress(length(seeds); desc="Seeds"; parent=pbar_pairs, showspeed=true, output=stdout)
         for (run_index, seed) in enumerate(seeds)
             pair = pair_entry.pair
             @info "Training v10 pair run" pair run_index seed
@@ -2198,6 +2217,8 @@ function train_selected_pairs(pairs_data, compiled_model;
                 train_step_cache=compiled_model.train_step_cache,
                 n_compiled=compiled_model.n_train,
                 compile_missing=false,
+                pbar_pair=pbar_pairs,
+                pbar_seed=pbar_seeds,
             )
             @info "Finished v10 pair run" pair run_index seed time_s=round(time() - train_start; digits=3)
             run_dir = run_dir_for_seed(save_root, pair, seed)
@@ -2208,7 +2229,12 @@ function train_selected_pairs(pairs_data, compiled_model;
                 model=compiled_model.model, ps, st, para=compiled_model.para,
                 training_para, loss_history, data=pair_entry.data,
                 data_bundle=pair_entry.data_bundle))
+            # Update seed progress bar
+            final_loss = loss_history.record[:, 1][end]  # Get final epoch loss
+            next!(pbar_seeds; showvalues=[(:final_loss, round(final_loss; digits=4))])
         end
+        # Update pair progress bar
+        next!(pbar_pairs; showvalues=[(:pair, pair_entry.pair)])
     end
     return results
 end
@@ -2371,7 +2397,7 @@ function compile_model(nt::Int, n_train::Int; vqvae_parameters::NamedTuple,
     train_step_cache = compile_train_step(model, xdev(ps), xdev(st),
         dummy_batch_cpu, para, training_para; device=xdev, cdev)
     @info "compile_model complete (using batchsize for variable-N inference)" nt batchsize=training_para.batchsize
-    return (; model, para, compiled, train_step_cache, compile_seed=seed, n_train)
+    return (; model, para, compiled, train_step_cache, compile_seed=seed, n_train=training_para.batchsize)
 end
 
 # ╔═╡ a848319e-7bda-4844-a916-2bbdef1d5417
