@@ -128,6 +128,32 @@ train_vqvae --data-dir /path/to/jld2/files --nepoch 100
 
 ---
 
+## Versioning
+
+**SeismicAutoencoders uses calendar-based versioning (YYYY.MM format).**
+
+Version numbers show the month and year of release:
+- `2026.06` = June 2026 release
+- `2026.06.1` = Second release in June 2026 (if needed)
+- `2026.07` = July 2026 release
+
+This scheme makes it immediately clear when a version was released, without ambiguity about major/minor/patch semantics. Common in scientific and research software.
+
+**Current Version**: v2026.06 (June 2026)
+
+Check your version:
+```bash
+symvqvae --help
+# Shows "SeismicAutoencoders v2026.06" in the header
+
+julia --project=. -e 'include("vqvae/version.jl"); println(version_string())'
+# Prints: SeismicAutoencoders v2026.06
+```
+
+See [releases](https://github.com/pawbz/SeismicAutoencoders/releases) for release notes and changelog.
+
+---
+
 ## VQ-VAE v9 architecture
 
 The v9 model (internally called "v10 Split-Decoder") is a **Split-Decoder Interferometric
