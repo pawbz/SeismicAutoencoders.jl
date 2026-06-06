@@ -1672,7 +1672,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
     end
     training_para.verbose && @info "Prepared v10 update loop" setup_time_s=round(time() - setup_start; digits=3) N=size(train_x_cpu, 2) batchsize=training_para.batchsize compiled_helpers=!isnothing(compiled)
 
-    pbar_epochs = Progress(training_para.nepoch; desc="Epochs"; parent=pbar_seed, showspeed=true, output=stdout)
+    pbar_epochs = Progress(training_para.nepoch; desc="Epochs", parent=pbar_seed, showspeed=true, output=stdout)
     for epoch in 1:training_para.nepoch
         phase = ensemble_phase(epoch, training_para)
         if phase.post_epoch > 0 &&
@@ -2197,9 +2197,9 @@ function train_selected_pairs(pairs_data, compiled_model;
     xdev = isnothing(device) ? default_xdev(; force=true) : device
     cdev = default_cdev()
     results = Any[]
-    pbar_pairs = Progress(length(pairs_data); desc="Pairs"; showspeed=true, output=stdout)
+    pbar_pairs = Progress(length(pairs_data); desc="Pairs", showspeed=true, output=stdout)
     for pair_entry in pairs_data
-        pbar_seeds = Progress(length(seeds); desc="Seeds"; parent=pbar_pairs, showspeed=true, output=stdout)
+        pbar_seeds = Progress(length(seeds); desc="Seeds", parent=pbar_pairs, showspeed=true, output=stdout)
         for (run_index, seed) in enumerate(seeds)
             pair = pair_entry.pair
             @info "Training v10 pair run" pair run_index seed
