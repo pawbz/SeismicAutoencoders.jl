@@ -108,7 +108,6 @@ begin
     bandwidth_factor = 0.15
     zero_pad_factor = 4
     use_latest_run_per_seed = true
-    training_n_max = 10_000  # maximum pooled waveforms per pair; use nothing for no cap
 end
 
 # ╔═╡ 1000000c-0000-0000-0000-000000000004
@@ -247,8 +246,7 @@ end
 pairs_data_preview = let
     pd_raw = only(vqvae.load_pairs_data(selected_pairs[1:1];
         filepath=data_filepath, seed=1234,
-        dt=dt, period_min=period_min, period_max=period_max,
-        n_max=training_n_max))
+        dt=dt, period_min=period_min, period_max=period_max))
     [vqvae.whiten_pair_entry(pd_raw;
         bp_filter, per_waveform_whitening_kernel_length)]
 end
@@ -302,7 +300,7 @@ end
 selected_pairs_key = (
     path=:symvqvae_notebook,
     selected_pairs=Tuple(selected_pairs),
-    compile_shape=size(pairs_data_whitened[1].data.D_train),
+    nt=size(pairs_data_whitened[1].data.D_train, 1),
     vqvae_parameters=vqvae_parameters,
     training_batchsize=training_para.batchsize,
     autodiff_backend=training_para.autodiff_backend,
@@ -317,8 +315,7 @@ compiled_model = let
         compiled_model_cache_symvqvae[]
     else
         nt = size(pairs_data_whitened[1].data.D_train, 1)
-        n_train = size(pairs_data_whitened[1].data.D_train, 2)
-        compiled_model_cache_symvqvae[] = vqvae.compile_model(nt, n_train;
+        compiled_model_cache_symvqvae[] = vqvae.compile_model(nt;
             vqvae_parameters=vqvae_parameters,
             training_para=training_para,
             seed=1234,
@@ -360,7 +357,6 @@ train_results = begin
             dt,
             period_min,
             period_max,
-            n_max=training_n_max,
             bp_filter,
             per_waveform_whitening_kernel_length,
             device=training_device,
@@ -678,6 +674,51 @@ let
 end
 
 
+# ╔═╡ 1c1cbf6c-625a-11f1-b15e-792a0fa6ea1b
+
+begin
+    if isnothing(train_results)
+        "timing_diagnostics\nstatus=no train_results"
+    else
+        io = IOBuffer()
+        println(io, "timing_diagnostics")
+        for result in train_results
+            lh = result.loss_history
+            n_epoch = length(lh.epoch_time_s)
+            total_inner = sum(Float64.(lh.epoch_time_s))
+            mean_inner = n_epoch == 0 ? NaN : total_inner / n_epoch
+            median_inner = n_epoch == 0 ? NaN : median(Float64.(lh.epoch_time_s))
+            mean_throughput = isempty(lh.throughput) ? NaN : mean(Float64.(lh.throughput))
+            println(io, "pair=$(result.pair) seed=$(result.seed)")
+            println(io, "train_size=$(size(result.data.D_train)) batchsize=$(result.training_para.batchsize) nbatches_per_epoch=$(max(1, floor(Int, size(result.data.D_train, 2) / result.training_para.batchsize)))")
+            println(io, "stored_inner_epoch_time_sum_s=$(round(total_inner; digits=3))")
+            println(io, "stored_inner_epoch_time_mean_s=$(round(mean_inner; digits=3))")
+            println(io, "stored_inner_epoch_time_median_s=$(round(median_inner; digits=3))")
+            println(io, "stored_inner_throughput_mean=$(round(mean_throughput; digits=1))")
+            println(io, "first_epoch_time_s=$(isempty(lh.epoch_time_s) ? missing : lh.epoch_time_s[1]) last_epoch_time_s=$(isempty(lh.epoch_time_s) ? missing : lh.epoch_time_s[end])")
+            println(io)
+        end
+        String(take!(io))
+    end
+end
+
+
+# ╔═╡ 4323e936-625b-11f1-aef2-8ffd0dfa45ff
+
+begin
+    if isnothing(train_results)
+        "timing_short: no train_results"
+    else
+        lines = String[]
+        for result in train_results
+            lh = result.loss_history
+            push!(lines, "seed=$(result.seed) N=$(size(result.data.D_train,2)) nepoch=$(length(lh.epoch_time_s)) sum_inner=$(round(sum(Float64.(lh.epoch_time_s));digits=2)) mean_inner=$(round(mean(Float64.(lh.epoch_time_s));digits=3)) med_inner=$(round(median(Float64.(lh.epoch_time_s));digits=3)) first=$(round(Float64(first(lh.epoch_time_s));digits=3)) last=$(round(Float64(last(lh.epoch_time_s));digits=3))")
+        end
+        join(lines, "\n")
+    end
+end
+
+
 # ╔═╡ Cell order:
 # ╠═10000001-0000-0000-0000-000000000001
 # ╠═96817feb-6aa9-4f35-9277-9a4560e9a2a7
@@ -739,3 +780,5 @@ end
 # ╠═d1eec798-b7aa-4387-9a1e-71064e2660fd
 # ╠═d5000002-0000-0000-0000-000000000003
 # ╠═d5000002-0000-0000-0000-000000000004
+# ╠═1c1cbf6c-625a-11f1-b15e-792a0fa6ea1b
+# ╠═4323e936-625b-11f1-aef2-8ffd0dfa45ff

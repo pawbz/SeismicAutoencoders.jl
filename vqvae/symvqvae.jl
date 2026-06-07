@@ -58,7 +58,6 @@ Commands:
       --Nmax INT                    Compiled encoder inference width (default: 25000)
       --lr FLOAT                    Learning rate (default: 0.001)
       --seeds LIST                  Seeds per model (default: "1234,1235")
-      --nwindows INT                Waveforms per pair (default: 20000)
       --period-min FLOAT            Min period (default: 3.0s)
       --period-max FLOAT            Max period (default: 10.0s)
       --dt FLOAT                    Sample interval (default: 1.0s)
@@ -320,7 +319,6 @@ end
 
 append_xla_flags!([
     "--xla_gpu_enable_cublaslt=true",
-    "--xla_gpu_autotune_level=0",
 ])
 
 using Lux, Reactant, DSP, Statistics
@@ -338,15 +336,15 @@ include_vqvae_architecture_for_cli()
 
 # Test helper: train on synthetic random waveform data using real training pipeline
 function train_selected_pairs_synthetic(compiled_model;
-    seeds, training_para, save_root, nt, nwindows,
+    seeds, training_para, save_root, nt, n_synthetic,
     period_min, period_max, dt, bp_filter,
     per_waveform_whitening_kernel_length, device)
 
-    @info "Test mode: creating synthetic data and running full training pipeline" nt nwindows nepoch=training_para.nepoch
+    @info "Test mode: creating synthetic data and running full training pipeline" nt n_synthetic nepoch=training_para.nepoch
 
     # Create synthetic waveform data
-    n_acausal = div(nwindows, 2)
-    n_causal = nwindows - n_acausal
+    n_acausal = div(n_synthetic, 2)
+    n_causal = n_synthetic - n_acausal
     D_acausal_raw = Float32.(randn(nt, n_acausal))
     D_causal_raw = Float32.(randn(nt, n_causal))
 
@@ -428,7 +426,6 @@ train [pairs] [options]
     --Nmax INT                    Compiled encoder inference width (default: 25000)
     --lr FLOAT                    Learning rate (default: 0.001)
     --seeds LIST                  Seeds per model (default: "1234,1235")
-    --nwindows INT                Waveforms per pair (default: 20000)
     --period-min FLOAT            Min period (default: 3.0s)
     --period-max FLOAT            Max period (default: 10.0s)
     --dt FLOAT                    Sample interval (default: 1.0s)
@@ -453,7 +450,6 @@ train [pairs] [options]
     batchsize = 4096
     Nmax = 25_000
     lr = 0.001
-    nwindows = 20000
     period_min = 3.0
     period_max = 10.0
     dt = 1.0
@@ -491,9 +487,6 @@ train [pairs] [options]
         elseif a == "--lr"
             i += 1
             i <= length(args) && (lr = parse(Float64, args[i]))
-        elseif a == "--nwindows"
-            i += 1
-            i <= length(args) && (nwindows = parse(Int, args[i]))
         elseif a == "--period-min"
             i += 1
             i <= length(args) && (period_min = parse(Float64, args[i]))
@@ -535,7 +528,6 @@ train [pairs] [options]
         elseif a == "--test-mode"
             # Override parameters for quick testing with small synthetic data
             nepoch = 2
-            nwindows = 250  # NOT a multiple of batchsize to test edge case
             batchsize = 32  # Much smaller than real (4096)
             Nmax = max(Nmax, 512)
             pairs = "TEST"  # Special marker for synthetic data
@@ -557,7 +549,6 @@ train [pairs] [options]
     println("Encoder compile Nmax:        $Nmax")
     println("Learning rate:               $lr")
     println("Seeds:                       $seeds")
-    println("Number of waveforms/pair:    $nwindows")
     println("Period range (bandpass):     $period_min — $period_max s")
     println("Sample interval (dt):        $dt s")
     println("Codebook sizes (K):          $K")
@@ -652,27 +643,25 @@ train [pairs] [options]
     if test_mode
         @info "TEST MODE: Using synthetic data with small sizes"
         nt = 100  # Very small for fast compilation
-        n_train = nwindows
     else
         @info "Loading first pair to determine nt for XLA compilation..."
         first_pair_data = load_pairs_data([selected_pairs[1]];
-            filepath=data_dir, dt, period_min, period_max, n_max=nwindows)
-        nt      = size(first_pair_data[1].data.D_train, 1)
-        n_train = nwindows
+            filepath=data_dir, dt, period_min, period_max)
+        nt = size(first_pair_data[1].data.D_train, 1)
     end
 
-    @info "Compiling Reactant XLA graph (once for this session)..." nt n_train K=K_vec batchsize Nmax
-    compiled_model = compile_model(nt, n_train;
+    @info "Compiling Reactant XLA graph (once for this session)..." nt K=K_vec batchsize Nmax
+    compiled_model = compile_model(nt;
         vqvae_parameters, training_para, seed=seeds_vec[1], device, Nmax)
 
     if test_mode
-        # Generate and train on synthetic data
-        @info "Generating synthetic test data..." nt nwindows batchsize nepoch
+        n_synthetic = 250  # NOT a multiple of batchsize to test edge case
+        @info "Generating synthetic test data..." nt n_synthetic batchsize nepoch
         train_selected_pairs_synthetic(compiled_model;
             seeds=seeds_vec,
             training_para,
             save_root,
-            nt, nwindows,
+            nt, n_synthetic,
             period_min, period_max, dt,
             bp_filter,
             per_waveform_whitening_kernel_length=whitening_kernel_length,
@@ -685,7 +674,6 @@ train [pairs] [options]
             save_root,
             filepath=data_dir,
             dt, period_min, period_max,
-            n_max=nwindows,
             bp_filter,
             per_waveform_whitening_kernel_length=whitening_kernel_length,
             device,

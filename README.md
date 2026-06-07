@@ -83,7 +83,6 @@ you cloned the repo:
 ```bash
 export SEISMIC_AE_DIR="/path/to/SeismicAutoencoders"
 alias symvqvae="$SEISMIC_AE_DIR/vqvae/symvqvae.sh"
-alias train_vqvae="symvqvae train"  # backward compatibility
 ```
 
 Then reload your shell:
@@ -155,6 +154,43 @@ See [releases](https://github.com/pawbz/SeismicAutoencoders/releases) for releas
 
 ---
 
+## Performance benchmarks
+
+Epoch timing is tracked here to allow regression detection across versions.
+All timings are **post-warmup steady-state** (epoch ≥ 2, after XLA JIT compilation).
+
+| Version | Hardware | batchsize | Nmax | Dataset | epoch_time_s | Notes |
+|---------|----------|-----------|------|---------|--------------|-------|
+| v2026.06 | NVIDIA GPU (Oracle cloud) | 4096 | 25000 | CCC-OVY, ~4000 waveforms | **~0.19 s** | CLI and Pluto notebook now match |
+
+**Measurement conditions (v2026.06):**
+- XLA flags: `--xla_gpu_enable_cublaslt=true` only (autotuning enabled, default)
+- `metric_sync_time_s ≈ 0.18 s` — this is real GPU compute time surfacing through async XLA execution, not transfer overhead
+- First epoch (warmup): ~4 s due to XLA JIT compilation
+
+**How to benchmark:**
+
+```bash
+symvqvae train CCC-OVY --data-dir vqvae/test_data --nepoch 10 --verbose
+# Read epoch_time_s from the "Epoch timing breakdown" log lines (skip epoch 1)
+```
+
+---
+
+## Test data
+
+A small real-pair dataset for testing and benchmarking is included at `vqvae/test_data/`:
+
+```
+vqvae/test_data/
+└── CCC_OVY-full-width-30mins-with-zerolag-2026-03-13T02:08:27.784-1001.jld2
+```
+
+This is the CCC-OVY station pair (ambient noise cross-correlations, 30-minute windows).
+Use it with `--data-dir vqvae/test_data` for smoke tests and benchmarking.
+
+---
+
 ## SymVQVAE architecture
 
 SymVQVAE is a **Split-Decoder Interferometric Mixture VQ-VAE** built with Lux.jl
@@ -181,7 +217,7 @@ Key parameters (defaults):
 | `--nepoch` | `100` | Training epochs |
 | `--seeds` | `1234,1235` | Random seeds (one model trained per seed) |
 | `--batchsize` | `4096` | Minibatch size |
-| `--nwindows` | `20000` | Waveforms per pair |
+| `--Nmax` | `25000` | Encoder compiled width (inference batch size) |
 | `--period-min/max` | `10/75 s` | Bandpass filter period range |
 
 See `vqvae/VQVAE_readme.md` for the full architecture evolution from v1 to v9.

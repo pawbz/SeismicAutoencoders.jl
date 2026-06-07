@@ -900,6 +900,16 @@ function make_batches(X_cpu::AbstractMatrix{Float32}, batchsize::Int; shuffle::B
     return batches
 end
 
+function repeat_columns_to_minimum(X_cpu::AbstractMatrix{Float32}, min_n::Int)
+    nt, N = size(X_cpu)
+    min_n > 0 || error("Minimum column count must be positive; got $min_n.")
+    N > 0 || error("Cannot repeat columns from an empty training matrix.")
+    N >= min_n && return X_cpu
+    extra = min_n - N
+    repeated_ids = 1 .+ mod.(0:extra-1, N)
+    return hcat(X_cpu, X_cpu[:, repeated_ids])
+end
+
 # ╔═╡ 2d6639d1-ae40-46d0-a811-e1fd34a23613
 begin
 	function batch_with_target(batch, X_cpu, idx::Union{Nothing,LatentIndex},
@@ -1270,16 +1280,6 @@ function build_training_bundle(pair::Tuple{String,String}; filepath::String, dt:
             latitudes=raw.latitudes, longitudes=raw.longitudes)
 end
 
-function trim_training_bundle(bundle; n_max::Union{Nothing,Integer}=nothing,
-    rng=Random.default_rng())
-    # n_max parameter DEPRECATED: XLA compilation now uses batchsize (not n_train)
-    # All pairs train on their full waveform count, no trimming needed
-    if !isnothing(n_max)
-        @warn "n_max parameter deprecated: XLA compiles at batchsize now. Training on all available waveforms."
-    end
-    return bundle
-end
-
 # ╔═╡ 8dd1c50c-587c-471d-bc80-cd77012302a9
 function make_pooled_split(D1fac, D1fc; at=0.9, shuffle=true, rng=Random.default_rng())
     D_all = Float32.(hcat(D1fac, D1fc))
@@ -1302,15 +1302,13 @@ end
 
 # ╔═╡ f3583928-80f5-4e89-8d86-463eda8b97bd
 function load_pairs_data(selected_pairs; filepath::String,
-    seed::Int=1234, dt::Real=1.0, period_min::Real=10, period_max::Real=50,
-    n_max::Union{Nothing,Integer}=nothing)
+    seed::Int=1234, dt::Real=1.0, period_min::Real=10, period_max::Real=50)
     rng = Xoshiro(seed)
     pairs_data = Any[]
     for pair_raw in selected_pairs
         pair = (String(pair_raw[1]), String(pair_raw[2]))
         @info "Loading SymVQVAE pair data" pair
         bundle = build_training_bundle(pair; filepath, dt, period_min, period_max)
-        bundle = trim_training_bundle(bundle; n_max, rng)
         @info "Loaded SymVQVAE pair bundle" pair distance=bundle.distance D1fac_size=size(bundle.D1fac) D1fc_size=size(bundle.D1fc)
         data = make_pooled_split(bundle.D1fac, bundle.D1fc; rng)
         @info "Built SymVQVAE train/test split" pair train_size=size(data.D_train) test_size=size(data.D_test)
@@ -1599,8 +1597,12 @@ function update(model, ps, st, loss_history, train_data, test_data,
 
     setup_start = time()
     train_x_cpu_full = Float32.(cdev(flatten_batch(train_data)))
-    # Use all waveforms - batching with padding in rebuild_latent_index handles variable-N
-    train_x_cpu = train_x_cpu_full
+    # Use all waveforms; repeat columns only when needed to fill one fixed training batch.
+    original_train_N = size(train_x_cpu_full, 2)
+    train_x_cpu = repeat_columns_to_minimum(train_x_cpu_full, training_para.batchsize)
+    if size(train_x_cpu, 2) != original_train_N
+        training_para.verbose && @info "Repeated training waveforms to fill one fixed batch" original_N=original_train_N padded_N=size(train_x_cpu, 2) batchsize=training_para.batchsize
+    end
     test_x_cpu = Float32.(cdev(flatten_batch(test_data)))
     opt = Optimisers.AdamW(; eta=Float64(training_para.initial_learning_rate),
         lambda=Float64(training_para.weight_decay))
@@ -1613,8 +1615,6 @@ function update(model, ps, st, loss_history, train_data, test_data,
     idx = LatentIndex(max_Mnn(training_para))
     last_index_Mnn = 0
     ensemble_targets_cpu = nothing
-    size(train_x_cpu, 2) >= training_para.batchsize ||
-        error("Training set N=$(size(train_x_cpu, 2)) is smaller than batchsize=$(training_para.batchsize). Reactant training uses fixed full batches.")
     test_eval_x_cpu = test_x_cpu[:, 1:min(512, size(test_x_cpu, 2))]
     inference_compiled = compiled
     if isnothing(inference_compiled)
@@ -1693,6 +1693,8 @@ function update(model, ps, st, loss_history, train_data, test_data,
         entropy_sum = 0f0
         perplexity_sum = 0f0
         nbatches_seen = 0
+        # Accumulate raw device-side metric tensors; sync once after the batch loop
+        pending_metrics = Any[]
         pbar = Progress(length(batches); desc="Epoch $epoch", showspeed=true)
         for (batch_idx, batch) in enumerate(batches)
             prep_start = time()
@@ -1714,38 +1716,31 @@ function update(model, ps, st, loss_history, train_data, test_data,
             )
             step_time += time() - step_start
             total_seen += size(batch.x, 2)
-            metric_sync_start = time()
-            batch_metrics = cdev((;
-                loss,
-                recon_loss=stats.recon_loss,
-                commit_loss=stats.commit_loss,
-                entropy_loss=stats.entropy_loss,
-                perplexity=stats.perplexity,
-            ))
-            metric_sync_time += time() - metric_sync_start
-            last_loss = Float32(batch_metrics.loss)
-            isnan(last_loss) && error("NaN loss encountered.")
-            last_recon = Float32(batch_metrics.recon_loss)
-            last_commit = Float32(batch_metrics.commit_loss)
-            last_entropy = Float32(batch_metrics.entropy_loss)
-            last_perplexity = Float32(batch_metrics.perplexity)
-            total_sum += last_loss
-            recon_sum += last_recon
-            commit_sum += last_commit
-            entropy_sum += last_entropy
-            perplexity_sum += last_perplexity
+            push!(pending_metrics, (; loss, recon_loss=stats.recon_loss,
+                commit_loss=stats.commit_loss, entropy_loss=stats.entropy_loss,
+                perplexity=stats.perplexity))
             nbatches_seen += 1
-            # Update progress bar with metrics
-            elapsed = time() - start
-            loss_display = isfinite(last_loss) ? round(last_loss; digits=4) : "pending"
-            recon_display = isfinite(last_recon) ? round(last_recon; digits=4) : "pending"
-            commit_display = isfinite(last_commit) ? round(last_commit; digits=4) : "pending"
-            next!(pbar; showvalues=[
-                (:loss, loss_display),
-                (:recon, recon_display),
-                (:commit, commit_display),
-            ])
+            next!(pbar)
         end
+        # One device→CPU sync: sum scalars on-device across all batches, then transfer
+        # the 5-element epoch aggregate in a single cdev call.
+        metric_sync_start = time()
+        if !isempty(pending_metrics)
+            loss_dev    = sum(m.loss        for m in pending_metrics)
+            recon_dev   = sum(m.recon_loss  for m in pending_metrics)
+            commit_dev  = sum(m.commit_loss for m in pending_metrics)
+            entropy_dev = sum(m.entropy_loss for m in pending_metrics)
+            pplx_dev    = sum(m.perplexity  for m in pending_metrics)
+            epoch_sums  = map(Float32, cdev((; loss=loss_dev, recon=recon_dev,
+                commit=commit_dev, entropy=entropy_dev, perplexity=pplx_dev)))
+            isnan(epoch_sums.loss) && error("NaN loss encountered.")
+            total_sum      += epoch_sums.loss
+            recon_sum      += epoch_sums.recon
+            commit_sum     += epoch_sums.commit
+            entropy_sum    += epoch_sums.entropy
+            perplexity_sum += epoch_sums.perplexity
+        end
+        metric_sync_time += time() - metric_sync_start
         epoch_time = time() - start
         throughput = total_seen / max(epoch_time, 1e-8)
         denom = Float32(max(nbatches_seen, 1))
@@ -2176,7 +2171,6 @@ end
 function train_selected_pairs_lazy(selected_pairs, compiled_model;
     seeds, training_para::VQVAE_Training_Para, save_root::String,
     filepath::String, dt::Real=1.0, period_min::Real=10, period_max::Real=50,
-    n_max::Union{Nothing,Integer}=nothing,
     bp_filter, per_waveform_whitening_kernel_length::Int,
     device=nothing, analysis_settings=(;))
     isempty(selected_pairs) && return Any[]
@@ -2189,7 +2183,6 @@ function train_selected_pairs_lazy(selected_pairs, compiled_model;
         pair = (String(pair_raw[1]), String(pair_raw[2]))
         @info "Loading pair" pair
         bundle = build_training_bundle(pair; filepath, dt, period_min, period_max)
-        bundle = trim_training_bundle(bundle; n_max, rng)
         data = make_pooled_split(bundle.D1fac, bundle.D1fc; rng)
         pd_raw = (; pair, data, data_bundle=bundle)
         @info "Whitening pair" pair
@@ -2313,7 +2306,7 @@ function get_vqvae(para; rng=Random.default_rng(), device=identity)
 end
 
 # ╔═╡ a74f1dab-d658-4f37-9d26-4ddd9097d15e
-function compile_model(nt::Int, n_train::Int; vqvae_parameters::NamedTuple,
+function compile_model(nt::Int; vqvae_parameters::NamedTuple,
     training_para::VQVAE_Training_Para, seed::Int=1234, device=nothing,
     Nmax::Int=25_000)
     ensure_reactant_xla_flags!()
@@ -2329,9 +2322,9 @@ function compile_model(nt::Int, n_train::Int; vqvae_parameters::NamedTuple,
         device=xdev, sample_batch_x=xdev(dummy_batch_cpu))
     train_step_cache = compile_train_step(model, xdev(ps), xdev(st),
         dummy_batch_cpu, para, training_para; device=xdev, cdev)
-    @info "$(version_string()) — compile_model complete" nt Nmax batchsize=training_para.batchsize n_train_metadata=n_train
+    @info "$(version_string()) — compile_model complete" nt Nmax batchsize=training_para.batchsize
     return (; model, para, compiled, train_step_cache, compile_seed=seed,
-        n_train, n_compiled_encoder=Nmax)
+        n_compiled_encoder=Nmax)
 end
 
 # ╔═╡ a848319e-7bda-4844-a916-2bbdef1d5417
@@ -2339,11 +2332,10 @@ function train_one_pair(pair::Tuple{<:AbstractString,<:AbstractString}; filepath
     vqvae_parameters::NamedTuple, training_para::VQVAE_Training_Para,
     save_root::String=joinpath(filepath, "SavedModels", "symvqvae"),
     seed::Int=1234, dt::Real=1.0, period_min::Real=10, period_max::Real=50,
-    device=nothing, n_max::Union{Nothing,Integer}=nothing, Nmax::Int=25_000)
-    pairs_data = load_pairs_data([pair]; filepath, seed, dt, period_min, period_max, n_max=n_max)
+    device=nothing, Nmax::Int=25_000)
+    pairs_data = load_pairs_data([pair]; filepath, seed, dt, period_min, period_max)
     nt = size(pairs_data[1].data.D_train, 1)
-    n_train = size(pairs_data[1].data.D_train, 2)
-    compiled_model = compile_model(nt, n_train; vqvae_parameters, training_para, seed, device, Nmax)
+    compiled_model = compile_model(nt; vqvae_parameters, training_para, seed, device, Nmax)
     return only(train_selected_pairs(pairs_data, compiled_model; seeds=[seed],
         training_para, save_root, device))
 end
