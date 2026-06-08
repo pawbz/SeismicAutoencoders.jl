@@ -32,6 +32,26 @@ function parse_pair_spec(pair_str::AbstractString)
     (String(strip(parts[1])), String(strip(parts[2])))
 end
 
+function save_dir_number_label(x::Real)
+    xf = Float64(x)
+    label = isinteger(xf) ? string(Int(xf)) : string(xf)
+    replace(label, "." => "p", "-" => "m")
+end
+
+function default_train_save_root(data_dir::AbstractString, K_vec, period_min::Real, period_max::Real)
+    period_label = "Tmin=$(save_dir_number_label(period_min))s_Tmax=$(save_dir_number_label(period_max))s"
+    joinpath(data_dir, "SavedModels", "vqvae_$(VERSION)_K=$(K_vec)_$(period_label)")
+end
+
+function parse_period_range(periods::AbstractString)
+    parts = strip.(split(periods, ","))
+    length(parts) == 2 || error("--periods expects MIN,MAX, e.g. --periods 3,10")
+    period_min, period_max = parse.(Float64, parts)
+    period_min > 0 && period_max > 0 || error("--periods values must be positive")
+    period_min < period_max || error("--periods MIN must be less than MAX")
+    period_min, period_max
+end
+
 # Check for help/info flags BEFORE loading expensive packages
 if isempty(ARGS) || ARGS[1] in ("--help", "-h")
     println("""
@@ -40,6 +60,7 @@ $(version_string()) — SymVQVAE training and inspection CLI.
 Usage:
   symvqvae train [pairs] [options]      Train models
   symvqvae inspect PAIR [options]        Inspect a pair
+  symvqvae list-pairs [--data-dir DIR]   List available station pairs
   symvqvae --help                        Show help
 
 Commands:
@@ -58,8 +79,7 @@ Commands:
       --Nmax INT                    Compiled encoder inference width (default: 25000)
       --lr FLOAT                    Learning rate (default: 0.001)
       --seeds LIST                  Seeds per model (default: "1234,1235")
-      --period-min FLOAT            Min period (default: 3.0s)
-      --period-max FLOAT            Max period (default: 10.0s)
+      --periods MIN,MAX             Period range (default: 3,10s)
       --dt FLOAT                    Sample interval (default: 1.0s)
       --K LIST                      Codebook sizes (default: "5,3")
       --d INT                       Latent dimension (default: 40)
@@ -79,14 +99,44 @@ Commands:
 
     Options:
       --data-dir DIR                JLD2 files directory (default: pwd)
-      --period-min FLOAT            Min period (default: 3.0s)
-      --period-max FLOAT            Max period (default: 10.0s)
+      --periods MIN,MAX             Period range (default: 3,10s)
       --dt FLOAT                    Sample interval (default: 1.0s)
       --whitening-kernel-length INT FIR taps for whitening (default: 128)
+
+  list-pairs [options]
+    List all station pairs found in the data directory. Fast — no GPU/model loading.
+
+    Options:
+      --data-dir DIR                JLD2 files directory (default: pwd)
 
   --help, -h
     Show this help message
 """)
+    exit(0)
+end
+
+# Handle list-pairs command — pure file scan, no heavy dependencies
+function cmd_list_pairs(args::Vector{String})
+    data_dir = pwd()
+    i = 1
+    while i <= length(args)
+        if args[i] == "--data-dir" && i < length(args)
+            i += 1
+            data_dir = args[i]
+        end
+        i += 1
+    end
+    pairs = list_station_pairs(data_dir)
+    if isempty(pairs)
+        println("No station pairs found in $(data_dir)")
+    else
+        println("$(length(pairs)) pair(s) in $(data_dir):")
+        for p in pairs; println("  $(p[1])-$(p[2])"); end
+    end
+end
+
+if !isempty(ARGS) && ARGS[1] == "list-pairs"
+    cmd_list_pairs(ARGS[2:end])
     exit(0)
 end
 
@@ -110,8 +160,7 @@ inspect PAIR [options]
 
   Options:
     --data-dir DIR                JLD2 files directory (default: pwd)
-    --period-min FLOAT            Min period (default: 3.0s)
-    --period-max FLOAT            Max period (default: 10.0s)
+    --periods MIN,MAX             Period range (default: 3,10s)
     --dt FLOAT                    Sample interval (default: 1.0s)
     --whitening-kernel-length INT FIR taps for whitening (default: 128)
 """)
@@ -130,12 +179,9 @@ inspect PAIR [options]
             if args[i] == "--data-dir"
                 i += 1
                 i <= length(args) && (data_dir = args[i])
-            elseif args[i] == "--period-min"
+            elseif args[i] == "--periods"
                 i += 1
-                i <= length(args) && (period_min = parse(Float64, args[i]))
-            elseif args[i] == "--period-max"
-                i += 1
-                i <= length(args) && (period_max = parse(Float64, args[i]))
+                i <= length(args) && ((period_min, period_max) = parse_period_range(args[i]))
             elseif args[i] == "--dt"
                 i += 1
                 i <= length(args) && (dt = parse(Float64, args[i]))
@@ -426,8 +472,7 @@ train [pairs] [options]
     --Nmax INT                    Compiled encoder inference width (default: 25000)
     --lr FLOAT                    Learning rate (default: 0.001)
     --seeds LIST                  Seeds per model (default: "1234,1235")
-    --period-min FLOAT            Min period (default: 3.0s)
-    --period-max FLOAT            Max period (default: 10.0s)
+    --periods MIN,MAX             Period range (default: 3,10s)
     --dt FLOAT                    Sample interval (default: 1.0s)
     --K LIST                      Codebook sizes (default: "5,3")
     --d INT                       Latent dimension (default: 40)
@@ -487,12 +532,9 @@ train [pairs] [options]
         elseif a == "--lr"
             i += 1
             i <= length(args) && (lr = parse(Float64, args[i]))
-        elseif a == "--period-min"
+        elseif a == "--periods"
             i += 1
-            i <= length(args) && (period_min = parse(Float64, args[i]))
-        elseif a == "--period-max"
-            i += 1
-            i <= length(args) && (period_max = parse(Float64, args[i]))
+            i <= length(args) && ((period_min, period_max) = parse_period_range(args[i]))
         elseif a == "--dt"
             i += 1
             i <= length(args) && (dt = parse(Float64, args[i]))
@@ -537,13 +579,18 @@ train [pairs] [options]
         i += 1
     end
 
+    seeds_vec  = parse.(Int, strip.(split(seeds, ",")))
+    K_vec      = parse.(Int, strip.(split(K, ",")))
+    ratios_vec = parse.(Int, strip.(split(ratios, ",")))
+    default_save_root = default_train_save_root(data_dir, K_vec, period_min, period_max)
+
     # Print all parameters for user verification
     println("\n" * "="^80)
     println("$(version_string()) — Training Configuration:")
     println("="^80)
     println("Pair(s):                     $(pairs == "all" ? "all" : pairs)")
     println("Data directory:              $data_dir")
-    println("Save directory:              $(isempty(save_dir) ? "$(data_dir)/SavedModels/symvqvae_..." : save_dir)")
+    println("Save directory:              $(isempty(save_dir) ? default_save_root : save_dir)")
     println("Number of epochs:            $nepoch")
     println("Batch size:                  $batchsize")
     println("Encoder compile Nmax:        $Nmax")
@@ -604,10 +651,6 @@ train [pairs] [options]
     end
     end  # Close outer if-else for test mode vs normal mode
 
-    seeds_vec  = parse.(Int, strip.(split(seeds, ",")))
-    K_vec      = parse.(Int, strip.(split(K, ",")))
-    ratios_vec = parse.(Int, strip.(split(ratios, ",")))
-
     vqvae_parameters = (;
         d, K=K_vec, n_filters, ratios=ratios_vec,
         n_residual_layers,
@@ -634,8 +677,7 @@ train [pairs] [options]
         DSP.digitalfilter(rt, DSP.Butterworth(2); fs=inv(dt))
     end
 
-    save_root = isempty(save_dir) ?
-        joinpath(data_dir, "SavedModels", "vqvae_$(VERSION)_K=$(K_vec)") : save_dir
+    save_root = isempty(save_dir) ? default_save_root : save_dir
 
     device = default_xdev(; force=true)
 

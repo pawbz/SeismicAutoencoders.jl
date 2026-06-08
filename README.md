@@ -111,9 +111,9 @@ symvqvae --help
 symvqvae inspect AP_BK --data-dir /path/to/jld2/files
 
 # Customize period range and whitening kernel for inspection
-symvqvae inspect AP_BK --data-dir /path/to/jld2/files --period-min 3 --period-max 100 --whitening-kernel-length 256
+symvqvae inspect AP_BK --data-dir /path/to/jld2/files --periods 3,100 --whitening-kernel-length 256
 
-# Train all pairs, background (default) — logs to file
+# Train all pairs on GPU 0, background (default) — logs to file
 symvqvae train --data-dir /path/to/jld2/files --nepoch 100
 
 # Train specific pairs only
@@ -121,6 +121,12 @@ symvqvae train AP-BK,AP-CL --data-dir /path/to/jld2/files --nepoch 50
 
 # Train with custom parameters
 symvqvae train --data-dir /path/to/jld2/files --nepoch 200 --lr 0.0005 --K 8,5 --d 64
+
+# Train across multiple GPUs — pairs split round-robin, one Julia process per GPU
+symvqvae train --gpus 0,1 --data-dir /path/to/jld2/files --nepoch 100
+
+# Multi-GPU, stream all logs to terminal (blocks until done)
+symvqvae train --gpus 0,1,2,3 --foreground --data-dir /path/to/jld2/files --nepoch 100
 
 # Backward compatibility: old alias still works
 train_vqvae --data-dir /path/to/jld2/files --nepoch 100
@@ -218,7 +224,7 @@ Key parameters (defaults):
 | `--seeds` | `1234,1235` | Random seeds (one model trained per seed) |
 | `--batchsize` | `4096` | Minibatch size |
 | `--Nmax` | `25000` | Encoder compiled width (inference batch size) |
-| `--period-min/max` | `10/75 s` | Bandpass filter period range |
+| `--periods` | `10,75` | Bandpass filter period range |
 
 See `vqvae/VQVAE_readme.md` for the full architecture evolution from v1 to v9.
 
@@ -255,8 +261,8 @@ bandpass filtering, and train/test splitting.
 
 ## Output
 
-Trained models are saved under `--save-dir` (default: `<data-dir>/SavedModels/vqvae_YYYY.MM_K=[...]`).
-The version number indicates which release trained the model (e.g., `vqvae_2026.06_K=[5,3]`).
+Trained models are saved under `--save-dir` (default: `<data-dir>/SavedModels/vqvae_YYYY.MM_K=[...]_Tmin=...s_Tmax=...s`).
+The version number indicates which release trained the model (e.g., `vqvae_2026.06_K=[5, 3]_Tmin=3s_Tmax=10s`).
 Each run creates a timestamped directory per pair and seed containing:
 
 - `run_summary.jld2` — hyperparameters and loss history
