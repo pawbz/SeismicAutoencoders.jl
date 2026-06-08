@@ -128,6 +128,28 @@ while [ $i -le $# ]; do
         i=$((i+1))
         DATA_DIR="${!i}"
         PASSTHROUGH+=("--data-dir" "${!i}")
+    elif [ "$arg" = "--save-dir" ] || \
+         [ "$arg" = "--nepoch" ] || \
+         [ "$arg" = "--batchsize" ] || \
+         [ "$arg" = "--Nmax" ] || \
+         [ "$arg" = "--lr" ] || \
+         [ "$arg" = "--seeds" ] || \
+         [ "$arg" = "--periods" ] || \
+         [ "$arg" = "--dt" ] || \
+         [ "$arg" = "--K" ] || \
+         [ "$arg" = "--d" ] || \
+         [ "$arg" = "--n-filters" ] || \
+         [ "$arg" = "--ratios" ] || \
+         [ "$arg" = "--n-residual-layers" ] || \
+         [ "$arg" = "--entropy-weight" ] || \
+         [ "$arg" = "--whitening-kernel-length" ] || \
+         [ "$arg" = "--autodiff-backend" ]; then
+        i=$((i+1))
+        if [ $i -gt $# ]; then
+            echo "Error: missing value for ${arg}" >&2
+            exit 1
+        fi
+        PASSTHROUGH+=("$arg" "${!i}")
     elif [[ "$arg" != --* && "$arg" != -* && -z "$PAIRS_ARG" ]]; then
         # First positional arg is the pairs specification
         PAIRS_ARG="$arg"
@@ -144,6 +166,14 @@ NGPUS=${#GPU_IDS[@]}
 if [ "$NGPUS" -eq 1 ]; then
     PAIRS_PASSTHROUGH=()
     [ -n "$PAIRS_ARG" ] && PAIRS_PASSTHROUGH=("$PAIRS_ARG")
+
+    if [ "${SYMVQVAE_DRY_RUN:-}" = "1" ]; then
+        printf 'CUDA_VISIBLE_DEVICES=%s\n' "${GPU_IDS[0]}"
+        printf 'julia_args:'
+        printf ' %q' train "${PAIRS_PASSTHROUGH[@]}" "${PASSTHROUGH[@]}"
+        printf '\n'
+        exit 0
+    fi
 
     if $FOREGROUND; then
         CUDA_VISIBLE_DEVICES="${GPU_IDS[0]}" \
