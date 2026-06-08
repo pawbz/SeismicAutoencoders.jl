@@ -236,119 +236,115 @@ inspect PAIR [options]
 
         jld2_data = JLD2.load(jld2_file)
 
-        # Handle Sanket's data format (correlations, dist, latitudes, longitudes, headers)
-        if haskey(jld2_data, "correlations")
-            correlations = jld2_data["correlations"]
-            nt = size(correlations, 1)
-            n_waveforms = size(correlations, 2)
-            println("  nt: $nt")
-            println("  Number of waveforms: $n_waveforms")
-            println("  Data shape: $(size(correlations))")
-            println("  Data dtype: $(eltype(correlations))")
-            println("  Data range: [$(minimum(correlations)), $(maximum(correlations))]")
+        # Handle supported JLD2 schemas:
+        # - correlations, dist
+        # - D, Distances
+        correlations = jld2_correlations(jld2_data)
+        nt = size(correlations, 1)
+        n_waveforms = size(correlations, 2)
+        println("  nt: $nt")
+        println("  Number of waveforms: $n_waveforms")
+        println("  Data shape: $(size(correlations))")
+        println("  Data dtype: $(eltype(correlations))")
+        println("  Data range: [$(minimum(correlations)), $(maximum(correlations))]")
 
-            if haskey(jld2_data, "dist")
-                dist_km = jld2_data["dist"]  # distance is always in km
-                println("  Interstation distance: $dist_km km")
-            end
-
-            if haskey(jld2_data, "latitudes") && haskey(jld2_data, "longitudes")
-                lats = jld2_data["latitudes"]
-                lons = jld2_data["longitudes"]
-                if length(lats) >= 2 && length(lons) >= 2
-                    println("  Station $(pair_obj[1]): lat=$(lats[1]), lon=$(lons[1])")
-                    println("  Station $(pair_obj[2]): lat=$(lats[2]), lon=$(lons[2])")
-                end
-            end
-
-            # Split acausal (negative lags) and causal (positive lags) sides
-            mid = div(nt, 2) + 1
-            acausal = correlations[1:mid-1, :]
-            causal = correlations[mid:nt, :]
-
-            mean_acausal = vec(mean(acausal, dims=2))
-            mean_causal = vec(mean(causal, dims=2))
-
-            # Plot 1: Unified waveform plot on single lag axis
-            n_acausal = size(acausal, 1)
-            n_causal = size(causal, 1)
-            # Unified lag axis: acausal lags from -n_acausal to -1, causal from 0 to n_causal-1
-            lags_unified = collect(-(n_acausal):(n_causal-1)) .* dt
-
-            # Combine acausal and causal into single vector (concatenate on same axis)
-            # Acausal occupies indices 1:n_acausal, causal occupies indices n_acausal+1:n_acausal+n_causal
-            waveform_unified = vcat(mean_acausal, mean_causal)
-
-            plt_wave = UnicodePlots.lineplot(
-                lags_unified, waveform_unified;
-                xlabel="lag (s)", ylabel="amplitude",
-                title="$(pair_obj[1])-$(pair_obj[2])  global average waveform (unified lag axis)",
-                width=80, height=12,
-            )
-            println(plt_wave)
-
-            # Plot 2: PSD comparison (raw vs whitened) with period-range filtering
-            # Compute raw PSD for acausal and causal separately
-            psd_acausal_raw = DSP.periodogram(Float64.(mean_acausal); fs=inv(dt))
-            psd_causal_raw = DSP.periodogram(Float64.(mean_causal); fs=inv(dt))
-
-            freqs_acausal = DSP.freq(psd_acausal_raw)
-            valid_freqs_ac = freqs_acausal .> 0
-            periods_acausal = inv.(freqs_acausal[valid_freqs_ac])
-            pow_acausal_raw = 10 .* log10.(max.(DSP.power(psd_acausal_raw)[valid_freqs_ac], 1e-30))
-
-            freqs_causal = DSP.freq(psd_causal_raw)
-            valid_freqs_c = freqs_causal .> 0
-            periods_causal = inv.(freqs_causal[valid_freqs_c])
-            pow_causal_raw = 10 .* log10.(max.(DSP.power(psd_causal_raw)[valid_freqs_c], 1e-30))
-
-            # Combine periods and power (average across acausal and causal)
-            # Note: periods may have different lengths; use acausal for plotting (longer)
-            pow_raw_combined = (pow_acausal_raw .+ pow_causal_raw[1:length(pow_acausal_raw)]) ./ 2
-
-            # Filter to period range
-            period_mask_raw = (periods_acausal .>= period_min) .& (periods_acausal .<= period_max)
-            periods_filtered = periods_acausal[period_mask_raw]
-            pow_raw_filtered = pow_raw_combined[period_mask_raw]
-
-            # Compute whitened PSD
-            # Apply whitening to both acausal and causal separately
-            acausal_f32 = Float32.(acausal)
-            causal_f32 = Float32.(causal)
-
-            fir_ac = compute_whitening_fir(acausal_f32; kernel_length=whitening_kernel_length)
-            fir_c = compute_whitening_fir(causal_f32; kernel_length=whitening_kernel_length)
-
-            acausal_whitened = apply_whitening_fir(acausal_f32, fir_ac)
-            causal_whitened = apply_whitening_fir(causal_f32, fir_c)
-
-            mean_acausal_whitened = vec(mean(acausal_whitened, dims=2))
-            mean_causal_whitened = vec(mean(causal_whitened, dims=2))
-
-            psd_acausal_whitened = DSP.periodogram(Float64.(mean_acausal_whitened); fs=inv(dt))
-            psd_causal_whitened = DSP.periodogram(Float64.(mean_causal_whitened); fs=inv(dt))
-
-            pow_acausal_wh = 10 .* log10.(max.(DSP.power(psd_acausal_whitened)[valid_freqs_ac], 1e-30))
-            pow_causal_wh = 10 .* log10.(max.(DSP.power(psd_causal_whitened)[valid_freqs_c], 1e-30))
-            pow_whitened_combined = (pow_acausal_wh .+ pow_causal_wh[1:length(pow_acausal_wh)]) ./ 2
-
-            pow_whitened_filtered = pow_whitened_combined[period_mask_raw]
-
-            # Plot raw PSD
-            plt_psd = UnicodePlots.lineplot(
-                periods_filtered, pow_raw_filtered;
-                name="raw", xlabel="period (s)", ylabel="PSD (dB)",
-                title="$(pair_obj[1])-$(pair_obj[2])  PSD: raw vs whitened",
-                width=80, height=12,
-            )
-            # Overlay whitened PSD
-            UnicodePlots.lineplot!(plt_psd, periods_filtered, pow_whitened_filtered; name="whitened")
-            println(plt_psd)
-        else
-            # Fallback for other JLD2 formats
-            println("Available keys in file: $(join(keys(jld2_data), ", "))")
-            error("Unrecognized JLD2 data format")
+        dist_km = jld2_distance(jld2_data)
+        if !isnothing(dist_km)
+            println("  Interstation distance: $dist_km km")
         end
+
+        if haskey(jld2_data, "latitudes") && haskey(jld2_data, "longitudes")
+            lats = jld2_data["latitudes"]
+            lons = jld2_data["longitudes"]
+            if length(lats) >= 2 && length(lons) >= 2
+                println("  Station $(pair_obj[1]): lat=$(lats[1]), lon=$(lons[1])")
+                println("  Station $(pair_obj[2]): lat=$(lats[2]), lon=$(lons[2])")
+            end
+        end
+
+        # Split acausal (negative lags) and causal (positive lags) sides
+        mid = div(nt, 2) + 1
+        acausal = correlations[1:mid-1, :]
+        causal = correlations[mid:nt, :]
+
+        mean_acausal = vec(mean(acausal, dims=2))
+        mean_causal = vec(mean(causal, dims=2))
+
+        # Plot 1: Unified waveform plot on single lag axis
+        n_acausal = size(acausal, 1)
+        n_causal = size(causal, 1)
+        # Unified lag axis: acausal lags from -n_acausal to -1, causal from 0 to n_causal-1
+        lags_unified = collect(-(n_acausal):(n_causal-1)) .* dt
+
+        # Combine acausal and causal into single vector (concatenate on same axis)
+        # Acausal occupies indices 1:n_acausal, causal occupies indices n_acausal+1:n_acausal+n_causal
+        waveform_unified = vcat(mean_acausal, mean_causal)
+
+        plt_wave = UnicodePlots.lineplot(
+            lags_unified, waveform_unified;
+            xlabel="lag (s)", ylabel="amplitude",
+            title="$(pair_obj[1])-$(pair_obj[2])  global average waveform (unified lag axis)",
+            width=80, height=12,
+        )
+        println(plt_wave)
+
+        # Plot 2: PSD comparison (raw vs whitened) with period-range filtering
+        # Compute raw PSD for acausal and causal separately
+        psd_acausal_raw = DSP.periodogram(Float64.(mean_acausal); fs=inv(dt))
+        psd_causal_raw = DSP.periodogram(Float64.(mean_causal); fs=inv(dt))
+
+        freqs_acausal = DSP.freq(psd_acausal_raw)
+        valid_freqs_ac = freqs_acausal .> 0
+        periods_acausal = inv.(freqs_acausal[valid_freqs_ac])
+        pow_acausal_raw = 10 .* log10.(max.(DSP.power(psd_acausal_raw)[valid_freqs_ac], 1e-30))
+
+        freqs_causal = DSP.freq(psd_causal_raw)
+        valid_freqs_c = freqs_causal .> 0
+        periods_causal = inv.(freqs_causal[valid_freqs_c])
+        pow_causal_raw = 10 .* log10.(max.(DSP.power(psd_causal_raw)[valid_freqs_c], 1e-30))
+
+        # Combine periods and power (average across acausal and causal)
+        # Note: periods may have different lengths; use acausal for plotting (longer)
+        pow_raw_combined = (pow_acausal_raw .+ pow_causal_raw[1:length(pow_acausal_raw)]) ./ 2
+
+        # Filter to period range
+        period_mask_raw = (periods_acausal .>= period_min) .& (periods_acausal .<= period_max)
+        periods_filtered = periods_acausal[period_mask_raw]
+        pow_raw_filtered = pow_raw_combined[period_mask_raw]
+
+        # Compute whitened PSD
+        # Apply whitening to both acausal and causal separately
+        acausal_f32 = Float32.(acausal)
+        causal_f32 = Float32.(causal)
+
+        fir_ac = compute_whitening_fir(acausal_f32; kernel_length=whitening_kernel_length)
+        fir_c = compute_whitening_fir(causal_f32; kernel_length=whitening_kernel_length)
+
+        acausal_whitened = apply_whitening_fir(acausal_f32, fir_ac)
+        causal_whitened = apply_whitening_fir(causal_f32, fir_c)
+
+        mean_acausal_whitened = vec(mean(acausal_whitened, dims=2))
+        mean_causal_whitened = vec(mean(causal_whitened, dims=2))
+
+        psd_acausal_whitened = DSP.periodogram(Float64.(mean_acausal_whitened); fs=inv(dt))
+        psd_causal_whitened = DSP.periodogram(Float64.(mean_causal_whitened); fs=inv(dt))
+
+        pow_acausal_wh = 10 .* log10.(max.(DSP.power(psd_acausal_whitened)[valid_freqs_ac], 1e-30))
+        pow_causal_wh = 10 .* log10.(max.(DSP.power(psd_causal_whitened)[valid_freqs_c], 1e-30))
+        pow_whitened_combined = (pow_acausal_wh .+ pow_causal_wh[1:length(pow_acausal_wh)]) ./ 2
+
+        pow_whitened_filtered = pow_whitened_combined[period_mask_raw]
+
+        # Plot raw PSD
+        plt_psd = UnicodePlots.lineplot(
+            periods_filtered, pow_raw_filtered;
+            name="raw", xlabel="period (s)", ylabel="PSD (dB)",
+            title="$(pair_obj[1])-$(pair_obj[2])  PSD: raw vs whitened",
+            width=80, height=12,
+        )
+        # Overlay whitened PSD
+        UnicodePlots.lineplot!(plt_psd, periods_filtered, pow_whitened_filtered; name="whitened")
+        println(plt_psd)
     end
 
     cmd_inspect(ARGS[2:end])

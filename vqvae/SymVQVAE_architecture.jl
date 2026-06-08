@@ -33,6 +33,9 @@ end
 # ╔═╡ 330652f1-0754-48a4-9a0f-4fb9d6824222
 # Load version information
 include("version.jl")
+if !isdefined(@__MODULE__, :jld2_correlations)
+    include("io_utils.jl")
+end
 
 using Distances
 
@@ -1243,12 +1246,11 @@ function get_acausal_causal(pair::String, filepath::String)
     matches = filter(x -> occursin(pair, basename(x)), readdir(filepath, join=true))
     isempty(matches) && error("No JLD2 file matching pair $(pair) found in $(filepath).")
     jldfile = load(matches[1])
-    correlations = haskey(jldfile, "correlations") ? jldfile["correlations"] : jldfile["D"][1]
-    headers = haskey(jldfile, "headers") ? jldfile["headers"] : nothing
+    correlations = jld2_correlations(jldfile)
+    headers = jld2_headers(jldfile)
     latitudes = haskey(jldfile, "latitudes") ? Float64.(jldfile["latitudes"]) : nothing
     longitudes = haskey(jldfile, "longitudes") ? Float64.(jldfile["longitudes"]) : nothing
-    distance = haskey(jldfile, "dist") ? Float64(jldfile["dist"]) :
-        (haskey(jldfile, "Distances") ? Float64(jldfile["Distances"][1]) : nothing)
+    distance = jld2_distance(jldfile)
     return (; correlations, headers, distance, latitudes, longitudes)
 end
 
