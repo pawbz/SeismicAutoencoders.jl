@@ -81,7 +81,7 @@ Commands:
       --seeds LIST                  Seeds per model (default: "1234,1235")
       --periods MIN,MAX             Period range (default: 3,10s)
       --dt FLOAT                    Sample interval (default: 1.0s)
-      --K LIST                      Codebook sizes (default: "5,3")
+      --K LIST                      Codebook sizes, 1 or 2 stages (default: "5,3"; single-stage: "5")
       --d INT                       Latent dimension (default: 40)
       --n-filters INT               Encoder filters (default: 32)
       --ratios LIST                 Stride ratios (default: "2,5")
@@ -577,6 +577,7 @@ train [pairs] [options]
 
     seeds_vec  = parse.(Int, strip.(split(seeds, ",")))
     K_vec      = parse.(Int, strip.(split(K, ",")))
+    length(K_vec) in (1, 2) || error("--K must specify 1 or 2 codebook stages, e.g. \"5\" or \"5,3\". Got: $K")
     ratios_vec = parse.(Int, strip.(split(ratios, ",")))
     default_save_root = default_train_save_root(data_dir, K_vec, period_min, period_max)
 

@@ -1,6 +1,6 @@
 # Version utilities for SeismicAutoencoders
 
-const VERSION = "2026.06"
+const VERSION = "2026.06.1"
 
 function get_version()::String
     VERSION

@@ -567,6 +567,102 @@ begin
 	end
 end
 
+# ╔═╡ 1000000e-0000-0000-0000-000000000002
+md"## Single-Stage VQ"
+
+# ╔═╡ 1000000e-0000-0000-0000-000000000003
+begin
+	# Independent quantization of a single z_e — used when length(K)==1.
+	# Returns the same named-tuple shape as split_vq_quantize so all downstream
+	# code (losses, decode_from_latents) is uniform. z_q2 is a zero placeholder.
+	function single_vq_quantize(z_e1, rvq_state, K::Tuple;
+		beta_commit::Float32, ema_decay::Float32, epsilon::Float32,
+		dead_threshold::Int, training::Bool)
+
+		stage1 = rvq_state.stages[1]
+
+		_, idx1 = EnzymeCore.ignore_derivatives(vq_lookup(stage1.embedding, z_e1))
+		z_q1_det = EnzymeCore.ignore_derivatives(stage1.embedding[:, idx1])
+
+		z_q1 = z_e1 .+ EnzymeCore.ignore_derivatives(z_q1_det .- z_e1)
+
+		commit_loss = beta_commit * mse_loss(z_e1, z_q1_det)
+
+		new_stages = rvq_state.stages
+		counts1 = if training
+			new_s1, c1_loc = update_rvq_stage_state(stage1, z_e1, idx1,
+				ema_decay, epsilon, dead_threshold)
+			new_stages = replace_tuple(new_stages, 1, new_s1)
+			c1_loc
+		else
+			counts_and_sums(EnzymeCore.ignore_derivatives(z_e1), idx1, K[1])[1]
+		end
+
+		perp1, ent1, _ = probs_entropy(counts1)
+		z_q2 = EnzymeCore.ignore_derivatives(zero(z_q1))
+		stage_indices  = training ? nothing : reshape(idx1, 1, :)
+		coarse_indices = training ? nothing : reshape(idx1, 1, :)
+
+		return (;
+			z_q1, z_q2,
+			stage_indices,
+			coarse_indices,
+			commit_loss,
+			entropy_loss=ent1,
+			perplexity=perp1,
+			stage_perplexities=(training ? nothing : (perp1,)),
+		), (; stages=new_stages)
+	end
+
+	# CPU-side precomputation for single-stage: lookup + EMA, stores detached z_q.
+	function prepare_single_payload(z_e1, rvq_state, K::Tuple;
+		ema_decay::Float32, epsilon::Float32, dead_threshold::Int, training::Bool)
+
+		stages = rvq_state.stages
+		new_stages = stages
+
+		_, idx1 = vq_lookup(stages[1].embedding, z_e1)
+		z_q1_det = Float32.(stages[1].embedding[:, idx1])
+
+		counts1 = if training
+			new_s1, c1_loc = update_rvq_stage_state(stages[1], z_e1, idx1,
+				ema_decay, epsilon, dead_threshold)
+			new_stages = replace_tuple(new_stages, 1, new_s1)
+			c1_loc
+		else
+			counts_and_sums(z_e1, idx1, K[1])[1]
+		end
+
+		perp1, ent1, _ = probs_entropy(Float32.(counts1))
+		z_q2_det = zeros(Float32, size(z_q1_det)...)
+
+		payload = (;
+			z_q_stages=(z_q1_det, z_q2_det),
+			counts_stages=(Float32.(counts1), zeros(Float32, K[1])),
+			entropy_loss=Float32(ent1),
+			perplexity=Float32(perp1),
+		)
+		return payload, (; stages=new_stages)
+	end
+
+	# Compiled training step for single-stage: frozen lookup from payload, STE only.
+	function single_vq_quantize_precomputed(z_e1, payload, K::Tuple; beta_commit::Float32)
+		z_q1_det = EnzymeCore.ignore_derivatives(payload.z_q_stages[1])
+		z_q1 = z_e1 .+ EnzymeCore.ignore_derivatives(z_q1_det .- z_e1)
+		z_q2 = EnzymeCore.ignore_derivatives(zero(z_q1))
+		commit_loss = beta_commit * mse_loss(z_e1, z_q1_det)
+		return (;
+			z_q1, z_q2,
+			stage_indices=nothing,
+			coarse_indices=nothing,
+			commit_loss,
+			entropy_loss=EnzymeCore.ignore_derivatives(payload.entropy_loss),
+			perplexity=EnzymeCore.ignore_derivatives(payload.perplexity),
+			stage_perplexities=nothing,
+		)
+	end
+end
+
 # ╔═╡ 1000000e-0000-0000-0000-000000000001
 md"## SymVQVAE Model"
 
@@ -598,30 +694,45 @@ begin
 	end
 
 	function Lux.initialstates(rng::AbstractRNG, m::VQVAE)
+	    codebook_dim = length(m.K) == 1 ? m.d : m.d ÷ 2
 	    return (;
 	        encoder=Lux.initialstates(rng, m.encoder),
 	        head1=Lux.initialstates(rng, m.head1),
 	        head2=Lux.initialstates(rng, m.head2),
 	        decoder1=Lux.initialstates(rng, m.decoder1),
 	        decoder2=Lux.initialstates(rng, m.decoder2),
-	        rvq=init_rvq_state(rng, m.d ÷ 2, m.K),   # each codebook is (d÷2, K[s])
+	        rvq=init_rvq_state(rng, codebook_dim, m.K),
 	    )
 	end
 
 	function encoder_latents(m, x, ps, st)
 	    feat, st_enc = m.encoder(waveform_to_conv3(x), ps.encoder, st.encoder)
-	    z_e1, st_h1 = m.head1(feat, ps.head1, st.head1)   # (d÷2, B)
-	    z_e2, st_h2 = m.head2(feat, ps.head2, st.head2)   # (d÷2, B)
-	    z_e = vcat(z_e1, z_e2)                             # (d, B) — for kNN
-	    return (; feat, z_e, z_e1, z_e2),
-	           (; encoder=st_enc, head1=st_h1, head2=st_h2)
+	    z_e1, st_h1 = m.head1(feat, ps.head1, st.head1)
+	    if length(m.K) == 1
+	        # single-stage: head1 produces full d-dim latent; head2/z_e2 unused
+	        z_e = z_e1
+	        z_e2 = EnzymeCore.ignore_derivatives(zero(z_e1))
+	        return (; feat, z_e, z_e1, z_e2),
+	               (; encoder=st_enc, head1=st_h1, head2=st.head2)
+	    else
+	        z_e2, st_h2 = m.head2(feat, ps.head2, st.head2)
+	        z_e = vcat(z_e1, z_e2)                         # (d, B) — for kNN
+	        return (; feat, z_e, z_e1, z_e2),
+	               (; encoder=st_enc, head1=st_h1, head2=st_h2)
+	    end
 	end
 
 	function encode(m, ps, st, x; beta_commit::Float32=m.beta_commit, training::Bool=false)
 	    lat, st_lat = encoder_latents(m, x, ps, st)
-	    q, st_rvq = split_vq_quantize(lat.z_e1, lat.z_e2, st.rvq, m.K;
-	        beta_commit, ema_decay=m.ema_decay, epsilon=m.epsilon,
-	        dead_threshold=m.dead_threshold, training)
+	    q, st_rvq = if length(m.K) == 1
+	        single_vq_quantize(lat.z_e1, st.rvq, m.K;
+	            beta_commit, ema_decay=m.ema_decay, epsilon=m.epsilon,
+	            dead_threshold=m.dead_threshold, training)
+	    else
+	        split_vq_quantize(lat.z_e1, lat.z_e2, st.rvq, m.K;
+	            beta_commit, ema_decay=m.ema_decay, epsilon=m.epsilon,
+	            dead_threshold=m.dead_threshold, training)
+	    end
 	    st_new = (; encoder=st_lat.encoder, head1=st_lat.head1, head2=st_lat.head2,
 	        decoder1=st.decoder1, decoder2=st.decoder2, rvq=st_rvq)
 	    return merge(lat, q), st_new
@@ -639,11 +750,19 @@ begin
 	end
 
 	function decode_from_latents(m, ps, st, result)
-	    x1hat, st_dec1 = m.decoder1(result.z_q1, ps.decoder1, st.decoder1)
-	    x2hat, st_dec2 = m.decoder2(result.z_q2, ps.decoder2, st.decoder2)
-	    xhat = x1hat .+ x2hat
-	    st_new = merge(st, (; decoder1=st_dec1, decoder2=st_dec2))
-	    return merge(result, (; xhat, x1hat, x2hat)), st_new
+	    if length(m.K) == 1
+	        x1hat, st_dec1 = m.decoder1(result.z_q1, ps.decoder1, st.decoder1)
+	        xhat = x1hat
+	        x2hat = zero(x1hat)
+	        st_new = merge(st, (; decoder1=st_dec1))
+	        return merge(result, (; xhat, x1hat, x2hat)), st_new
+	    else
+	        x1hat, st_dec1 = m.decoder1(result.z_q1, ps.decoder1, st.decoder1)
+	        x2hat, st_dec2 = m.decoder2(result.z_q2, ps.decoder2, st.decoder2)
+	        xhat = x1hat .+ x2hat
+	        st_new = merge(st, (; decoder1=st_dec1, decoder2=st_dec2))
+	        return merge(result, (; xhat, x1hat, x2hat)), st_new
+	    end
 	end
 
 	function (m::VQVAE)(x, ps, st; beta_commit::Float32=m.beta_commit, training::Bool=true)
@@ -654,7 +773,11 @@ begin
 	function forward_with_precomputed_vq(m, x, ps, st, payload;
 	    beta_commit::Float32=m.beta_commit)
 	    lat, st_lat = encoder_latents(m, x, ps, st)
-	    q = split_vq_quantize_precomputed(lat.z_e1, lat.z_e2, payload, m.K; beta_commit)
+	    q = if length(m.K) == 1
+	        single_vq_quantize_precomputed(lat.z_e1, payload, m.K; beta_commit)
+	    else
+	        split_vq_quantize_precomputed(lat.z_e1, lat.z_e2, payload, m.K; beta_commit)
+	    end
 	    st_mid = (; encoder=st_lat.encoder, head1=st_lat.head1, head2=st_lat.head2,
 	        decoder1=st.decoder1, decoder2=st.decoder2, rvq=st.rvq)
 	    return decode_from_latents(m, ps, st_mid, merge(lat, q))
@@ -989,16 +1112,29 @@ begin
 	        rvq_cpu = st_cpu.rvq
 	    else
 	        z_e_cpu = Float32.(cdev(encode_compiled(model, ps, Lux.testmode(st), device(batch.x))))
-	        half = model.d ÷ 2
-	        z_e1_cpu = z_e_cpu[1:half, :]
-	        z_e2_cpu = z_e_cpu[half+1:end, :]
+	        if length(model.K) == 1
+	            z_e1_cpu = z_e_cpu
+	            z_e2_cpu = nothing
+	        else
+	            half = model.d ÷ 2
+	            z_e1_cpu = z_e_cpu[1:half, :]
+	            z_e2_cpu = z_e_cpu[half+1:end, :]
+	        end
 	        rvq_cpu = cdev(st.rvq)
 	    end
-	    payload_cpu, rvq_cpu = prepare_split_payload(z_e1_cpu, z_e2_cpu, rvq_cpu, model.K;
-	        ema_decay=para.ema_decay,
-	        epsilon=para.epsilon,
-	        dead_threshold=para.dead_threshold,
-	        training=true)
+	    payload_cpu, rvq_cpu = if length(model.K) == 1
+	        prepare_single_payload(z_e1_cpu, rvq_cpu, model.K;
+	            ema_decay=para.ema_decay,
+	            epsilon=para.epsilon,
+	            dead_threshold=para.dead_threshold,
+	            training=true)
+	    else
+	        prepare_split_payload(z_e1_cpu, z_e2_cpu, rvq_cpu, model.K;
+	            ema_decay=para.ema_decay,
+	            epsilon=para.epsilon,
+	            dead_threshold=para.dead_threshold,
+	            training=true)
+	    end
 	    st_dev = merge(st, (; rvq=device(rvq_cpu)))
 	    payload_time = time() - payload_start
 	    return merge(bdev, (; vq_payload=device(payload_cpu))), st_dev, (; target_time, pack_time, payload_time)
@@ -1981,28 +2117,40 @@ end
 function decode_codebook_waveforms(model, ps, st; cdev=default_cdev())
     ps_cpu = cdev(ps)
     st_cpu = Lux.testmode(cdev(st))
-    embeddings = [Array(stage.embedding) for stage in st_cpu.rvq.stages]  # [(d÷2,K1), (d÷2,K2)]
+    embeddings = [Array(stage.embedding) for stage in st_cpu.rvq.stages]
 
-    K1, K2 = model.K[1], model.K[2]
-    e1 = embeddings[1]   # (d÷2, K1)
+    K1 = model.K[1]
+    e1 = embeddings[1]   # (d or d÷2, K1)
+
+    # stage-1: decoder1 applied to each K1 codebook vector
+    Z1_all = Float32.(e1)
+    result1 = (; z_q1=Z1_all, z_q2=zeros(Float32, size(e1, 1), K1))
+    out1, _ = decode_from_latents(model, ps_cpu, st_cpu, result1)
+    stage1_waves = Array(out1.x1hat)   # (nt, K1)
+
+    if length(model.K) == 1
+        return (;
+            joint=Float32[;;],
+            stage1=stage1_waves,
+            stage2=Float32[;;],
+            joint_labels=String[],
+            stage1_labels=["s1=$k" for k in 1:K1],
+            stage2_labels=String[],
+        )
+    end
+
+    K2 = model.K[2]
     e2 = embeddings[2]   # (d÷2, K2)
 
-    # stage-1 marginal: decoder1 applied to each K1 codebook vector
-    Z1_all = Float32.(e1)   # (d÷2, K1)
-    result1 = (; z_q1=Z1_all, z_q2=zeros(Float32, model.d÷2, K1))
-    out1, _ = decode_from_latents(model, ps_cpu, st_cpu, result1)
-    stage1_waves = Array(out1.x1hat)   # (nt, K1) — decoder1 contribution only
-
     # stage-2 marginal: decoder2 applied to each K2 codebook vector
-    Z2_all = Float32.(e2)   # (d÷2, K2)
+    Z2_all = Float32.(e2)
     result2 = (; z_q1=zeros(Float32, model.d÷2, K2), z_q2=Z2_all)
     out2, _ = decode_from_latents(model, ps_cpu, st_cpu, result2)
-    stage2_waves = Array(out2.x2hat)   # (nt, K2) — decoder2 contribution only
+    stage2_waves = Array(out2.x2hat)   # (nt, K2)
 
     # joint: additive combination of all K1*K2 pairs
-    n_joint = K1 * K2
-    Z1_rep = hcat([e1[:, k1] for k2 in 1:K2 for k1 in 1:K1]...)   # (d÷2, n_joint)
-    Z2_rep = hcat([e2[:, k2] for k2 in 1:K2 for k1 in 1:K1]...)   # (d÷2, n_joint)
+    Z1_rep = hcat([e1[:, k1] for k2 in 1:K2 for k1 in 1:K1]...)   # (d÷2, K1*K2)
+    Z2_rep = hcat([e2[:, k2] for k2 in 1:K2 for k1 in 1:K1]...)   # (d÷2, K1*K2)
     result_joint = (; z_q1=Float32.(Z1_rep), z_q2=Float32.(Z2_rep))
     out_joint, _ = decode_from_latents(model, ps_cpu, st_cpu, result_joint)
     joint_waves = Array(out_joint.xhat)   # (nt, K1*K2)
@@ -2276,9 +2424,10 @@ end
 
 # ╔═╡ 10000010-0000-0000-0000-000000000001
 function get_vqvae(para; rng=Random.default_rng(), device=identity)
-    length(para.K) == 2 || error("SymVQVAE requires exactly 2 codebook stages (length(K) must be 2). Got K=$(para.K).")
+    length(para.K) in (1, 2) || error("SymVQVAE supports 1 or 2 codebook stages. Got K=$(para.K).")
     all(>(1), para.K) || error("All K entries must be > 1.")
-    iseven(para.d) || error("d must be even for SymVQVAE split heads. Got d=$(para.d).")
+    length(para.K) == 2 && !iseven(para.d) &&
+        error("d must be even for 2-stage SymVQVAE split heads. Got d=$(para.d).")
     Random.seed!(rng, para.seed)
 
     encoder = make_encoder(para)
@@ -2288,13 +2437,23 @@ function get_vqvae(para; rng=Random.default_rng(), device=identity)
     latent_len, enc_channels, _ = size(enc_dummy)
 
     head1 = make_encoder_head(para, latent_len, enc_channels)
-    head2 = make_encoder_head(para, latent_len, enc_channels)
-    decoder1 = make_decoder(para, latent_len; latent_dim=para.d ÷ 2)
-    decoder2 = make_decoder(para, latent_len; latent_dim=para.d ÷ 2)
-    ps_dec1, st_dec1 = Lux.setup(rng, decoder1)
-    dec_dummy, _ = decoder1(randn(rng, Float32, para.d ÷ 2, 2), ps_dec1, Lux.testmode(st_dec1))
-    size(dec_dummy, 1) == para.nt ||
-        error("Decoder geometry mismatch: output length $(size(dec_dummy, 1)) != nt $(para.nt). Adjust decoder strides/kernels.")
+    if length(para.K) == 1
+        head2    = Lux.NoOpLayer()
+        decoder1 = make_decoder(para, latent_len; latent_dim=para.d)
+        decoder2 = Lux.NoOpLayer()
+        ps_dec1, st_dec1 = Lux.setup(rng, decoder1)
+        dec_dummy, _ = decoder1(randn(rng, Float32, para.d, 2), ps_dec1, Lux.testmode(st_dec1))
+        size(dec_dummy, 1) == para.nt ||
+            error("Decoder geometry mismatch: output length $(size(dec_dummy, 1)) != nt $(para.nt). Adjust decoder strides/kernels.")
+    else
+        head2    = make_encoder_head(para, latent_len, enc_channels)
+        decoder1 = make_decoder(para, latent_len; latent_dim=para.d ÷ 2)
+        decoder2 = make_decoder(para, latent_len; latent_dim=para.d ÷ 2)
+        ps_dec1, st_dec1 = Lux.setup(rng, decoder1)
+        dec_dummy, _ = decoder1(randn(rng, Float32, para.d ÷ 2, 2), ps_dec1, Lux.testmode(st_dec1))
+        size(dec_dummy, 1) == para.nt ||
+            error("Decoder geometry mismatch: output length $(size(dec_dummy, 1)) != nt $(para.nt). Adjust decoder strides/kernels.")
+    end
     model = VQVAE(encoder, head1, head2, decoder1, decoder2, Tuple(Int.(para.K)),
         para.d, latent_len,
         para.beta_commit, para.ema_decay,
@@ -2303,7 +2462,7 @@ function get_vqvae(para; rng=Random.default_rng(), device=identity)
     ps, st = (ps, st) |> device
 
     loss_history = fresh_loss_history()
-    @info "SymVQVAE geometry" nt=para.nt d=para.d half=para.d÷2 latent_len K=para.K enc_channels
+    @info "SymVQVAE geometry" nt=para.nt d=para.d stages=length(para.K) latent_len K=para.K enc_channels
     return model, ps, st, loss_history
 end
 

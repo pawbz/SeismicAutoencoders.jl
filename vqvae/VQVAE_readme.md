@@ -1,5 +1,26 @@
 # VQVAE Architecture Notes
 
+## Current model: SymVQVAE (v2026.06.1+)
+
+The active training script is `symvqvae.jl` with architecture in `SymVQVAE_architecture.jl`.
+
+### Codebook stages (--K)
+
+SymVQVAE supports **1 or 2 codebook stages**, controlled by `--K`:
+
+- `--K 5,3` — **2-stage split-decoder** (default): two encoder heads produce z_e1 and z_e2 each of dimension `d÷2`. Each half is quantized by its own independent codebook (K1=5, K2=3). Two decoders reconstruct from each quantized half and their outputs are summed: `xhat = decoder1(z_q1) + decoder2(z_q2)`. Analysis produces K1×K2=15 joint states.
+
+- `--K 5` — **1-stage**: one encoder head produces a full `d`-dimensional latent, quantized by a single codebook of size 5. One decoder reconstructs directly. Analysis produces 5 states with no joint decomposition.
+
+The single-stage model is simpler and may be preferred when you want a single discrete bottleneck without the additive split structure.
+
+### Key parameters
+
+- `--d`: latent dimension. For 2-stage this is split as d÷2 per head. For 1-stage the full d is used for the single codebook.
+- `--K`: codebook size(s). 1 or 2 comma-separated integers.
+
+---
+
 This document summarizes the evolution of the seismic VQVAE code and the current design intent.
 
 ## Scientific objective
