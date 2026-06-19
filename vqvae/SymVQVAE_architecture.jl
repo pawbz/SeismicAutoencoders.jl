@@ -2410,15 +2410,15 @@ function train_selected_pairs_lazy(selected_pairs, compiled_model;
 end
 
 # ╔═╡ a1b2c3d5-0000-0000-0000-000000000001
-function make_encoder_head(para, latent_len::Int, enc_channels::Int)
+function make_encoder_head(para, latent_len::Int, enc_channels::Int; latent_dim::Int=para.d ÷ 2)
     conv = Conv((3,), enc_channels => enc_channels, activation; pad=SamePad())
-    dense = Dense(latent_len * enc_channels, para.d ÷ 2)
+    dense = Dense(latent_len * enc_channels, latent_dim)
     return @compact(; conv, dense, latent_len, enc_channels) do feat
         # feat: (L, C, B)
         y = conv(feat)                                              # (L, C, B)
         B = size(feat, 3)
         y_flat = reshape(permutedims(y, (2, 1, 3)), enc_channels * latent_len, B)
-        @return dense(y_flat)                                       # (d÷2, B)
+        @return dense(y_flat)                                       # (latent_dim, B)
     end
 end
 
@@ -2436,8 +2436,8 @@ function get_vqvae(para; rng=Random.default_rng(), device=identity)
     enc_dummy, _ = encoder(waveform_to_conv3(dummy), ps_enc, Lux.testmode(st_enc))
     latent_len, enc_channels, _ = size(enc_dummy)
 
-    head1 = make_encoder_head(para, latent_len, enc_channels)
     if length(para.K) == 1
+        head1    = make_encoder_head(para, latent_len, enc_channels; latent_dim=para.d)
         head2    = Lux.NoOpLayer()
         decoder1 = make_decoder(para, latent_len; latent_dim=para.d)
         decoder2 = Lux.NoOpLayer()
@@ -2446,7 +2446,8 @@ function get_vqvae(para; rng=Random.default_rng(), device=identity)
         size(dec_dummy, 1) == para.nt ||
             error("Decoder geometry mismatch: output length $(size(dec_dummy, 1)) != nt $(para.nt). Adjust decoder strides/kernels.")
     else
-        head2    = make_encoder_head(para, latent_len, enc_channels)
+        head1    = make_encoder_head(para, latent_len, enc_channels; latent_dim=para.d ÷ 2)
+        head2    = make_encoder_head(para, latent_len, enc_channels; latent_dim=para.d ÷ 2)
         decoder1 = make_decoder(para, latent_len; latent_dim=para.d ÷ 2)
         decoder2 = make_decoder(para, latent_len; latent_dim=para.d ÷ 2)
         ps_dec1, st_dec1 = Lux.setup(rng, decoder1)
