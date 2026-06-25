@@ -100,9 +100,9 @@ Base.@kwdef struct VQVAE_Training_Para
     initial_learning_rate::Float64 = 0.001
     weight_decay::Float64 = 0.0
     stop_on_recon_loss::Union{Nothing,Float64} = nothing
-    Mnn_schedule::Vector{Tuple{Int,Int}} = [(1, 5), (6, 10), (26, 25)]
+    Mnn_fraction::Float64 = 0.05
     warmup_epochs::Int = 5
-    index_refresh_every::Int = 1
+    index_refresh_every::Int = 4  # optimizer steps between latent-index/ensemble-target rebuilds
     autodiff_backend::Symbol = :auto
     normalize_target::Bool = true
     verbose::Bool = false
@@ -995,20 +995,16 @@ function build_ensemble_targets(X, idx::LatentIndex, batch_indices::AbstractVect
 end
 
 # ╔═╡ 2ee07196-8b28-418c-a0d4-40866584bc6f
-function ensemble_phase(epoch::Int, training_para::VQVAE_Training_Para)
+function ensemble_phase(epoch::Int, N::Int, training_para::VQVAE_Training_Para)
     post_epoch = epoch - training_para.warmup_epochs
     post_epoch <= 0 && return (; post_epoch=0, Mnn=0)
-    phase = training_para.Mnn_schedule[1]
-    for candidate in training_para.Mnn_schedule
-        candidate[1] <= post_epoch || break
-        phase = candidate
-    end
-    return (; post_epoch, Mnn=phase[2])
+    Mnn = max(1, round(Int, training_para.Mnn_fraction * N))
+    return (; post_epoch, Mnn)
 end
 
-# ╔═╡ 5c9d71d1-c6a6-4968-814d-66506a78b516
-max_Mnn(training_para::VQVAE_Training_Para) =
-    maximum(p[2] for p in training_para.Mnn_schedule)
+# ╔═╡ 5c9d71d1-c6a6-4968-814d-66506a8b516
+max_Mnn(N::Int, training_para::VQVAE_Training_Para) =
+    max(1, round(Int, training_para.Mnn_fraction * N))
 
 # ╔═╡ 10000013-0000-0000-0000-000000000001
 md"## Training"
@@ -1040,7 +1036,7 @@ end
 begin
 	function batch_with_target(batch, X_cpu, idx::Union{Nothing,LatentIndex},
 	    epoch::Int, training_para::VQVAE_Training_Para; device=identity)
-	    phase = ensemble_phase(epoch, training_para)
+	    phase = ensemble_phase(epoch, size(X_cpu, 2), training_para)
 	    target = if phase.post_epoch == 0 || isnothing(idx)
 	        batch.x
 	    else
@@ -1051,7 +1047,7 @@ begin
 	
 	function make_batch_target(batch, X_cpu, idx::Union{Nothing,LatentIndex},
 	    epoch::Int, training_para::VQVAE_Training_Para, ensemble_targets_cpu::Union{Nothing,AbstractMatrix}=nothing)
-	    phase = ensemble_phase(epoch, training_para)
+	    phase = ensemble_phase(epoch, size(X_cpu, 2), training_para)
 	    if phase.post_epoch == 0 || isnothing(idx)
 	        return batch.x
 	    end
@@ -1750,7 +1746,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
     end
     loss_fn = VQVAELoss(para)
     ad_backend = training_backend(training_para, device)
-    idx = LatentIndex(max_Mnn(training_para))
+    idx = LatentIndex(max_Mnn(size(train_x_cpu, 2), training_para))
     last_index_Mnn = 0
     ensemble_targets_cpu = nothing
     test_eval_x_cpu = test_x_cpu[:, 1:min(512, size(test_x_cpu, 2))]
@@ -1772,11 +1768,28 @@ function update(model, ps, st, loss_history, train_data, test_data,
     end
     training_para.verbose && @info "Prepared SymVQVAE update loop" setup_time_s=round(time() - setup_start; digits=3) N=size(train_x_cpu, 2) batchsize=training_para.batchsize compiled_helpers=!isnothing(compiled)
 
+    function maybe_rebuild_latent_index!(phase)
+        index_start = time()
+        training_para.verbose && @info "Rebuilding latent index" post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn N=size(train_x_cpu, 2) steps_since_last_rebuild
+        rebuild_latent_index!(idx, train_state.model, train_state.parameters, train_state.states, train_x_cpu;
+            Mnn=phase.Mnn, device, cdev,
+            encode_compiled=inference_compiled.encode_z_e,
+            knn_search_chunk_size_fraction=training_para.knn_search_chunk_size_fraction,
+            n_compiled)
+        latent_index_time = time() - index_start
+        target_cache_start = time()
+        ensemble_targets_cpu = build_ensemble_targets(train_x_cpu, idx, 1:size(train_x_cpu, 2); Mnn=phase.Mnn)
+        target_cache_time = time() - target_cache_start
+        last_index_Mnn = phase.Mnn
+        steps_since_last_rebuild = 0
+        training_para.verbose && @info "Rebuilt latent index" post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn latent_index_time_s=round(latent_index_time; digits=3) ensemble_target_cache_time_s=round(target_cache_time; digits=3)
+    end
+
+    steps_since_last_rebuild = 0
     pbar_epochs = Progress(training_para.nepoch; desc="Epochs", showspeed=true)
     for epoch in 1:training_para.nepoch
-        phase = ensemble_phase(epoch, training_para)
-        if phase.post_epoch > 0 &&
-           (phase.Mnn != last_index_Mnn || mod(phase.post_epoch - 1, training_para.index_refresh_every) == 0)
+        phase = ensemble_phase(epoch, size(train_x_cpu, 2), training_para)
+        if phase.post_epoch > 0 && phase.Mnn != last_index_Mnn
             if isnothing(inference_compiled.encode_z_e)
                 if !compile_missing && device isa ReactantDevice
                     error("Latent-index rebuild requires compiled.encode_z_e on Reactant. Recompile with compile_vqvae_helpers or pass compile_missing=true.")
@@ -1797,19 +1810,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
                     )
                 end
             end
-            index_start = time()
-            training_para.verbose && @info "Rebuilding latent index before epoch batches" epoch post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn N=size(train_x_cpu, 2)
-            rebuild_latent_index!(idx, train_state.model, train_state.parameters, train_state.states, train_x_cpu;
-                Mnn=phase.Mnn, device, cdev,
-                encode_compiled=inference_compiled.encode_z_e,
-                knn_search_chunk_size_fraction=training_para.knn_search_chunk_size_fraction,
-                n_compiled)
-            latent_index_time = time() - index_start
-            target_cache_start = time()
-            ensemble_targets_cpu = build_ensemble_targets(train_x_cpu, idx, 1:size(train_x_cpu, 2); Mnn=phase.Mnn)
-            target_cache_time = time() - target_cache_start
-            last_index_Mnn = phase.Mnn
-            training_para.verbose && @info "Rebuilt latent index" epoch post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn latent_index_time_s=round(latent_index_time; digits=3) ensemble_target_cache_time_s=round(target_cache_time; digits=3)
+            maybe_rebuild_latent_index!(phase)
         end
 
         batches = make_batches(train_x_cpu, training_para.batchsize)
@@ -1858,6 +1859,10 @@ function update(model, ps, st, loss_history, train_data, test_data,
                 commit_loss=stats.commit_loss, entropy_loss=stats.entropy_loss,
                 perplexity=stats.perplexity))
             nbatches_seen += 1
+            steps_since_last_rebuild += 1
+            if phase.post_epoch > 0 && steps_since_last_rebuild >= training_para.index_refresh_every
+                maybe_rebuild_latent_index!(phase)
+            end
             next!(pbar)
         end
         # One device→CPU sync: sum scalars on-device across all batches, then transfer

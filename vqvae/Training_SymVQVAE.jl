@@ -148,12 +148,12 @@ training_para = vqvae.VQVAE_Training_Para(
     nepoch=100,
     initial_learning_rate=0.001,
     weight_decay=0.0,
-    Mnn_schedule=[(1, 128), (5, 256), (26, 256)],
+    Mnn_fraction=0.02,
     warmup_epochs=0,
 	verbose = true,
 	autodiff_backend = :auto,
 	knn_search_chunk_size_fraction = 0.25,
-    index_refresh_every=2,
+    index_refresh_every=4,  # optimizer steps between latent-index/ensemble-target rebuilds
 )
 
 # ╔═╡ 1000000c-0000-0000-0000-000000000003

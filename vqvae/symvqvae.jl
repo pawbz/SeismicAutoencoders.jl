@@ -662,11 +662,11 @@ train [pairs] [options]
         nepoch,
         initial_learning_rate=lr,
         autodiff_backend=Symbol(autodiff_backend),
-        Mnn_schedule=[(1, 128), (5, 256), (26, 256)],
+        Mnn_fraction=0.02,
         warmup_epochs=0,
         verbose,
         knn_search_chunk_size_fraction=0.25,
-        index_refresh_every=2,
+        index_refresh_every=4,  # optimizer steps between latent-index/ensemble-target rebuilds
     )
 
     bp_filter = let
