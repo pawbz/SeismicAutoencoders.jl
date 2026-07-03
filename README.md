@@ -23,7 +23,8 @@ SeismicAutoencoders/
 │   ├── symvqvae.sh                Launcher (background/foreground)
 │   ├── train_vqvae.jl             Legacy CLI (deprecated)
 │   ├── train_vqvae.sh             Legacy launcher (deprecated)
-│   ├── data_generators.jl         Data loading and preprocessing
+│   ├── io_utils.jl                JLD2/HDF5 file I/O and station-pair discovery
+│   ├── data_generators.jl         Batch/data-iterator machinery for training loops
 │   ├── Prepare_Tomography_v9.jl   Post-training tomography preparation
 │   ├── TomographySelection_v9.jl  Station-pair selection for tomography
 │   ├── VQVAE_readme.md            Detailed architecture evolution notes (v1→v9)
@@ -250,12 +251,48 @@ julia --project=. vqvae/symvqvae.jl train --data-dir /path/to/data --nepoch 100 
 
 ## Data format
 
-Input data is expected as **JLD2 files**, one per station pair, in the directory passed
-to `--data-dir`. File names must follow the pattern `NET1_STA1_NET2_STA2*.jld2`.
+Input data is expected as **JLD2 or HDF5 (`.h5`) files**, one per station pair, in the
+directory passed to `--data-dir`. File names must follow the pattern
+`NET1_STA1_NET2_STA2*.{jld2,h5}`. The two formats can be mixed in the same directory —
+`list-pairs`, `inspect`, and `train` all discover and load either transparently.
 
 Each file contains ambient noise cross-correlations (causal and acausal sides) for that
-station pair. The `data_generators.jl` module handles loading, normalisation, tapering,
-bandpass filtering, and train/test splitting.
+station pair. File I/O and format dispatch live in `io_utils.jl`; normalisation, tapering,
+bandpass filtering, and train/test splitting happen in `build_training_bundle` and
+`make_pooled_split` (`SymVQVAE_architecture.jl`).
+
+**JLD2 schema** (one of two supported key sets):
+
+| Concept | Primary keys | Legacy keys |
+|---|---|---|
+| Waveform matrix | `correlations` (nt × n_waveforms) | `D` |
+| Distance (km) | `dist` | `Distances` |
+| Headers | `headers` (optional) | — |
+| Station coordinates | `latitudes`, `longitudes` (optional) | — |
+
+**HDF5 schema:**
+
+```
+Datasets:
+  D        Float32 matrix, shape (nt, n_waveforms) on disk
+  headers  String vector, shape (n_waveforms,) — e.g. per-window source filename
+
+Attributes (on the root group):
+  sta1, sta2               station codes
+  distance_km               interstation distance (km)
+  lat1, lon1, lat2, lon2    station coordinates
+  sampling_rate              sampling rate in Hz (dt = 1/sampling_rate seconds)
+```
+
+Neither format stores `dt` as a direct, unambiguous field the pipeline consumes
+automatically: JLD2 files carry no sampling-rate metadata at all, and the HDF5
+`sampling_rate` attribute is informational only — it is not read back into the pipeline.
+**Always pass `--dt` and `--periods` explicitly to match your data's actual sample
+interval** (e.g. `--dt 50 --periods 150,400` for hum/microseism data sampled at 0.02 Hz).
+`inspect` prints the file's `sampling_rate`-derived `dt` alongside the `--dt` you passed so
+you can catch a mismatch before training, and both `train` and `inspect` reject
+`--periods`/`--dt` combinations where `--periods` min doesn't clear the Nyquist period
+(`2 * dt`).
 
 ---
 
