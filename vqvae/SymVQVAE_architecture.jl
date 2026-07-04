@@ -1375,13 +1375,14 @@ end
 
 # ╔═╡ a1e5a8cb-0bd1-44b8-8cd4-c95a667d830d
 function get_acausal_causal(pair::String, filepath::String)
-    matches = filter(x -> occursin(pair, basename(x)), readdir(filepath, join=true))
-    isempty(matches) && error("No JLD2 file matching pair $(pair) found in $(filepath).")
-    jldfile = load(matches[1])
+    matches = filter(readdir(filepath, join=true)) do x
+        occursin(pair, basename(x)) && (endswith(x, ".jld2") || endswith(x, ".h5"))
+    end
+    isempty(matches) && error("No JLD2/HDF5 file matching pair $(pair) found in $(filepath).")
+    jldfile = load_pair_file(matches[1])
     correlations = jld2_correlations(jldfile)
     headers = jld2_headers(jldfile)
-    latitudes = haskey(jldfile, "latitudes") ? Float64.(jldfile["latitudes"]) : nothing
-    longitudes = haskey(jldfile, "longitudes") ? Float64.(jldfile["longitudes"]) : nothing
+    latitudes, longitudes = jld2_latlon(jldfile)
     distance = jld2_distance(jldfile)
     return (; correlations, headers, distance, latitudes, longitudes)
 end

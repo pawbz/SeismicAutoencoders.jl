@@ -52,6 +52,15 @@ function parse_period_range(periods::AbstractString)
     period_min, period_max
 end
 
+function check_nyquist(period_min::Real, dt::Real)
+    nyquist_period = 2 * dt
+    period_min <= nyquist_period && error(
+        "--periods min ($(period_min)s) must exceed the Nyquist period (2*dt = " *
+        "$(nyquist_period)s) for --dt=$(dt)s. Did you forget to set --dt for this data source?"
+    )
+    nothing
+end
+
 # Check for help/info flags BEFORE loading expensive packages
 if isempty(ARGS) || ARGS[1] in ("--help", "-h")
     println("""
@@ -72,7 +81,7 @@ Commands:
       pairs    Comma-separated pairs e.g. "AP-BK,AP-CL" (default: all)
 
     Options:
-      --data-dir DIR                JLD2 files directory (default: pwd)
+      --data-dir DIR                JLD2/HDF5 files directory (default: pwd)
       --save-dir DIR                Output directory
       --nepoch INT                  Training epochs (default: 100)
       --batchsize INT               Minibatch size (default: 4096)
@@ -98,7 +107,7 @@ Commands:
       PAIR    Station pair e.g. "AP-BK" or "AP_BK"
 
     Options:
-      --data-dir DIR                JLD2 files directory (default: pwd)
+      --data-dir DIR                JLD2/HDF5 files directory (default: pwd)
       --periods MIN,MAX             Period range (default: 3,10s)
       --dt FLOAT                    Sample interval (default: 1.0s)
       --whitening-kernel-length INT FIR taps for whitening (default: 128)
@@ -107,7 +116,7 @@ Commands:
     List all station pairs found in the data directory. Fast — no GPU/model loading.
 
     Options:
-      --data-dir DIR                JLD2 files directory (default: pwd)
+      --data-dir DIR                JLD2/HDF5 files directory (default: pwd)
 
   --help, -h
     Show this help message
@@ -159,7 +168,7 @@ inspect PAIR [options]
     PAIR    Station pair e.g. "AP-BK" or "AP_BK"
 
   Options:
-    --data-dir DIR                JLD2 files directory (default: pwd)
+    --data-dir DIR                JLD2/HDF5 files directory (default: pwd)
     --periods MIN,MAX             Period range (default: 3,10s)
     --dt FLOAT                    Sample interval (default: 1.0s)
     --whitening-kernel-length INT FIR taps for whitening (default: 128)
@@ -192,13 +201,15 @@ inspect PAIR [options]
             i += 1
         end
 
+        check_nyquist(period_min, dt)
+
         all_pairs = list_station_pairs(data_dir)
         if isempty(all_pairs)
-            jld2_files = filter(f -> endswith(f, ".jld2"), readdir(data_dir))
-            if isempty(jld2_files)
-                error("No .jld2 files found in $(data_dir)")
+            data_files = filter(f -> endswith(f, ".jld2") || endswith(f, ".h5"), readdir(data_dir))
+            if isempty(data_files)
+                error("No .jld2/.h5 files found in $(data_dir)")
             else
-                error("No station pair files matching pattern STATION_STATION.jld2 found in $(data_dir). Found: $(join(jld2_files, ", "))")
+                error("No station pair files matching pattern STATION_STATION.{jld2,h5} found in $(data_dir). Found: $(join(data_files, ", "))")
             end
         end
 
@@ -225,20 +236,23 @@ inspect PAIR [options]
         println("="^80 * "\n")
 
         all_files = readdir(data_dir, join=true)
-        jld2_files = filter(f -> endswith(f, ".jld2") && startswith(basename(f), "$(pair_obj[1])_$(pair_obj[2])"), all_files)
-
-        if isempty(jld2_files)
-            error("No JLD2 file found for pair $(pair_obj[1])-$(pair_obj[2])")
+        data_files = filter(all_files) do f
+            (endswith(f, ".jld2") || endswith(f, ".h5")) &&
+                startswith(basename(f), "$(pair_obj[1])_$(pair_obj[2])")
         end
 
-        jld2_file = jld2_files[1]
-        println("File: $(basename(jld2_file))")
+        if isempty(data_files)
+            error("No JLD2/HDF5 file found for pair $(pair_obj[1])-$(pair_obj[2])")
+        end
 
-        jld2_data = JLD2.load(jld2_file)
+        data_file = data_files[1]
+        println("File: $(basename(data_file))")
 
-        # Handle supported JLD2 schemas:
-        # - correlations, dist
-        # - D, Distances
+        jld2_data = load_pair_file(data_file)
+
+        # Handle supported schemas:
+        # JLD2: correlations/dist, D/Distances
+        # HDF5: D dataset, distance_km/sampling_rate/lat1,lon1,lat2,lon2 attrs
         correlations = jld2_correlations(jld2_data)
         nt = size(correlations, 1)
         n_waveforms = size(correlations, 2)
@@ -253,13 +267,16 @@ inspect PAIR [options]
             println("  Interstation distance: $dist_km km")
         end
 
-        if haskey(jld2_data, "latitudes") && haskey(jld2_data, "longitudes")
-            lats = jld2_data["latitudes"]
-            lons = jld2_data["longitudes"]
-            if length(lats) >= 2 && length(lons) >= 2
-                println("  Station $(pair_obj[1]): lat=$(lats[1]), lon=$(lons[1])")
-                println("  Station $(pair_obj[2]): lat=$(lats[2]), lon=$(lons[2])")
-            end
+        file_dt = jld2_dt(jld2_data)
+        if !isnothing(file_dt)
+            agree = isapprox(file_dt, dt) ? "matches --dt" : "DIFFERS from --dt=$(dt)s — pass --dt $(file_dt) to match the file"
+            println("  File sample interval: $file_dt s ($agree)")
+        end
+
+        lats, lons = jld2_latlon(jld2_data)
+        if !isnothing(lats) && !isnothing(lons) && length(lats) >= 2 && length(lons) >= 2
+            println("  Station $(pair_obj[1]): lat=$(lats[1]), lon=$(lons[1])")
+            println("  Station $(pair_obj[2]): lat=$(lats[2]), lon=$(lons[2])")
         end
 
         # Split acausal (negative lags) and causal (positive lags) sides
@@ -461,7 +478,7 @@ train [pairs] [options]
     pairs    Comma-separated pairs e.g. "AP-BK,AP-CL" (default: all)
 
   Options:
-    --data-dir DIR                JLD2 files directory (default: pwd)
+    --data-dir DIR                JLD2/HDF5 files directory (default: pwd)
     --save-dir DIR                Output directory
     --nepoch INT                  Training epochs (default: 100)
     --batchsize INT               Minibatch size (default: 4096)
@@ -574,6 +591,8 @@ train [pairs] [options]
         end
         i += 1
     end
+
+    pairs != "TEST" && check_nyquist(period_min, dt)
 
     seeds_vec  = parse.(Int, strip.(split(seeds, ",")))
     K_vec      = parse.(Int, strip.(split(K, ",")))
