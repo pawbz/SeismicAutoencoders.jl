@@ -96,6 +96,8 @@ Commands:
       --ratios LIST                 Stride ratios (default: "2,5")
       --n-residual-layers INT       Residual blocks (default: 3)
       --entropy-weight FLOAT        Entropy weight (default: 0.1)
+      --Mnn-fraction FLOAT          Fraction of neighbors for ensemble targets (default: 0.02)
+      --index-refresh-every INT     Optimizer steps between latent-index rebuilds (default: 4)
       --whitening-kernel-length INT FIR taps (default: 128)
       --autodiff-backend STR        "zygote", "enzyme", "auto" (default: "auto")
       --verbose, -v                 Print per-epoch metrics
@@ -493,6 +495,8 @@ train [pairs] [options]
     --ratios LIST                 Stride ratios (default: "2,5")
     --n-residual-layers INT       Residual blocks (default: 3)
     --entropy-weight FLOAT        Entropy weight (default: 0.1)
+    --Mnn-fraction FLOAT          Fraction of neighbors for ensemble targets (default: 0.02)
+    --index-refresh-every INT     Optimizer steps between latent-index rebuilds (default: 4)
     --whitening-kernel-length INT FIR taps (default: 128)
     --autodiff-backend STR        "zygote", "enzyme", "auto" (default: "auto")
     --verbose, -v                 Print per-epoch metrics
@@ -517,6 +521,8 @@ train [pairs] [options]
     ratios = "2,5"
     n_residual_layers = 3
     entropy_weight = 0.1
+    Mnn_fraction = 0.02
+    index_refresh_every = 4
     whitening_kernel_length = 128
     autodiff_backend = "auto"
     verbose = false
@@ -569,6 +575,12 @@ train [pairs] [options]
         elseif a == "--entropy-weight"
             i += 1
             i <= length(args) && (entropy_weight = parse(Float64, args[i]))
+        elseif a == "--Mnn-fraction"
+            i += 1
+            i <= length(args) && (Mnn_fraction = parse(Float64, args[i]))
+        elseif a == "--index-refresh-every"
+            i += 1
+            i <= length(args) && (index_refresh_every = parse(Int, args[i]))
         elseif a == "--whitening-kernel-length"
             i += 1
             i <= length(args) && (whitening_kernel_length = parse(Int, args[i]))
@@ -620,6 +632,8 @@ train [pairs] [options]
     println("Stride ratios:               $ratios")
     println("Residual layers:             $n_residual_layers")
     println("Entropy weight:              $entropy_weight")
+    println("Mnn fraction:                $Mnn_fraction")
+    println("Index refresh every:         $index_refresh_every")
     println("Whitening kernel length:     $whitening_kernel_length")
     println("Autodiff backend:            $autodiff_backend")
     println("Verbose output:              $(verbose ? "yes" : "no")")
@@ -681,11 +695,11 @@ train [pairs] [options]
         nepoch,
         initial_learning_rate=lr,
         autodiff_backend=Symbol(autodiff_backend),
-        Mnn_fraction=0.02,
+        Mnn_fraction,
         warmup_epochs=0,
         verbose,
         knn_search_chunk_size_fraction=0.25,
-        index_refresh_every=4,  # optimizer steps between latent-index/ensemble-target rebuilds
+        index_refresh_every,  # optimizer steps between latent-index/ensemble-target rebuilds
     )
 
     bp_filter = let

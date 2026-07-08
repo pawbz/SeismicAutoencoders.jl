@@ -7,8 +7,8 @@ ambient seismic noise cross-correlations between station pairs. The goal is not 
 quality alone — it is to discover discrete, physically meaningful waveform modes that reveal
 coherent seismic arrivals when averaged within each quantized state.
 
-> **Other architectures** (SymAE, CatVAE, PhaseAligner) are in `experimental/` and are
-> research prototypes, not production-ready.
+> **Other architectures** (SymAE, CatVAE, PhaseAligner, CoherentN2N) are in `experimental/`
+> and are research prototypes, not production-ready.
 
 ---
 
@@ -46,7 +46,8 @@ SeismicAutoencoders/
 ├── experimental/             Research prototypes — not production-ready
 │   ├── symae/                Symmetric Autoencoder
 │   ├── catvae/               Categorical VAE
-│   └── phase_aligner/        Phase alignment network
+│   ├── phase_aligner/        Phase alignment network (learned siamese scalar phase)
+│   └── coherent_n2n/         Alternating cross-spectrum shift alignment + Noise2Noise denoising
 │
 ├── Notebooks/                Pluto/Jupyter notebooks
 ├── Project.toml              Julia package manifest
@@ -121,7 +122,7 @@ symvqvae train --data-dir /path/to/jld2/files --nepoch 100
 symvqvae train AP-BK,AP-CL --data-dir /path/to/jld2/files --nepoch 50
 
 # Train with custom parameters
-symvqvae train --data-dir /path/to/jld2/files --nepoch 200 --lr 0.0005 --K 8,5 --d 64
+symvqvae train --data-dir /path/to/jld2/files --nepoch 200 --lr 0.0005 --K 8,5 --d 64 --Mnn-fraction 0.02 --index-refresh-every 4
 
 # Train across multiple GPUs — pairs split round-robin, one Julia process per GPU
 symvqvae train --gpus 0,1 --data-dir /path/to/jld2/files --nepoch 100
@@ -246,6 +247,9 @@ To run in the **foreground** (blocking, output to terminal):
 # Run the Julia script directly for foreground output
 julia --project=. vqvae/symvqvae.jl train --data-dir /path/to/data --nepoch 100 --foreground
 ```
+
+Neighbor-target refresh can be tuned from the CLI with `--Mnn-fraction` (default `0.02`) and
+`--index-refresh-every` (default `4`).
 
 ---
 

@@ -142,6 +142,8 @@ while [ $i -le $# ]; do
          [ "$arg" = "--ratios" ] || \
          [ "$arg" = "--n-residual-layers" ] || \
          [ "$arg" = "--entropy-weight" ] || \
+         [ "$arg" = "--Mnn-fraction" ] || \
+         [ "$arg" = "--index-refresh-every" ] || \
          [ "$arg" = "--whitening-kernel-length" ] || \
          [ "$arg" = "--autodiff-backend" ]; then
         i=$((i+1))
