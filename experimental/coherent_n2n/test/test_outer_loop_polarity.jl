@@ -52,8 +52,14 @@ include(joinpath(@__DIR__, "synthetic_data.jl"))
 end
 
 @testset "run_coherent_n2n: use_polarity_gain=false ignores polarity flips (documented limitation)" begin
-    # Without gain correction, mixed-polarity traces partially cancel in the
-    # stack — this test documents the expected degradation, not a bug.
+    # Without gain correction, shift estimation itself is now polarity-strict
+    # (polarity_agnostic=!use_polarity_gain, see CoherentN2N_shift.jl), so a
+    # flipped trace no longer gets a clean-but-wrong-signed alignment — it
+    # gets a visibly bad shift estimate instead. That bad shift still isn't
+    # corrected (no gain step to fix the sign), so it still degrades the
+    # stack, just via a different mechanism (misalignment rather than
+    # opposite-sign cancellation). This test documents the expected
+    # degradation, not a bug.
     rng = MersenneTwister(40)
     nt = 128
     R = 20

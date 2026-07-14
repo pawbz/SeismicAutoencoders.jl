@@ -32,7 +32,7 @@ function shift_spectrum(X̂::AbstractMatrix{ComplexF32}, τ_scalar::Float32, gri
 end
 
 """
-    estimate_shift_xcorr_coarse(x_ref, x_trace) -> Int
+    estimate_shift_xcorr_coarse(x_ref, x_trace; polarity_agnostic=true) -> Int
 
 Integer-sample coarse pre-alignment via FFT-based cross-correlation peak.
 Bootstraps `estimate_shift_phase_slope` so the fine fit doesn't cycle-skip
@@ -40,13 +40,21 @@ on shifts approaching ±nt/2. Returns the shift `τ` (samples) such that
 `x_trace` best matches `x_ref` shifted by `τ`, i.e. positive `τ` means
 `x_trace` lags `x_ref`.
 
-Searches the *magnitude* of the cross-correlation (`argmax(abs.(cc))`), not
-the signed peak: earthquake traces can carry an unknown per-earthquake
-polarity flip (radiation-pattern sign), which would otherwise produce a
-large *negative* peak at the true lag that a plain `argmax` misses
-entirely. Polarity itself is resolved later by `estimate_earthquake_gain`.
+`polarity_agnostic=true` (default) searches the *magnitude* of the
+cross-correlation (`argmax(abs.(cc))`), not the signed peak: earthquake
+traces can carry an unknown per-earthquake polarity flip (radiation-pattern
+sign), which would otherwise produce a large *negative* peak at the true lag
+that a plain `argmax` misses entirely. Use this when polarity is resolved
+downstream by `estimate_earthquake_gain` (`use_polarity_gain=true`).
+
+`polarity_agnostic=false` searches the *signed* peak (`argmax(cc)`) instead:
+a polarity-flipped trace then no longer aligns cleanly to the wrong sign — it
+fails to find a strong positive peak at the true lag, surfacing the flip as a
+bad shift estimate. Use this when nothing downstream corrects sign
+(`use_polarity_gain=false`) and a flip should not be silently absorbed.
 """
-function estimate_shift_xcorr_coarse(x_ref::AbstractVector{<:Real}, x_trace::AbstractVector{<:Real})
+function estimate_shift_xcorr_coarse(x_ref::AbstractVector{<:Real}, x_trace::AbstractVector{<:Real};
+                                      polarity_agnostic::Bool=true)
     nt = length(x_ref)
     @assert length(x_trace) == nt "x_ref and x_trace must have equal length"
     X̂_ref   = fft(Float32.(x_ref))
@@ -54,7 +62,7 @@ function estimate_shift_xcorr_coarse(x_ref::AbstractVector{<:Real}, x_trace::Abs
     # cc[k] = sum_n x_trace[n] * x_ref[n-k]  -> peaks at k=τ when x_trace(t) = x_ref(t-τ),
     # matching the shift_spectrum/grid convention (positive τ means x_trace lags x_ref).
     cc = real(ifft(conj.(X̂_ref) .* X̂_trace))  # circular cross-correlation
-    lag0 = argmax(abs.(cc)) - 1                  # 0-based lag, peak of |cc| (polarity-agnostic)
+    lag0 = (polarity_agnostic ? argmax(abs.(cc)) : argmax(cc)) - 1  # 0-based lag
     # Wrap lags > nt/2 into negative range (circular shift convention)
     return lag0 > nt ÷ 2 ? lag0 - nt : lag0
 end
@@ -81,7 +89,8 @@ function unwrap_phase(phi::AbstractVector{<:Real})
 end
 
 """
-    estimate_shift_phase_slope(X̂_ref, X̂_trace, freqs; weight=:coherence, freq_band=nothing) -> Float32
+    estimate_shift_phase_slope(X̂_ref, X̂_trace, freqs; weight=:coherence, freq_band=nothing,
+                                zero_intercept=false) -> Float32
 
 Sub-sample delay via cross-spectrum phase-slope fit.
 
@@ -96,10 +105,22 @@ default, downweighting low-SNR bins), giving the slope `τ`.
 `shift_spectrum`. Positive `τ` means `x_trace` lags `x_ref`.
 
 `freq_band`, if given as `(flo, fhi)`, restricts the fit to `flo <= |freq| <= fhi`.
+
+`zero_intercept=false` (default) fits `phi ≈ ω*τ + c`, tolerating a residual
+constant phase offset `c`. A polarity flip between `x_ref`/`x_trace`
+contributes exactly such an offset (`c ≈ ±π`, since a sign flip multiplies
+the cross-spectrum by -1), which this mode absorbs into `c`, leaving `τ`
+correct regardless of polarity. `zero_intercept=true` fits `phi ≈ ω*τ`
+through the origin instead: a `±π` offset then corrupts the fit directly, so
+a polarity-flipped trace no longer returns a clean, wrong-signed-but-accurate
+`τ` — it returns a visibly bad one. Use `zero_intercept=true` when nothing
+downstream corrects sign (`use_polarity_gain=false`) and a flip should
+surface as a bad alignment rather than be silently tolerated.
 """
 function estimate_shift_phase_slope(X̂_ref::AbstractVector{<:Complex}, X̂_trace::AbstractVector{<:Complex},
                                      freqs::AbstractVector{<:Real};
-                                     weight::Symbol=:coherence, freq_band=nothing)
+                                     weight::Symbol=:coherence, freq_band=nothing,
+                                     zero_intercept::Bool=false)
     @assert length(X̂_ref) == length(X̂_trace) == length(freqs)
     C = X̂_ref .* conj.(X̂_trace)
     mag = abs.(C)
@@ -122,30 +143,50 @@ function estimate_shift_phase_slope(X̂_ref::AbstractVector{<:Complex}, X̂_trac
     phi = unwrap_phase(angle.(C[idx]))
     w = weight === :coherence ? mag[idx] ./ (maximum(mag[idx]) + eps(Float32)) : ones(Float32, length(idx))
 
-    # Weighted least squares: phi ≈ ω*τ + c   (no intercept needed for pure delay,
-    # but fit with intercept for robustness to any residual constant phase term)
-    Sw   = sum(w)
-    Swx  = sum(w .* ω)
-    Swy  = sum(w .* phi)
-    Swxx = sum(w .* ω .^ 2)
-    Swxy = sum(w .* ω .* phi)
-    denom = Sw * Swxx - Swx^2
-    τ = (Sw * Swxy - Swx * Swy) / denom
+    τ = if zero_intercept
+        # Weighted least squares through the origin: phi ≈ ω*τ (no tolerance
+        # for a constant phase offset, so a polarity-flip's ±π contribution
+        # corrupts the fit instead of being absorbed).
+        sum(w .* ω .* phi) / sum(w .* ω .^ 2)
+    else
+        # Weighted least squares with intercept: phi ≈ ω*τ + c (robust to any
+        # residual constant phase term, including a polarity flip's ±π).
+        Sw   = sum(w)
+        Swx  = sum(w .* ω)
+        Swy  = sum(w .* phi)
+        Swxx = sum(w .* ω .^ 2)
+        Swxy = sum(w .* ω .* phi)
+        (Sw * Swxy - Swx * Swy) / (Sw * Swxx - Swx^2)
+    end
     return Float32(τ)
 end
 
 """
-    estimate_shift_two_stage(x_ref, x_trace, freqs; freq_band=nothing) -> Float32
+    estimate_shift_two_stage(x_ref, x_trace, freqs; freq_band=nothing, polarity_agnostic=true) -> Float32
 
 Coarse integer-sample xcorr bootstrap + fine phase-slope fit. This is the
 recommended shift-estimation entry point (used both for initialization and
 Block B). `x_ref`/`x_trace` are real-valued time-domain traces; `freqs` are
 `fftfreq(nt)`-convention frequencies for the fine fit.
+
+`polarity_agnostic` (default `true`) is threaded through to both stages: the
+coarse xcorr peak search (`estimate_shift_xcorr_coarse`) and the fine fit's
+intercept handling (`estimate_shift_phase_slope`, via `zero_intercept =
+!polarity_agnostic`). Set to `false` when nothing downstream corrects
+polarity (`use_polarity_gain=false`), so a polarity-flipped trace fails to
+align cleanly instead of being silently aligned with the wrong sign. The
+coarse stage is the primary, robust polarity gate here (a flipped trace's
+cross-correlation at the true lag is large and *negative*, so the signed
+`argmax` reliably misses it); `zero_intercept` on the fine fit is a
+secondary safeguard against the same failure mode but, being a linear fit
+over a possibly non-ideal phase spectrum, doesn't always corrupt the result
+as dramatically.
 """
 function estimate_shift_two_stage(x_ref::AbstractVector{<:Real}, x_trace::AbstractVector{<:Real},
-                                   freqs::AbstractVector{<:Real}; freq_band=nothing)
+                                   freqs::AbstractVector{<:Real}; freq_band=nothing,
+                                   polarity_agnostic::Bool=true)
     nt = length(x_ref)
-    τ_coarse = estimate_shift_xcorr_coarse(x_ref, x_trace)
+    τ_coarse = estimate_shift_xcorr_coarse(x_ref, x_trace; polarity_agnostic=polarity_agnostic)
 
     # Undo the coarse shift on x_trace (circular) before the fine fit, so the
     # residual fine delay is small and safely within ±0.5 samples. x_trace
@@ -154,6 +195,7 @@ function estimate_shift_two_stage(x_ref::AbstractVector{<:Real}, x_trace::Abstra
     X̂_trace_shifted = fft(Float32.(x_trace)) .* exp.(im .* 2π .* freqs .* Float32(τ_coarse))
     X̂_ref = fft(Float32.(x_ref))
 
-    τ_fine = estimate_shift_phase_slope(X̂_ref, X̂_trace_shifted, freqs; freq_band=freq_band)
+    τ_fine = estimate_shift_phase_slope(X̂_ref, X̂_trace_shifted, freqs; freq_band=freq_band,
+                                         zero_intercept=!polarity_agnostic)
     return Float32(τ_coarse) + τ_fine
 end

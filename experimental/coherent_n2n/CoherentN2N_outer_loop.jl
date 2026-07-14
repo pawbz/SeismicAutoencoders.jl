@@ -118,7 +118,8 @@ function run_coherent_n2n(D::AbstractMatrix{Float32}, para::CoherentN2N_Para,
     energies = vec(sum(abs2, D; dims=1))
     ref_idx = good[argmin(abs.(energies[good] .- median(energies[good])))]
     ref = D[:, ref_idx]
-    τ = Float32[estimate_shift_two_stage(ref, D[:, r], freqs) for r in 1:R]
+    τ = Float32[estimate_shift_two_stage(ref, D[:, r], freqs;
+                                          polarity_agnostic=outer_para.use_polarity_gain) for r in 1:R]
     # Outlier traces don't participate in the gauge fit (their raw, ungauged
     # estimate is unreliable anyway); only non-outlier shifts are centered.
     anchor_total = enforce_zero_sum_gauge!(view(τ, good))
@@ -161,7 +162,8 @@ function run_coherent_n2n(D::AbstractMatrix{Float32}, para::CoherentN2N_Para,
         # ── Block B: update shifts (+ gains) (source fixed) ───────────────
         s_time = real(ifft(ŝ))
         for r in 1:R
-            τ[r] = estimate_shift_two_stage(s_time, D[:, r], freqs)
+            τ[r] = estimate_shift_two_stage(s_time, D[:, r], freqs;
+                                             polarity_agnostic=outer_para.use_polarity_gain)
         end
         anchor_total += enforce_zero_sum_gauge!(view(τ, good))
 

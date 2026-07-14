@@ -107,4 +107,68 @@ end
     @test abs(τ_est - τ_true) < 0.05
 end
 
+@testset "estimate_shift_two_stage: polarity_agnostic=true recovers τ under a flipped trace" begin
+    rng = MersenneTwister(6)
+    nt = 300
+    s_true, D, freqs, τ_true, g_true = make_synthetic_gather(
+        nt=nt, R=10, f0=0.02, source_kind=:broadband,
+        true_shifts=Float32.([60, -60, 100, -100, 5, -5, 0, 30, -30, 80]),
+        true_gains=ComplexF32.(rand(rng, (-1.0, 1.0), 10)),
+        noise_std=0.01, rng=rng)
+
+    for r in 1:10
+        τ_est = estimate_shift_two_stage(s_true, D[:, r], freqs; polarity_agnostic=true)
+        @test abs(τ_est - τ_true[r]) < 0.1
+    end
+end
+
+@testset "estimate_shift_xcorr_coarse: polarity_agnostic=false fails to find the true lag on a flipped trace" begin
+    # This is the primary polarity gate: the signed peak search must not find
+    # the true lag when the trace is flipped (its cross-correlation there is
+    # large and NEGATIVE, so argmax(cc) skips it), while it must still find
+    # it correctly for a same-polarity trace.
+    rng = MersenneTwister(7)
+    nt = 300
+    τ_shift = 40.0f0
+    s_true, D_pos, freqs, _, _ = make_synthetic_gather(
+        nt=nt, R=1, f0=0.02, source_kind=:broadband,
+        true_shifts=Float32[τ_shift], true_gains=ComplexF32[1.0],
+        noise_std=0.01, rng=rng)
+    _, D_neg, _, _, _ = make_synthetic_gather(
+        nt=nt, R=1, f0=0.02, source_kind=:broadband,
+        true_shifts=Float32[τ_shift], true_gains=ComplexF32[-1.0],
+        noise_std=0.01, rng=MersenneTwister(7))
+
+    τ_coarse_pos = estimate_shift_xcorr_coarse(s_true, D_pos[:, 1]; polarity_agnostic=false)
+    @test abs(τ_coarse_pos - τ_shift) <= 1  # same-polarity trace still aligns correctly
+
+    τ_coarse_neg = estimate_shift_xcorr_coarse(s_true, D_neg[:, 1]; polarity_agnostic=false)
+    @test abs(τ_coarse_neg - τ_shift) > 1  # flipped trace: signed peak misses the true lag
+
+    # Sanity check on the mechanism: the (signed) cross-correlation at the
+    # true lag is strongly negative for the flipped trace, confirming
+    # argmax(cc) (not argmax(abs.(cc))) is what causes it to be skipped.
+    X̂_ref, X̂_neg = fft(s_true), fft(D_neg[:, 1])
+    cc = real(ifft(conj.(X̂_ref) .* X̂_neg))
+    @test cc[round(Int, τ_shift) + 1] < 0
+end
+
+@testset "estimate_shift_phase_slope: zero_intercept changes the fit under a constant phase offset" begin
+    # Isolates the fine-fit mechanism: a pure delay plus a constant phase
+    # offset (what a polarity flip contributes, ±π) corrupts the
+    # zero-intercept fit but is absorbed by the intercept-including fit.
+    nt = 300
+    freqs = Float32.(fftfreq(nt))
+    ω = 2π .* freqs[2:150]
+    τ_true = 5.3f0
+    phi_clean = ω .* τ_true
+    phi_with_offset = phi_clean .+ Float32(π)
+
+    w = ones(Float32, length(ω))
+    τ_zero_clean    = sum(w .* ω .* phi_clean) / sum(w .* ω .^ 2)
+    τ_zero_offset   = sum(w .* ω .* phi_with_offset) / sum(w .* ω .^ 2)
+    @test isapprox(τ_zero_clean, τ_true; atol=1e-3)
+    @test abs(τ_zero_offset - τ_true) > 0.5  # offset corrupts the zero-intercept fit
+end
+
 println("All CoherentN2N shift-estimator tests passed.")
