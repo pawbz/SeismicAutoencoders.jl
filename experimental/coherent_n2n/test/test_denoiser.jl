@@ -35,8 +35,7 @@ include(joinpath(@__DIR__, "synthetic_data.jl"))
 
     X̂_aligned = fft(D, 1) .|> ComplexF32
 
-    model = build_complex_denoiser(nt; enc_kernels=[16, 8], enc_filters=[8, 16],
-                                    dec_kernels=[8, 16], dec_filters=[8, 2])
+    model = build_complex_denoiser(nt; kernels=[16, 8], filters=[8, 16])
     training_para = CoherentN2N_Denoiser_Training_Para(
         n_samples_per_epoch=256, batchsize=32, nepoch=200,
         initial_lr=0.003, restart_period=50, nprint=1000)

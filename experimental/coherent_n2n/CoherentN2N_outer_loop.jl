@@ -17,10 +17,8 @@ using Statistics: mean, median
 
 Base.@kwdef struct CoherentN2N_Para
     nt::Int
-    enc_kernels::Vector{Int} = [32, 16, 8]
-    enc_filters::Vector{Int} = [16, 32, 64]
-    dec_kernels::Vector{Int} = [8, 16, 32]
-    dec_filters::Vector{Int} = [32, 16, 2]
+    kernels::Vector{Int} = [32, 16, 8]
+    filters::Vector{Int} = [16, 32, 64]
     seed::Int = 42
     # If true, the denoiser (model + Block A training/inference data) runs on
     # GPU via Flux.gpu; requires `using CUDA, cuDNN` before calling
@@ -141,8 +139,7 @@ function run_coherent_n2n(D::AbstractMatrix{Float32}, para::CoherentN2N_Para,
     ŝ = complex_coherent_stack(X̂_aligned[:, good])
 
     history = (; delta_s=Float32[], delta_tau=Float32[], denoiser_loss=Vector{Float32}[])
-    model = build_complex_denoiser(nt; enc_kernels=para.enc_kernels, enc_filters=para.enc_filters,
-                                    dec_kernels=para.dec_kernels, dec_filters=para.dec_filters)
+    model = build_complex_denoiser(nt; kernels=para.kernels, filters=para.filters)
     para.use_gpu && (model = Flux.gpu(model))
     to_device = para.use_gpu ? Flux.gpu : identity
 

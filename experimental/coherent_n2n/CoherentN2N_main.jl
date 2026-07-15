@@ -135,8 +135,7 @@ let
 end
 
 # ╔═╡ c000000f-0000-0000-0000-00000000000f
-para_syn = cn.CoherentN2N_Para(nt=nt_syn, enc_kernels=[16, 8], enc_filters=[8, 16],
-                                dec_kernels=[8, 16], dec_filters=[8, 2], use_gpu=true)
+para_syn = cn.CoherentN2N_Para(nt=nt_syn, kernels=[16, 8], filters=[8, 16], use_gpu=true)
 
 # ╔═╡ c0000010-0000-0000-0000-000000000010
 outer_para_syn = cn.CoherentN2N_Outer_Para(

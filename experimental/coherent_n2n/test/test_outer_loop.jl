@@ -33,8 +33,7 @@ include(joinpath(@__DIR__, "synthetic_data.jl"))
         true_shifts=τ_true, true_gains=g_true,
         noise_std=0.05, rng=rng)
 
-    para = CoherentN2N_Para(nt=nt, enc_kernels=[16, 8], enc_filters=[8, 16],
-                             dec_kernels=[8, 16], dec_filters=[8, 2])
+    para = CoherentN2N_Para(nt=nt, kernels=[16, 8], filters=[8, 16])
     outer_para = CoherentN2N_Outer_Para(
         n_outer_iters=4,
         denoiser_training=CoherentN2N_Denoiser_Training_Para(
@@ -81,8 +80,7 @@ end
     # Corrupt one earthquake with much larger noise (simulating a bad trace).
     D[:, 1] .+= 2.0f0 .* randn(rng, Float32, nt)
 
-    para = CoherentN2N_Para(nt=nt, enc_kernels=[16, 8], enc_filters=[8, 16],
-                             dec_kernels=[8, 16], dec_filters=[8, 2])
+    para = CoherentN2N_Para(nt=nt, kernels=[16, 8], filters=[8, 16])
     outer_para = CoherentN2N_Outer_Para(
         n_outer_iters=3,
         denoiser_training=CoherentN2N_Denoiser_Training_Para(
