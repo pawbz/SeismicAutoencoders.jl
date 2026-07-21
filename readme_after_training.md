@@ -1,6 +1,6 @@
 # After-Training APC CLI Runbook
 
-This runbook documents the five acausal+causal post-training CLIs copied into this folder. They are intended to be run after VQ-VAE training has produced `source_state_averages.jld2` artifacts, and they cover transfer, candidate ranking, phase-correction sweeps, final all-triplet evaluation, and export for tomography.
+This runbook documents the acausal+causal post-training CLIs copied into this folder. They are intended to be run after VQ-VAE training has produced `source_state_averages.jld2` artifacts, and they cover triplet-list generation, transfer, candidate ranking, phase-correction sweeps, final all-triplet evaluation, and export for tomography.
 
 ## Prerequisites
 
@@ -71,11 +71,68 @@ Useful flags:
 
 ## Recommended Workflow
 
+0. Generate or refresh a triplet CSV with `triplet_list_cli.jl`.
 1. Transfer a trained reference pair to the remaining raw pairs with `transfer_all_states_cli.jl`.
 2. Rank candidates on a reference triplet with `group_velocity_acausal_plus_causal_cli.jl`.
 3. Use the selected candidate labels in `phase_candidate_sweep_acausal_plus_causal_cli.jl` to find good phase-correction denominators.
 4. Evaluate the final candidate and chosen denominator values over all passing triplets with `phase_final_all_triplets_acausal_plus_causal_cli.jl`.
 5. Export waveforms and dispersion products for downstream tomography with `pair_export_acausal_plus_causal_candidate_cli.jl`.
+
+## 0. `triplet_list_cli.jl`
+
+### What It Does
+
+Builds a station-triplet CSV from a station latitude/longitude table. It can either apply geometry criteria or write all triplets available in a raw-pair dataset. The default output is `available_station_triplets.csv` in the repository root, not inside `station_triplet_csvs`, so it does not overwrite the shared default triplet CSV used by the other CLIs.
+
+### Typical Commands
+
+Write all raw-data-available triplets:
+
+```bash
+julia --project=. --startup-file=no triplet_list_cli.jl \
+  --station-csv /home/sanket/Desktop/Stations_XI_2011_13_SN.csv \
+  --raw-data-dir /Data1/Minneapolis_pairs_SN_months_full_26062026_10_60 \
+  --require-raw-pairs \
+  --all-triplets \
+  --output available_station_triplets.csv \
+  --overwrite
+```
+
+Write only triplets passing stricter geometry criteria:
+
+```bash
+julia --project=. --startup-file=no triplet_list_cli.jl \
+  --station-csv /home/sanket/Desktop/Stations_XI_2011_13_SN.csv \
+  --raw-data-dir /Data1/Minneapolis_pairs_SN_months_full_26062026_10_60 \
+  --require-raw-pairs \
+  --max-delta-az 0.5 \
+  --max-delta-d 0.1 \
+  --min-segment-distance 45 \
+  --min-ratio 0.75 \
+  --max-ratio 1.25 \
+  --output available_station_triplets_filtered.csv \
+  --overwrite
+```
+
+### Important Options
+
+- `--station-csv FILE`: station table with station code, latitude, and longitude columns.
+- `--raw-data-dir DIR`: raw pair JLD2 directory, with files named like `SN43_SN57-*.jld2`.
+- `--require-raw-pairs`: keep only triplets where AB, BC, and AC pair files exist in `--raw-data-dir`.
+- `--all-triplets`: skip geometry filtering. With `--require-raw-pairs`, this gives all triplets available in the raw dataset.
+- Geometry filters: `--max-delta-az`, `--max-delta-d`, `--min-segment-distance`, `--min-ratio`, `--max-ratio`.
+- `--stations LIST`: optional comma-separated station subset.
+- `--include-all`: write every computed triplet with pass/fail columns instead of only selected rows.
+- `--output FILE`: destination CSV. Default: `available_station_triplets.csv`.
+- `--overwrite`: replace an existing output CSV.
+
+### Using The Output
+
+Pass the generated CSV to downstream CLIs with `--triplets-csv`:
+
+```bash
+--triplets-csv available_station_triplets.csv
+```
 
 ## 1. `transfer_all_states_cli.jl`
 
@@ -390,4 +447,3 @@ Check that:
 - Needed triplet pairs have artifacts under `--saved-root`.
 - The intended `--output-dir` is correct.
 - Existing outputs should really be replaced before adding `--overwrite`.
-
