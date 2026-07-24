@@ -32,6 +32,42 @@ is unchanged; no learning-rate adjustment is needed.
 complex_mse_loss(pred::AbstractMatrix{<:Complex}, target::AbstractMatrix{<:Complex}) =
     Float32(mean(abs2, pred .- target) / size(pred, 1))
 
+"""
+    complex_l1_loss(pred, target) -> Float32
+
+Mean **L1** (magnitude-of-residual) error over complex spectra: `mean(|pred −
+target|)`, normalized by `√nt`. Whereas MSE (`complex_mse_loss`) trains a
+Noise2Noise denoiser toward the posterior **mean**, this L1 loss trains it toward
+the posterior **median** — more robust to heavy-tailed / outlier noise samples,
+at the cost of a (usually mild) amplitude bias on skewed noise. The `1/√nt`
+mirrors the Parseval scaling rationale of `complex_mse_loss`: an L1 magnitude sum
+over frequencies scales like `√nt` times its time-domain counterpart, so dividing
+by `√nt` keeps the reported number ~`nt`-comparable. (The constant scale is
+absorbed by Adam, so it does not change the effective step size.)
+
+The residual magnitude is computed as `sqrt(abs2(Δ))` (elementwise) rather than
+`abs(Δ)`: on GPU under Zygote, `sum(abs, ::Complex CuArray)` falls back to a
+scalar-indexing `collect` (disallowed on GPU), whereas `abs2.` → `sqrt.` →
+`mean` is fully vectorized and AD-safe. `sqrt` is differentiable away from 0; the
+measure-zero exact-zero residual is not a practical concern.
+"""
+complex_l1_loss(pred::AbstractMatrix{<:Complex}, target::AbstractMatrix{<:Complex}) =
+    Float32(mean(sqrt.(abs2.(pred .- target))) / sqrt(Float32(size(pred, 1))))
+
+"""
+    denoiser_loss_fn(loss_type::Symbol) -> f(pred, target)
+
+Select the Noise2Noise training loss: `:l2` → `complex_mse_loss` (posterior mean,
+default, unchanged behaviour), `:l1` → `complex_l1_loss` (posterior median,
+outlier-robust). Governs ONLY the denoiser's training objective; the coherent
+stack has its own `stack_type` knob (`CoherentN2N_Outer_Para`).
+"""
+function denoiser_loss_fn(loss_type::Symbol)
+    loss_type === :l2 && return complex_mse_loss
+    loss_type === :l1 && return complex_l1_loss
+    throw(ArgumentError("unknown denoiser_loss_type $loss_type (expected :l2 or :l1)"))
+end
+
 Base.@kwdef struct CoherentN2N_Denoiser_Training_Para
     n_samples_per_epoch::Int = 512
     batchsize::Int            = 64
@@ -39,6 +75,9 @@ Base.@kwdef struct CoherentN2N_Denoiser_Training_Para
     initial_lr::Float64        = 0.001
     restart_period::Int         = 50
     nprint::Int                 = 20
+    # Noise2Noise training loss: :l2 (MSE → posterior mean, default) or :l1
+    # (mean-abs → posterior median, robust to outlier noise). See denoiser_loss_fn.
+    denoiser_loss_type::Symbol  = :l2
 end
 
 """Log if on print interval."""
@@ -61,6 +100,7 @@ function train_denoiser!(model::ComplexDenoiser, X̂_aligned::AbstractMatrix{Com
                           rng::AbstractRNG=Random.default_rng())
     opt_state = Optimisers.setup(Optimisers.Adam(training_para.initial_lr), model)
     T = training_para.restart_period
+    loss_fn = denoiser_loss_fn(training_para.denoiser_loss_type)
     h = (; train_loss=Float32[])
 
     @withprogress name = "Denoiser training" begin
@@ -79,7 +119,7 @@ function train_denoiser!(model::ComplexDenoiser, X̂_aligned::AbstractMatrix{Com
                 xb = input[:, start:stop]
                 yb = target[:, start:stop]
                 loss, grads = Flux.withgradient(model) do m
-                    complex_mse_loss(m(xb), yb)
+                    loss_fn(m(xb), yb)
                 end
                 Optimisers.update!(opt_state, model, grads[1])
                 push!(epoch_losses, loss)
@@ -129,6 +169,7 @@ function train_denoiser!(model::ComplexDenoiser, X̂_groups::Vector{<:AbstractMa
                           rng::AbstractRNG=Random.default_rng(), to_device=identity)
     opt_state = Optimisers.setup(Optimisers.Adam(training_para.initial_lr), model)
     T = training_para.restart_period
+    loss_fn = denoiser_loss_fn(training_para.denoiser_loss_type)
     h = (; train_loss=Float32[])
 
     @withprogress name = "Grouped denoiser training" begin
@@ -150,7 +191,7 @@ function train_denoiser!(model::ComplexDenoiser, X̂_groups::Vector{<:AbstractMa
                 xb = input[:, start:stop]
                 yb = target[:, start:stop]
                 loss, grads = Flux.withgradient(model) do m
-                    complex_mse_loss(m(xb), yb)
+                    loss_fn(m(xb), yb)
                 end
                 Optimisers.update!(opt_state, model, grads[1])
                 push!(epoch_losses, loss)

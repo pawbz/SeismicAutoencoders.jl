@@ -21,11 +21,6 @@ using Revise
 
 # ╔═╡ eb80a550-f8df-4d10-834c-bc4693926d29
 begin
-    # Silence cuDNN 9.x's verbose engine-selection tracebacks (harmless
-    # "Dilation not supported"/CUDNN_STATUS_NOT_SUPPORTED info logs from our
-    # dilated 1-D convs; the fallback engine is correct and, benchmarked,
-    # faster). Must be set BEFORE `using cuDNN` loads the C library.
-    ENV["CUDNN_LOGLEVEL_DBG"] = "0"
     using CUDA, cuDNN, Flux, Zygote, FFTW
     using Optimisers, Random, Statistics, LinearAlgebra
     using JLD2, FileIO
@@ -34,6 +29,13 @@ end
 
 # ╔═╡ b1a7c0de-0005-4000-8000-000000000005
 begin
+    # Silence cuDNN 9.x's verbose engine-selection logs (harmless
+    # "Dilation not supported"/CUDNN_STATUS_NOT_SUPPORTED info it emits when it
+    # skips a preferred backward-conv engine for our dilated 1-D convs and falls
+    # back to a working — and, benchmarked, FASTER — one). cuDNN.jl registers a
+    # log callback whenever Julia runs at debug_level>=2 (`-g2`, which the Pluto
+    # worker does), bypassing CUDNN_LOGLEVEL_DBG entirely; clearing the callback
+    # (severity mask 0, null fn) at runtime mutes them without a restart.
     using Base: C_NULL
     cuDNN.cudnnSetCallback(0, C_NULL, C_NULL)
     "cuDNN callback disabled"
@@ -235,12 +237,24 @@ Adjust the denoiser size / training below.
 # ╔═╡ d45f9551-2985-4350-b430-009887f23bd4
 para = cn.CoherentN2N_Para(nt=Nt, kernels=[32, 16, 8], filters=[16, 32, 64], use_gpu=true)
 
+# ╔═╡ b1a7c0de-0007-4000-8000-000000000007
+md"""#### Robustness / loss options
+
+Coherent stack (`stack_type`): $(@bind stack_type_bd Select([:l2 => "L2 — mean", :l1 => "L1 — robust Huber/IRLS"]; default=:l2))  •
+Denoiser loss (`denoiser_loss_type`): $(@bind denoiser_loss_bd Select([:l2 => "L2 / MSE", :l1 => "L1 / mean-abs"]; default=:l2))
+
+*L1 stack* down-weights receivers/traces disagreeing with the current source
+estimate; *L1 denoiser loss* trains toward the posterior median. Both default to
+**L2** (original behaviour)."""
+
 # ╔═╡ edccebf4-b93f-41df-a708-ed48a32f1fb2
 outer_para = cn.CoherentN2N_Outer_Para(
     n_outer_iters=10, use_polarity_gain=true,
+    stack_type=stack_type_bd,
     denoiser_training=cn.CoherentN2N_Denoiser_Training_Para(
         n_samples_per_epoch=512, batchsize=64, nepoch=120,
-        initial_lr=0.002, restart_period=40, nprint=30))
+        initial_lr=0.002, restart_period=40, nprint=30,
+        denoiser_loss_type=denoiser_loss_bd))
 
 # ╔═╡ 2c8d5c22-94af-479f-85ab-ed8c25c899cd
 rng = MersenneTwister(1)
@@ -340,8 +354,7 @@ begin
     freqs = Float32.(fftfreq(Nt))
     grid = ComplexF32.(-im .* 2f0 .* Float32(π) .* freqs)
     X̂ = ComplexF32.(fft(D_proc, 1))
-    good = .!result.outliers
-    τ_gauge = result.τ .- cn.mode_kde(result.τ[good])
+    τ_gauge = result.τ .- cn.mode_kde(result.τ)
     X̂_al = cn.shift_spectrum(X̂, reshape(-τ_gauge, 1, R), grid)
     D_aligned = real(ifft(X̂_al, 1))
     stack_raw = vec(mean(D_aligned, dims=2))
@@ -495,6 +508,7 @@ PlutoLinks = "0ff47ea0-7a50-410d-8455-4348d5de0420"
 PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
 ProgressLogging = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
@@ -511,6 +525,7 @@ PlutoHooks = "~0.1.0"
 PlutoLinks = "~0.1.8"
 PlutoUI = "~0.7.83"
 ProgressLogging = "~0.1.6"
+Revise = "~3.15.1"
 Zygote = "~0.7.11"
 cuDNN = "~6.2.0"
 """
@@ -521,7 +536,7 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "c4e28a08ba6aaa2f7af6b9ce2f5484cc1014b77c"
+project_hash = "7656c3452158585d965379674304ccebf10d1953"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "d9aaef7c63466eee4de23b4d9dad03629df54bea"
@@ -1883,6 +1898,7 @@ version = "17.7.0+0"
 # ╠═5bedcba0-107b-46b8-b361-0f17ea7dca57
 # ╟─17a4b4d6-a75e-4932-a675-e206ec45ad78
 # ╠═d45f9551-2985-4350-b430-009887f23bd4
+# ╟─b1a7c0de-0007-4000-8000-000000000007
 # ╠═edccebf4-b93f-41df-a708-ed48a32f1fb2
 # ╠═2c8d5c22-94af-479f-85ab-ed8c25c899cd
 # ╠═7ef65dc2-9b09-4e0b-bf4f-c5f4335254db

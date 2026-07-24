@@ -91,3 +91,27 @@ function enforce_location_gauge!(τ::AbstractVector{Float32}; center=mode_kde)
     τ .-= m
     return m
 end
+
+"""
+    clamp_shifts_to_mode!(τ::AbstractVector{Float32}, max_shift::Real) -> τ
+
+Clamp each shift to `mode(τ) ± max_shift`, in place, so `±max_shift` is a bound
+**relative to the dominant cluster** of the shift distribution — irrespective of
+its mean or any skew. `max_shift = Inf` is a no-op.
+
+Intended to run right AFTER `enforce_location_gauge!(...; center=mode_kde)`,
+which has already put the mode at 0; then the bound is simply
+`clamp(τ, -max_shift, +max_shift)` and it is exactly symmetric about the cluster
+the gauge pinned to zero. Passing an already-gauged view keeps this correct even
+if called standalone: it re-derives the mode and clamps about it, so a small
+residual mode offset does not bias the bound. This is deliberately separate from
+the cycle-skip search guard inside `estimate_shift_two_stage`, which bounds the
+raw lag against the (source-origin) reference and must stay origin-relative.
+"""
+function clamp_shifts_to_mode!(τ::AbstractVector{Float32}, max_shift::Real)
+    isfinite(max_shift) || return τ
+    ms = Float32(max_shift)
+    c = Float32(mode_kde(τ))
+    @. τ = clamp(τ, c - ms, c + ms)
+    return τ
+end

@@ -194,8 +194,29 @@ Mirrors the test scenarios in `test/test_outer_loop.jl` and
 `test/test_outer_loop_polarity.jl`.
 "
 
+# ╔═╡ c000001a-0000-0000-0000-00000000001a
+md"### Raw Training Data (before alignment/denoising)"
+
+# ╔═╡ c0000061-0000-0000-0000-000000000061
+md"""### ⚙️ Synthetic training controls
+
+| control | |
+|---|---|
+| **Outer iterations** | $(@bind ni_syn PlutoUI.Slider(1:20; default=10, show_value=true)) |
+| **Polarity / gain** | $(@bind pg_syn PlutoUI.CheckBox(default=false)) estimate per-event complex gains |
+| **Shift bound** ±max_shift | $(@bind bound_syn PlutoUI.CheckBox(default=false)) enable&nbsp; $(@bind max_shift_syn PlutoUI.Slider(1:64; default=20, show_value=true)) samples |
+| **Coherent stack** (`stack_type`) | $(@bind stack_type_syn PlutoUI.Select([:l2 => "L2 — mean stack", :l1 => "L1 — robust Huber/IRLS"]; default=:l2)) |
+| **Denoiser N2N loss** (`denoiser_loss_type`) | $(@bind denoiser_loss_syn PlutoUI.Select([:l2 => "L2 / MSE (posterior mean)", :l1 => "L1 / mean-abs (posterior median)"]; default=:l2)) |
+
+*L1 stack* down-weights traces that disagree with ŝ (robust to a few incoherent /
+cycle-skipped traces); *L1 denoiser loss* trains the network toward the posterior
+median (robust to heavy-tailed noise). Both default to **L2** (original
+behaviour). Click **Train synthetic** below to apply."""
+
 # ╔═╡ c000000d-0000-0000-0000-00000000000d
-use_polarity_gain_syn = false  # toggle to true to exercise the polarity/gain path
+# Polarity/gain toggle — bound in the "Synthetic training controls" panel (pg_syn).
+# Used both to synthesize gains (g_true_syn) and to drive the loop's use_polarity_gain.
+use_polarity_gain_syn = pg_syn
 
 # ╔═╡ c000000e-0000-0000-0000-00000000000e
 begin
@@ -210,11 +231,8 @@ begin
     s_true_syn, D_syn, freqs_syn, _, _ = make_synthetic_gather(
         nt=nt_syn, R=R_syn, f0=0.05, source_kind=:broadband,
         true_shifts=τ_true_syn, true_gains=g_true_syn,
-        noise_std=0.5, rng=rng_syn)
+        noise_std=0.1, rng=rng_syn)
 end
-
-# ╔═╡ c000001a-0000-0000-0000-00000000001a
-md"### Raw Training Data (before alignment/denoising)"
 
 # ╔═╡ c000001b-0000-0000-0000-00000000001b
 let
@@ -247,18 +265,15 @@ end
 # ╔═╡ c000000f-0000-0000-0000-00000000000f
 para_syn = cn.CoherentN2N_Para(nt=nt_syn, kernels=[16, 8], filters=[8, 16], use_gpu=true)
 
-# ╔═╡ c0000061-0000-0000-0000-000000000061
-md"""#### Shift bound (synthetic)
-Restrict recovered shifts to ±`max_shift` samples: $(@bind bound_syn PlutoUI.CheckBox(default=false)) enable,
-$(@bind max_shift_syn PlutoUI.Slider(1:64; default=20, show_value=true)) samples"""
-
 # ╔═╡ c0000010-0000-0000-0000-000000000010
 outer_para_syn = cn.CoherentN2N_Outer_Para(
-    n_outer_iters=10, use_polarity_gain=use_polarity_gain_syn,
+    n_outer_iters=ni_syn, use_polarity_gain=use_polarity_gain_syn,
     max_shift=bound_syn ? Float32(max_shift_syn) : Inf32,
+    stack_type=stack_type_syn,
     denoiser_training=cn.CoherentN2N_Denoiser_Training_Para(
         n_samples_per_epoch=256, batchsize=200, nepoch=80,
-        initial_lr=0.003, restart_period=40, nprint=20))
+        initial_lr=0.003, restart_period=40, nprint=20,
+        denoiser_loss_type=denoiser_loss_syn))
 
 # ╔═╡ c0000055-0000-0000-0000-000000000055
 train_syn_button = @bind train_syn_click PlutoUI.CounterButton("Train synthetic")
@@ -274,9 +289,18 @@ end
 # ╔═╡ c0000012-0000-0000-0000-000000000012
 result_syn === nothing ? md"⏳ Click **Train synthetic** to populate this." : let
     ŝ_time = real(ifft(result_syn.ŝ))
-    c = cor(ŝ_time, s_true_syn)
-    @info "Synthetic source recovery" correlation=c
-    (; correlation=c, delta_s=result_syn.history.delta_s, delta_tau=result_syn.history.delta_tau)
+    # Blind recovery is only defined up to a global time shift (the absolute
+    # origin is unrecoverable — see the gauge notes), so a RAW cor(ŝ, s_true) is
+    # misleading (near 0 even for a perfect but shifted ŝ). Report the best-lag
+    # aligned correlation: cross-correlate, circshift ŝ by the best lag, then cor.
+    cc = real(ifft(conj(fft(s_true_syn)) .* fft(ŝ_time)))
+    nt = length(ŝ_time)
+    lag = argmax(abs.(cc)) - 1
+    lag > nt ÷ 2 && (lag -= nt)
+    c_aligned = cor(circshift(ŝ_time, -lag), s_true_syn)
+    @info "Synthetic source recovery" correlation_aligned=c_aligned best_lag=lag
+    (; correlation_aligned=c_aligned, best_lag=lag,
+       delta_s=result_syn.history.delta_s, delta_tau=result_syn.history.delta_tau)
 end
 
 # ╔═╡ c000001d-0000-0000-0000-00000000001d
@@ -286,11 +310,11 @@ md"### Aligned Data (final recovered shifts applied)"
 D_aligned_syn = result_syn === nothing ? nothing : let
     grid_syn = ComplexF32.(-im .* 2f0 .* Float32(π) .* freqs_syn)
     X̂_syn = ComplexF32.(fft(D_syn, 1))
-    # result_syn.τ is absolute (anchor reapplied); re-center to the same
-    # gauge used internally (mode over non-outlier traces) so the alignment
-    # below matches what the outer loop used to build its final coherent stack.
-    good_syn = .!result_syn.outliers
-    τ_gauge = result_syn.τ .- cn.mode_kde(result_syn.τ[good_syn])
+    # result_syn.τ is absolute (anchor reapplied); re-center to the same mode
+    # gauge used internally so the alignment below matches what the outer loop
+    # used to build its final coherent stack. (All traces participate now — no
+    # outlier mask; robustness is carried by result_syn.weights.)
+    τ_gauge = result_syn.τ .- cn.mode_kde(result_syn.τ)
     X̂_aligned_syn = cn.shift_spectrum(X̂_syn, reshape(-τ_gauge, 1, R_syn), grid_syn)
     real(ifft(X̂_aligned_syn, 1))
 end
@@ -333,8 +357,9 @@ md"---
 `result.ŝ` — final complex source-spectrum estimate (`real(ifft(result.ŝ))`
 for the time-domain stack). `result.τ` — recovered per-earthquake shifts
 (absolute, anchor reapplied). `result.gains` — per-earthquake complex gain
-(all-ones if `use_polarity_gain=false`). `result.outliers` — energy-outlier
-mask (excluded from the stack/gauge fit).
+(all-ones if `use_polarity_gain=false`). `result.weights` — per-trace robust
+coherent-stack weights (all-ones for `stack_type=:l2`; `<1` marks a trace the
+L1/Huber stack down-weighted for disagreeing with ŝ).
 
 Two distinct \"loss\"-like signals are plotted below — don't conflate them:
 - **`result.history.delta_s` / `delta_tau`**: the **outer alternating loop's
@@ -379,9 +404,8 @@ end
 result_syn === nothing ? md"⏳ Click **Train synthetic** to populate this." : let
     # Center both by mode over the same non-outlier set, matching the internal
     # mode location gauge, so the two distributions share a reference.
-    good_syn = .!result_syn.outliers
-    τ_est_centered = result_syn.τ .- cn.mode_kde(result_syn.τ[good_syn])
-    τ_true_centered = τ_true_syn .- cn.mode_kde(τ_true_syn[good_syn])
+    τ_est_centered = result_syn.τ .- cn.mode_kde(result_syn.τ)
+    τ_true_centered = τ_true_syn .- cn.mode_kde(τ_true_syn)
     idx = collect(1:length(τ_true_syn))
     traces = [
         PlutoPlotly.scatter(x=idx, y=τ_true_centered, mode="markers",
@@ -402,9 +426,8 @@ result_syn === nothing ? md"⏳ Click **Train synthetic** to populate this." : l
     # Recovered vs. true shift distributions (both gauge-centered). Synthetic
     # test has ground truth, so overlay true τ for comparison. Center by median
     # over the non-outlier set to match the internal mode location gauge.
-    good_syn = .!result_syn.outliers
-    τ_est_hist = result_syn.τ .- cn.mode_kde(result_syn.τ[good_syn])
-    τ_true_hist = τ_true_syn .- cn.mode_kde(τ_true_syn[good_syn])
+    τ_est_hist = result_syn.τ .- cn.mode_kde(result_syn.τ)
+    τ_true_hist = τ_true_syn .- cn.mode_kde(τ_true_syn)
     traces = [
         PlutoPlotly.histogram(x=τ_true_hist, name="True τ",
             marker=attr(color="grey", opacity=0.55)),
@@ -524,18 +547,18 @@ begin
 end
 
 # ╔═╡ c0000024-0000-0000-0000-000000000024
-# """Per-trace normalize + taper (same convention as Training_PhaseAligner.jl:388-391)."""
-# function taper_sin_real(x)
-#     nt = size(x, 1)
-#     w = sin.(range(0, π, length=nt)) .^ 1
-#     return x .* reshape(w, nt, ntuple(_ -> 1, ndims(x) - 1)...)
-# end
+"""Per-trace normalize + taper (same convention as Training_PhaseAligner.jl:388-391)."""
+function taper_sin_real(x)
+    nt = size(x, 1)
+    w = sin.(range(0, π, length=nt)) .^ 1
+    return x .* reshape(w, nt, ntuple(_ -> 1, ndims(x) - 1)...)
+end
 
 # ╔═╡ c0000025-0000-0000-0000-000000000025
 groups_real = map(raw_data_list) do rd
     mr = mean(rd; dims=1)
     sr = std(rd; dims=1)
-    Float32.(((rd .- mr) ./ max.(sr, 1f-8)))
+    Float32.(taper_sin_real((rd .- mr) ./ max.(sr, 1f-8)))
 end
 
 # ╔═╡ c0000026-0000-0000-0000-000000000026
@@ -560,16 +583,21 @@ Restart period: $(@bind rp_real PlutoUI.Slider(10:10:200; default=50, show_value
 
 Initial LR: $(@bind lr_real PlutoUI.Select([0.0003, 0.001, 0.003, 0.01]; default=0.001))
 
-Bound shifts to ±: $(@bind bound_real PlutoUI.CheckBox(default=false)) enable, $(@bind max_shift_real PlutoUI.Slider(1:64; default=10, show_value=true)) samples"""
+Bound shifts to ±: $(@bind bound_real PlutoUI.CheckBox(default=false)) enable, $(@bind max_shift_real PlutoUI.Slider(1:64; default=10, show_value=true)) samples
+
+Coherent stack (`stack_type`): $(@bind stack_type_real PlutoUI.Select([:l2 => "L2 — mean", :l1 => "L1 — robust Huber/IRLS"]; default=:l2))  •
+Denoiser loss (`denoiser_loss_type`): $(@bind denoiser_loss_real PlutoUI.Select([:l2 => "L2 / MSE", :l1 => "L1 / mean-abs"]; default=:l2))"""
 
 # ╔═╡ c0000029-0000-0000-0000-000000000029
 outer_para_real = cn.CoherentN2N_Outer_Para(
     n_outer_iters=ni_real,
     use_polarity_gain=pg_real,
     max_shift=bound_real ? Float32(max_shift_real) : Inf32,
+    stack_type=stack_type_real,
     denoiser_training=cn.CoherentN2N_Denoiser_Training_Para(
         n_samples_per_epoch=nspe_real, batchsize=bs_real, nepoch=nepoch_real,
-        initial_lr=lr_real, restart_period=rp_real))
+        initial_lr=lr_real, restart_period=rp_real,
+        denoiser_loss_type=denoiser_loss_real))
 
 # ╔═╡ c000002a-0000-0000-0000-00000000002a
 # Runs ONLY after a button click: CounterButton starts at 0, so the body is
@@ -670,8 +698,7 @@ D_aligned_real = result_real === nothing ? nothing : let
     freqs_real = Float32.(fftfreq(size(D_g, 1)))
     grid_real = ComplexF32.(-im .* 2f0 .* Float32(π) .* freqs_real)
     X̂_real = ComplexF32.(fft(D_g, 1))
-    good_g = .!result_real.groups[g_sel].outliers
-    τ_gauge_real = τ_g .- cn.mode_kde(τ_g[good_g])
+    τ_gauge_real = τ_g .- cn.mode_kde(τ_g)
     X̂_aligned_real = cn.shift_spectrum(X̂_real, reshape(-τ_gauge_real, 1, length(τ_gauge_real)), grid_real)
     real(ifft(X̂_aligned_real, 1))
 end
@@ -757,8 +784,7 @@ result_real === nothing ? md"⏳ Click **Train receivers** to populate this." : 
     epi_dist = [epicentral_distance_deg(sta_lat, sta_lon, ev[1], ev[2]) for ev in EvtLoc_list[g_sel]]
     baz = [backazimuth_deg(sta_lat, sta_lon, ev[1], ev[2]) for ev in EvtLoc_list[g_sel]]
     τ_g = result_real.groups[g_sel].τ
-    good_g = .!result_real.groups[g_sel].outliers
-    τ_gauge_map = τ_g .- cn.mode_kde(τ_g[good_g])
+    τ_gauge_map = τ_g .- cn.mode_kde(τ_g)
 
     tr = PlutoPlotly.scatterpolar(
         r=epi_dist, theta=baz, mode="markers",
@@ -779,8 +805,7 @@ end
 # ╔═╡ c0000036-0000-0000-0000-000000000036
 result_real === nothing ? md"⏳ Click **Train receivers** to populate this." : let
     τ_g = result_real.groups[g_sel].τ
-    good_g = .!result_real.groups[g_sel].outliers
-    τ_gauge_hist = τ_g .- cn.mode_kde(τ_g[good_g])
+    τ_gauge_hist = τ_g .- cn.mode_kde(τ_g)
     tr = PlutoPlotly.histogram(x=τ_gauge_hist, marker=attr(color="#d62728", opacity=0.75))
     layout = Layout(
         title=attr(text="Real data: recovered shift distribution ($(StaN_used[g_sel]), gauge-centered)"),
@@ -2257,7 +2282,7 @@ version = "17.7.0+0"
 # ╠═c000001b-0000-0000-0000-00000000001b
 # ╠═c000001c-0000-0000-0000-00000000001c
 # ╠═c000000f-0000-0000-0000-00000000000f
-# ╠═c0000061-0000-0000-0000-000000000061
+# ╟─c0000061-0000-0000-0000-000000000061
 # ╠═c0000010-0000-0000-0000-000000000010
 # ╠═c0000055-0000-0000-0000-000000000055
 # ╠═c0000011-0000-0000-0000-000000000011
@@ -2279,6 +2304,8 @@ version = "17.7.0+0"
 # ╠═c0000021-0000-0000-0000-000000000021
 # ╠═c0000042-0000-0000-0000-000000000042
 # ╠═c0000022-0000-0000-0000-000000000022
+# ╟─c0000053-0000-0000-0000-000000000053
+# ╠═c0000054-0000-0000-0000-000000000054
 # ╠═c0000023-0000-0000-0000-000000000023
 # ╠═c0000024-0000-0000-0000-000000000024
 # ╠═c0000025-0000-0000-0000-000000000025
@@ -2286,8 +2313,6 @@ version = "17.7.0+0"
 # ╠═c0000027-0000-0000-0000-000000000027
 # ╠═c0000028-0000-0000-0000-000000000028
 # ╠═c0000029-0000-0000-0000-000000000029
-# ╠═c0000054-0000-0000-0000-000000000054
-# ╟─c0000053-0000-0000-0000-000000000053
 # ╠═c000002a-0000-0000-0000-00000000002a
 # ╟─c0000040-0000-0000-0000-000000000040
 # ╠═c0000041-0000-0000-0000-000000000041
