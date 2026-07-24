@@ -16,799 +16,485 @@ macro bind(def, element)
     #! format: on
 end
 
-# ╔═╡ 6967e957-8e56-43c0-be67-95298eabbd6f
+# ╔═╡ 2a8ee9cc-644c-4343-ad8e-ac5fcfc7f8af
 using Revise
 
-# ╔═╡ c0000001-0000-0000-0000-000000000001
+# ╔═╡ eb80a550-f8df-4d10-834c-bc4693926d29
 begin
+    # Silence cuDNN 9.x's verbose engine-selection tracebacks (harmless
+    # "Dilation not supported"/CUDNN_STATUS_NOT_SUPPORTED info logs from our
+    # dilated 1-D convs; the fallback engine is correct and, benchmarked,
+    # faster). Must be set BEFORE `using cuDNN` loads the C library.
+    ENV["CUDNN_LOGLEVEL_DBG"] = "0"
     using CUDA, cuDNN, Flux, Zygote, FFTW
     using Optimisers, Random, Statistics, LinearAlgebra
-    using JLD2
+    using JLD2, FileIO
     CUDA.device!(0)  # NVIDIA RTX 6000 Ada Generation
 end
 
-# ╔═╡ c0000062-0000-0000-0000-000000000062
+# ╔═╡ b1a7c0de-0005-4000-8000-000000000005
 begin
-    # Silence cuDNN 9.x's verbose engine-selection tracebacks (harmless
-    # "Dilation not supported"/CUDNN_STATUS_NOT_SUPPORTED info logs it emits when
-    # it skips a preferred backward-conv engine for our dilated 1-D convs and
-    # falls back to a working — and, benchmarked, FASTER — one). Must be set
-    # BEFORE `using cuDNN` loads the C library, which reads it at load time.
     using Base: C_NULL
     cuDNN.cudnnSetCallback(0, C_NULL, C_NULL)
     "cuDNN callback disabled"
 end
 
-# ╔═╡ 20c996f5-d056-4e10-b6fb-0995b444732a
-using PlutoPlotly
+# ╔═╡ 71b04988-4fa8-4a16-8ff9-f7e3167c44a4
+begin
+    using PlutoUI
+    using PGFPlotsX
+    # Publication-plot preamble (white background), same as the multiple_scattering
+    # generator and the reference multiple_scattering.jl notebook.
+    PGFPlotsX.CUSTOM_PREAMBLE = [
+        raw"\usetikzlibrary{backgrounds}",
+        raw"\tikzset{every picture/.style={background rectangle/.style={fill=white}, show background rectangle}}",
+        raw"\usepgfplotslibrary{fillbetween}",
+    ]
+end
 
-# ╔═╡ b3f6f1ae-066b-4427-a5f6-5512a0919865
-using PlutoUI
+# ╔═╡ fdc107e3-6d19-4838-ad2d-e139ed02d756
+using ProgressLogging
 
-# ╔═╡ c0000032-0000-0000-0000-000000000032
+# ╔═╡ 135760c5-1663-4d62-85a4-5d21d942641d
 begin
     using PlutoHooks, PlutoLinks
     using PlutoLinks: @ingredients
 end
 
-# ╔═╡ ba373ea1-0f23-424c-9778-2c6b55d30c34
-using ProgressLogging
+# ╔═╡ 81542682-66e0-46a8-8ac1-bb6455f9e1eb
+md"""# Multichannel Blind Deconvolution — CoherentN2N
 
-# ╔═╡ c000000c-0000-0000-0000-00000000000c
-include(joinpath(@__DIR__, "test", "synthetic_data.jl"))
+Recover a single common earthquake **source** ``s`` from many receiver
+seismograms, where receiver ``r`` records
 
-# ╔═╡ c0000002-0000-0000-0000-000000000002
-md"""# CoherentN2N — Main Notebook
+```math
+d_r = s * g_r
+```
 
-Alternating block-coordinate scheme for aligning and denoising a single
-station's multi-earthquake gather: cross-spectrum phase-slope shift
-estimation (Block B) alternated with Noise2Noise complex-spectrum
-denoising (Block A), with an optional per-earthquake polarity/gain
-correction.
+— the source convolved with that receiver's **Green's function** ``g_r``. The
+synthetic data comes from a 2-D acoustic multiple-scattering simulation
+(`../../multiple_scattering/`): a point source in a medium of random scatterers,
+so each ``g_r`` is a *full multi-sample scattering coda*, not a pure delay, and
+**traveltime moveout** between receivers arises naturally from the receiver-line
+geometry.
 
-Unlike `experimental/phase_aligner/` (a learned siamese scalar-phase
-network, no denoising), this method uses classical frequency-domain
-cross-correlation for alignment and a trained Noise2Noise network for
-denoising, alternating the two.
+## Why this is genuine blind deconvolution (not just stacking)
 
-## Files loaded by this notebook
+Aligning the traces and stacking recovers whatever is *common* across receivers.
+Because every receiver shares the same source ``s`` but has an independent
+``g_r``, the common factor is ``s`` itself — while ``g_r`` (the scattering coda)
+is the receiver-specific content. A plain aligned stack of ``d_r`` recovers
+``s * \bar g`` (source still convolved with the *average* response), **not**
+``s``: we need to strip ``g_r``.
 
-- `CoherentN2N_shift.jl` — Fourier shift theorem (complex-domain), coarse
-  xcorr + phase-slope sub-sample shift estimator (`estimate_shift_two_stage`)
-- `CoherentN2N_gauge.jl` — mode (KDE-peak) location-gauge fixing for per-earthquake shifts
-- `CoherentN2N_polarity.jl` — per-earthquake complex gain (polarity/amplitude)
-  estimation (used only if `use_polarity_gain=true`)
-- `CoherentN2N_denoiser.jl` — complex-valued conv encoder/decoder network
-- `CoherentN2N_n2n_pairs.jl` — Noise2Noise pair sampling (random earthquake
-  pairs at the same station)
-- `CoherentN2N_train_denoiser.jl` — denoiser training loop
-- `CoherentN2N_outer_loop.jl` — the alternating loop itself (`run_coherent_n2n`)
+## Method — CoherentN2N reinterpreted across receivers
 
-## Workflow
-1. Load all architecture/algorithm files (below)
-2. Synthetic validation (known ground truth — sanity check before real data)
-3. Real single-station receiver-function data (same JLD2 convention as
-   `experimental/phase_aligner/Training_PhaseAligner.jl`)
-4. Diagnostics: shift recovery, source stack, convergence history
+We reuse `run_coherent_n2n` unchanged. Its Noise2Noise denoiser is trained on
+pairs of **different receivers**: since each receiver is an independent "noisy
+look" whose *only* shared content is ``s``, the network learns to keep ``s`` and
+discard the receiver-specific ``g_r`` coda. The alternating loop:
+
+- **Block B** — cross-correlation + phase-slope alignment removes the geometric
+  moveout (`estimate_shift_two_stage`).
+- **Block A** — the N2N network deconvolves (strips ``g_r``), and a coherent
+  stack forms the updated source estimate ``\hat s``.
+
+The source ``s`` is generated by us, so we validate directly: recovered
+``\hat s`` vs. true ``s`` in time and frequency.
 """
 
-# ╔═╡ c0000003-0000-0000-0000-000000000003
-md"## Load architecture / algorithm files"
+# ╔═╡ 1ce3824c-dcf0-4811-9c2c-007e99a9da11
+md"## Load CoherentN2N algorithm files"
 
-# ╔═╡ c0000004-0000-0000-0000-000000000004
-# Single @ingredients call over CoherentN2N_lib.jl, which include()s all 7
-# architecture files (shift/gauge/polarity/denoiser/n2n_pairs/train_denoiser/
-# outer_loop). @ingredients uses Revise under the hood, so edits to any of
-# those files (or CoherentN2N_lib.jl's include list) are picked up
-# automatically — no manual cell rerun or kernel restart needed for
-# function-body changes. All functions/structs are accessed as cn.name(...).
-# (Re-run this cell after ADDING a new top-level name to an included file, so
-# the bound module re-imports it — Revise auto-tracks bodies, not new bindings.)
-cn = @ingredients(joinpath(@__DIR__, "CoherentN2N_lib.jl"))  # gauge: internal mode gauge, gauge-invariant via ŝ re-anchoring
+# ╔═╡ 89dcc49a-c979-45ec-be81-c513a66596c0
+# Single @ingredients over CoherentN2N_lib.jl (includes shift/gauge/polarity/
+# denoiser/n2n_pairs/train_denoiser/outer_loop). Everything is cn.name(...).
+# The library is reused UNCHANGED — nothing in it is specific to the
+# earthquake-vs-receiver interpretation; "columns" here are receivers.
+cn = @ingredients(joinpath(@__DIR__, "CoherentN2N_lib.jl"))
 
-# ╔═╡ c0000050-0000-0000-0000-000000000050
+# ╔═╡ 92f02400-a5d4-4644-9efa-9fbd053c1df1
 md"""---
-## Untrained-Architecture Diagnostic — per-sample RMS
+## Load a synthetic gather
 
-Probe the *architecture alone* (no training, no data): push many random white
-complex spectra through a freshly-built `ComplexDenoiser`, `ifft` to time, and
-measure the **per-time-sample RMS** across realizations. A spatially-flat operator
-gives a roughly flat RMS profile; a **dip at the centre sample** would expose a
-translation-equivariance break.
+Pick a `.jld2` produced by `../../multiple_scattering/generate_mscatter_data.jl`.
+Each file is one independent event: `d` (data ``s*g``, `Nt × R`), `g` (true
+per-receiver Green's functions), `s` (the source we aim to recover).
+"""
 
-History: the original strided (stride-2) U-Net denoiser had exactly such a node —
-stride-2 downsampling breaks translation equivariance, and the resulting
-position bias `ifft`s to a deep dip at the centre time sample (centre/edge RMS
-~0.03). The current denoiser is a **dilated, circular, stride-1** residual stack
-(WaveNet-style: dilations 1,2,4,8,… grow the receptive field without
-subsampling, so equivariance is preserved and the response is flat —
-centre/edge ~0.6–0.9). This cell should now show a roughly flat profile; the
-main residual feature is a mild spike at sample 0 (the DC bin).
+# ╔═╡ 86ac2a3b-89a5-4a7d-957c-564bf630cdde
+data_dir = normpath(joinpath(@__DIR__, "..", "..", "multiple_scattering", "data"))
 
-Vary `nt` and `filters` below; the profile should stay flat across `nt`."""
+# ╔═╡ 6b13710a-462a-4851-a690-b3c50db87ecc
+# (re-run this cell after generating new data — readdir is not filesystem-reactive)
+jld2_files = sort(filter(f -> endswith(f, ".jld2"), readdir(data_dir; join=true)))
 
-# ╔═╡ c0000051-0000-0000-0000-000000000051
+# ╔═╡ eb367d95-561d-4aa3-9b39-1af5caea610e
+# Interactive picker (empty-safe). NOTE: its bound value only updates when you
+# actually pick an option; the load cell below falls back to the first file so
+# the notebook runs headless / on first open without a manual selection.
+@bind data_path_sel Select(isempty(jld2_files) ? ["(run the generator)"] : jld2_files)
+
+# ╔═╡ 7be4f82e-3271-4c5d-bbb5-98f1d8b952cf
 begin
-    diag_nt_opts = [64, 128, 256, 300, 512]
-    md"""
-    N random inputs: $(@bind diag_N PlutoUI.Slider(50:50:1000; default=300, show_value=true))
-
-    nt: $(@bind diag_nt PlutoUI.Select(diag_nt_opts; default=128))
-
-    kernels (comma-sep): $(@bind diag_kernels_str PlutoUI.TextField(default="16,8"))
-
-    filters (comma-sep): $(@bind diag_filters_str PlutoUI.TextField(default="8,16"))
-    """
+    data_path = (data_path_sel in jld2_files) ? data_path_sel :
+                (isempty(jld2_files) ? error("No .jld2 files in $data_dir — run the generator") : first(jld2_files))
+    dat = load(data_path)
 end
 
-# ╔═╡ c0000052-0000-0000-0000-000000000052
-let
-    kernels = parse.(Int, split(diag_kernels_str, ","))
-    filters = parse.(Int, split(diag_filters_str, ","))
-    rng = Random.MersenneTwister(0)
-
-    # Untrained network at the chosen config (CPU — this is a tiny probe).
-    model = cn.build_complex_denoiser(diag_nt; kernels=kernels, filters=filters)
-
-    # N white complex spectra: real & imag ~ N(0,1). No data, no source structure.
-    X̂ = ComplexF32.(randn(rng, Float32, diag_nt, diag_N) .+ im .* randn(rng, Float32, diag_nt, diag_N))
-    Ŷ = model(X̂)
-
-    # Back to time; per-time-sample RMS across the N realizations.
-    x_t = real(ifft(X̂, 1))
-    y_t = real(ifft(Ŷ, 1))
-    rms(A) = vec(sqrt.(mean(abs2, A; dims=2)))
-    rms_in = rms(x_t)
-    rms_out = rms(y_t)
-    ratio = rms_out ./ (rms_in .+ eps(Float32))
-    ts = 0:(diag_nt - 1)
-    centre = diag_nt ÷ 2   # 0-based centre sample
-
-    tr_in = PlutoPlotly.scatter(x=collect(ts), y=rms_in, mode="lines",
-        name="input RMS", line=attr(color="grey", width=1.5, dash="dash"))
-    tr_out = PlutoPlotly.scatter(x=collect(ts), y=rms_out, mode="lines",
-        name="untrained output RMS", line=attr(color="#1f77b4", width=2))
-    tr_ratio = PlutoPlotly.scatter(x=collect(ts), y=ratio, mode="lines",
-        name="output/input RMS", line=attr(color="#d62728", width=2), yaxis="y2")
-    tr_centre = PlutoPlotly.scatter(x=[centre, centre], y=[0, maximum(rms_out)],
-        mode="lines", name="centre sample",
-        line=attr(color="black", width=1, dash="dot"))
-
-    layout = Layout(
-        title=attr(text="Untrained ComplexDenoiser — per-sample RMS over $(diag_N) white inputs (nt=$(diag_nt), kernels=$(kernels), filters=$(filters))"),
-        xaxis=attr(title="Time sample"),
-        yaxis=attr(title="RMS", side="left"),
-        yaxis2=attr(title="output/input ratio", side="right", overlaying="y", showgrid=false),
-        height=380, width=950, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot([tr_in, tr_out, tr_ratio, tr_centre], layout))
-end
-
-# ╔═╡ c000000b-0000-0000-0000-00000000000b
-md"---
-## Synthetic Validation
-
-Known ground-truth shifts, source wavelet, and (optionally) per-earthquake
-polarity/gain — sanity-checks the pipeline before touching real data.
-Mirrors the test scenarios in `test/test_outer_loop.jl` and
-`test/test_outer_loop_polarity.jl`.
-"
-
-# ╔═╡ c000000d-0000-0000-0000-00000000000d
-use_polarity_gain_syn = false  # toggle to true to exercise the polarity/gain path
-
-# ╔═╡ c000000e-0000-0000-0000-00000000000e
+# ╔═╡ a77fd47c-473e-4a21-96ce-22d107faf0be
 begin
-    rng_syn = MersenneTwister(1)
-    nt_syn = 128
-    R_syn = 200
-    τ_true_syn = Float32.(range(-8, 8, length=R_syn))
-    g_true_syn = use_polarity_gain_syn ?
-        ComplexF32.(rand(rng_syn, (-1.0, 1.0), R_syn) .* rand(rng_syn, 0.7:0.1:1.3, R_syn)) :
-        ones(ComplexF32, R_syn)
-
-    s_true_syn, D_syn, freqs_syn, _, _ = make_synthetic_gather(
-        nt=nt_syn, R=R_syn, f0=0.05, source_kind=:broadband,
-        true_shifts=τ_true_syn, true_gains=g_true_syn,
-        noise_std=0.5, rng=rng_syn)
+    G_true = Float32.(dat["g"])            # (Nt, R) per-receiver impulse responses
+    tvec = Float64.(vec(dat["tvec"]))
+    Nt, R = size(G_true)
+    (; Nt, R, dt=dat["dt"])
 end
 
-# ╔═╡ c000001a-0000-0000-0000-00000000001a
-md"### Raw Training Data (before alignment/denoising)"
-
-# ╔═╡ c000001b-0000-0000-0000-00000000001b
+# ╔═╡ 6a9880bf-ed87-4cf0-8aa7-8419e5f4ae05
+# Companion PNG overview of the loaded event (wavefield with scatterers/receivers/
+# source, and the impulse responses g) — so the raw simulation is visible at a
+# glance before any processing.
 let
-    tr = PlutoPlotly.heatmap(z=D_syn, colorscale="RdBu", zmid=0)
-    layout = Layout(
-        title=attr(text="Raw synthetic gather (unaligned, noisy) — $(R_syn) earthquakes"),
-        xaxis=attr(title="Earthquake index"), yaxis=attr(title="Sample"),
-        height=400, width=900, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot([tr], layout))
+    png = replace(data_path, ".jld2" => ".png")
+    isfile(png) ? PlutoUI.LocalResource(png) : md"_(no companion PNG found)_"
 end
 
-# ╔═╡ c000001c-0000-0000-0000-00000000001c
-let
-    ts = 1:nt_syn
-    n_show = min(8, R_syn)
-    traces = [
-        PlutoPlotly.scatter(x=collect(ts), y=D_syn[:, r] .+ 3 * (r - 1), mode="lines",
-            name="eq $r (τ=$(round(τ_true_syn[r], digits=1)))", line=attr(width=1.2))
-        for r in 1:n_show
-    ]
-    layout = Layout(
-        title=attr(text="Raw synthetic traces (first $(n_show), offset for visibility)"),
-        xaxis=attr(title="Sample"), yaxis=attr(title="Amplitude (offset)", showticklabels=false),
-        height=450, width=900, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot(traces, layout))
+# ╔═╡ b1a7c0de-0001-4000-8000-000000000001
+md"""## Synthesize source and form the data ``d_r = s * g_r``
+
+The simulation supplies only the impulse responses ``g_r``. Here in the notebook
+we build a common source-time function ``s`` and convolve it onto every receiver
+to form the observed gather — so one simulated medium can be reused for any
+source. Blind deconvolution then tries to recover this ``s`` from the ``d_r``.
+"""
+
+# ╔═╡ b1a7c0de-0002-4000-8000-000000000002
+# Ricker-summed earthquake source wavelet (same construction as the reference /
+# generate_source_wavelet), built here so we know the ground truth s exactly.
+function make_source(tvec; Mw=6.5, num_pulses=4, seed=7)
+    rng = MersenneTwister(seed)
+    t = tvec
+    stf = zeros(length(t))
+    amp_scale = 10.0^(1.5Mw + 9.1) / 1e20
+    for _ in 1:num_pulses
+        center = rand(rng) * (0.2 - 0.1) * last(t) + 0.1 * last(t)
+        width = rand(rng) * (5.0 - 0.5) + 0.5
+        amp = (rand(rng) * (1.2 - 0.5) + 0.5) * amp_scale / num_pulses
+        f = 1 / width
+        stf .+= amp .* (1 .- 2 .* (π .* f .* (t .- center)) .^ 2) .*
+                exp.(-(π .* f .* (t .- center)) .^ 2)
+    end
+    return Float32.(stf)
 end
 
-# ╔═╡ c000000f-0000-0000-0000-00000000000f
-para_syn = cn.CoherentN2N_Para(nt=nt_syn, kernels=[16, 8], filters=[8, 16], use_gpu=true)
+# ╔═╡ b1a7c0de-0003-4000-8000-000000000003
+# Additive noise level (fraction of data peak) — convolution is done here, so
+# noise is a notebook knob now, not baked into the saved data.
+@bind noise_frac Slider(0.0:0.01:0.2; default=0.02, show_value=true)
 
-# ╔═╡ c0000061-0000-0000-0000-000000000061
-md"""#### Shift bound (synthetic)
-Restrict recovered shifts to ±`max_shift` samples: $(@bind bound_syn PlutoUI.CheckBox(default=false)) enable,
-$(@bind max_shift_syn PlutoUI.Slider(1:64; default=20, show_value=true)) samples"""
+# ╔═╡ b1a7c0de-0004-4000-8000-000000000004
+begin
+    s_true = make_source(tvec)             # (Nt,) common source — the recovery target
+    # d_r = s * g_r via circular convolution in the frequency domain.
+    Ŝ = fft(ComplexF32.(s_true))
+    D_clean = real(ifft(Ŝ .* fft(ComplexF32.(G_true), 1), 1))
+    noise = noise_frac == 0 ? zeros(Float32, size(D_clean)) :
+            Float32(noise_frac) * maximum(abs, D_clean) .* randn(MersenneTwister(0), Float32, size(D_clean))
+    D = Float32.(D_clean .+ noise)         # (Nt, R) observed gather
+    (; peak=maximum(abs, D_clean), noise_frac)
+end
 
-# ╔═╡ c0000010-0000-0000-0000-000000000010
-outer_para_syn = cn.CoherentN2N_Outer_Para(
-    n_outer_iters=10, use_polarity_gain=use_polarity_gain_syn,
-    max_shift=bound_syn ? Float32(max_shift_syn) : Inf32,
+# ╔═╡ e8d96a27-2e2e-4815-a816-5ab55f5ae868
+md"## Preprocess (taper + per-trace normalize)"
+
+# ╔═╡ 0ab04a60-7267-4434-8a45-3e63dfae5d1a
+# Per-trace normalize + sin taper (same convention as CoherentN2N_main.jl).
+# Whitening is intentionally OFF: it would broaden the wavelet and change the
+# band, and we want ŝ compared to s in the source's native band.
+function taper_sin_real(x)
+    nt = size(x, 1)
+    w = sin.(range(0, π, length=nt)) .^ 1
+    return x .* reshape(w, nt, ntuple(_ -> 1, ndims(x) - 1)...)
+end
+
+# ╔═╡ 5bedcba0-107b-46b8-b361-0f17ea7dca57
+D_proc = let
+    mr = mean(D; dims=1)
+    sr = std(D; dims=1)
+    Float32.(taper_sin_real((D .- mr) ./ max.(sr, 1f-8)))
+end
+
+# ╔═╡ 17a4b4d6-a75e-4932-a675-e206ec45ad78
+md"""---
+## Run CoherentN2N blind deconvolution
+
+`run_coherent_n2n` alternates alignment (Block B) and N2N deconvolution (Block A).
+Adjust the denoiser size / training below.
+"""
+
+# ╔═╡ d45f9551-2985-4350-b430-009887f23bd4
+para = cn.CoherentN2N_Para(nt=Nt, kernels=[32, 16, 8], filters=[16, 32, 64], use_gpu=true)
+
+# ╔═╡ edccebf4-b93f-41df-a708-ed48a32f1fb2
+outer_para = cn.CoherentN2N_Outer_Para(
+    n_outer_iters=10, use_polarity_gain=true,
     denoiser_training=cn.CoherentN2N_Denoiser_Training_Para(
-        n_samples_per_epoch=256, batchsize=200, nepoch=80,
-        initial_lr=0.003, restart_period=40, nprint=20))
+        n_samples_per_epoch=512, batchsize=64, nepoch=120,
+        initial_lr=0.002, restart_period=40, nprint=30))
 
-# ╔═╡ c0000055-0000-0000-0000-000000000055
-train_syn_button = @bind train_syn_click PlutoUI.CounterButton("Train synthetic")
+# ╔═╡ 2c8d5c22-94af-479f-85ab-ed8c25c899cd
+rng = MersenneTwister(1)
 
-# ╔═╡ c0000011-0000-0000-0000-000000000011
-# Runs ONLY after a click (see the real-data run cell): `nothing` until the
-# "Train synthetic" button is first pressed, then exactly one run per click.
-result_syn = @use_memo([train_syn_click]) do
-    train_syn_click == 0 ? nothing :
-    cn.run_coherent_n2n(D_syn, para_syn, outer_para_syn; rng=rng_syn)
+# ╔═╡ 7ef65dc2-9b09-4e0b-bf4f-c5f4335254db
+result = cn.run_coherent_n2n(D_proc, para, outer_para; rng=rng)
+
+# ╔═╡ ae5cb581-a734-42b0-9f20-ecddcda8cf30
+md"""---
+## Validation — recovered ``\hat s`` vs. true ``s``
+
+Blind deconvolution recovers ``s`` only up to a global scale and a constant time
+shift (the gauge). We normalize both and cross-correlation-align ``\hat s`` to
+``s`` before comparing.
+"""
+
+# ╔═╡ ce0fc19f-1a64-4d1d-a606-ddd13ea3dd2f
+# Bring ŝ into a comparable frame: to time domain, undo the arbitrary constant
+# lag via cross-correlation with s_true, and unit-normalize both. Also fixes a
+# possible global sign flip.
+begin
+    ŝ_raw = real(ifft(result.ŝ))
+    normv(x) = x ./ (sqrt(sum(abs2, x)) + eps(Float32))
+    # circular cross-correlation lag that best aligns ŝ to s_true
+    cc = real(ifft(conj(fft(normv(ŝ_raw))) .* fft(normv(s_true))))
+    best_lag = argmax(abs.(cc)) - 1
+    ŝ_shift = circshift(ŝ_raw, best_lag)
+    flip = sign(sum(normv(ŝ_shift) .* normv(s_true)))
+    ŝ = normv(flip .* ŝ_shift)
+    s_ref = normv(s_true)
+    recovery_corr = sum(ŝ .* s_ref)   # normalized correlation in [-1,1]
+    @info "Source recovery" correlation = recovery_corr best_lag flip
+    recovery_corr
 end
 
-# ╔═╡ c0000012-0000-0000-0000-000000000012
-result_syn === nothing ? md"⏳ Click **Train synthetic** to populate this." : let
-    ŝ_time = real(ifft(result_syn.ŝ))
-    c = cor(ŝ_time, s_true_syn)
-    @info "Synthetic source recovery" correlation=c
-    (; correlation=c, delta_s=result_syn.history.delta_s, delta_tau=result_syn.history.delta_tau)
-end
-
-# ╔═╡ c000001d-0000-0000-0000-00000000001d
-md"### Aligned Data (final recovered shifts applied)"
-
-# ╔═╡ c000001e-0000-0000-0000-00000000001e
-D_aligned_syn = result_syn === nothing ? nothing : let
-    grid_syn = ComplexF32.(-im .* 2f0 .* Float32(π) .* freqs_syn)
-    X̂_syn = ComplexF32.(fft(D_syn, 1))
-    # result_syn.τ is absolute (anchor reapplied); re-center to the same
-    # gauge used internally (mode over non-outlier traces) so the alignment
-    # below matches what the outer loop used to build its final coherent stack.
-    good_syn = .!result_syn.outliers
-    τ_gauge = result_syn.τ .- cn.mode_kde(result_syn.τ[good_syn])
-    X̂_aligned_syn = cn.shift_spectrum(X̂_syn, reshape(-τ_gauge, 1, R_syn), grid_syn)
-    real(ifft(X̂_aligned_syn, 1))
-end
-
-# ╔═╡ c000001f-0000-0000-0000-00000000001f
-D_aligned_syn === nothing ? md"⏳ Click **Train synthetic** to populate this." : let
-    tr = PlutoPlotly.heatmap(z=D_aligned_syn, colorscale="RdBu", zmid=0)
-    layout = Layout(
-        title=attr(text="Aligned synthetic gather (τ from run_coherent_n2n) — $(R_syn) earthquakes"),
-        xaxis=attr(title="Earthquake index"), yaxis=attr(title="Sample"),
-        height=400, width=900, plot_bgcolor="white", paper_bgcolor="white",
+# ╔═╡ 132b2c51-21c9-454e-aaee-9a70df3c18c9
+# Headline figure: recovered vs true source (time domain), publication style.
+let
+    fig = @pgf Axis(
+        {
+            xmajorgrids, ymajorgrids,
+            width = "14cm", height = "7cm",
+            xlabel = "Time (s)", ylabel = "Normalized amplitude",
+            title = "Recovered vs. true source (corr = $(round(recovery_corr, digits=3)))",
+            title_style = "{font=\\fontsize{15}{12}\\selectfont}",
+            legend_style = "{at={(0.97,0.97)}, anchor=north east}",
+        },
+        (@pgf PGFPlotsX.Plot({color = "red", no_marks, "line width=1.2pt"},
+                             Coordinates(tvec, s_ref))),
+        LegendEntry("true \$s\$"),
+        (@pgf PGFPlotsX.Plot({color = "blue", no_marks, "line width=1.2pt", dashed},
+                             Coordinates(tvec, ŝ))),
+        LegendEntry("recovered \$\\hat s\$"),
     )
-    WideCell(PlutoPlotly.plot([tr], layout))
+    fig
 end
 
-# ╔═╡ c0000020-0000-0000-0000-000000000020
-D_aligned_syn === nothing ? md"⏳ Click **Train synthetic** to populate this." : let
-    ts = 1:nt_syn
-    n_show = min(8, R_syn)
-    traces = [
-        PlutoPlotly.scatter(x=collect(ts), y=D_aligned_syn[:, r] .+ 3 * (r - 1), mode="lines",
-            name="eq $r", line=attr(width=1.2))
-        for r in 1:n_show
-    ]
-    layout = Layout(
-        title=attr(text="Aligned synthetic traces (first $(n_show), offset for visibility)"),
-        xaxis=attr(title="Sample"), yaxis=attr(title="Amplitude (offset)", showticklabels=false),
-        height=450, width=900, plot_bgcolor="white", paper_bgcolor="white",
+# ╔═╡ 24db6c53-d503-4636-8132-f2d4f6fc0bc5
+md"### Amplitude spectra"
+
+# ╔═╡ 5dc8883b-3393-4029-83d7-7704a6de9e8c
+# |ŝ(f)| vs |s(f)| over the positive-frequency band.
+let
+    nf = Nt ÷ 2 + 1
+    fax = rfftfreq(Nt, inv(dat["dt"]))
+    Ŝ = abs.(rfft(ŝ)); Ŝ ./= maximum(Ŝ)
+    S = abs.(rfft(s_ref)); S ./= maximum(S)
+    fig = @pgf Axis(
+        {
+            xmajorgrids, ymajorgrids,
+            width = "14cm", height = "6cm",
+            xlabel = "Frequency (Hz)", ylabel = "Normalized |amplitude|",
+            title = "Source amplitude spectrum",
+            legend_style = "{at={(0.97,0.97)}, anchor=north east}",
+        },
+        (@pgf PGFPlotsX.Plot({color = "red", no_marks, "line width=1.2pt"},
+                             Coordinates(collect(fax), S))),
+        LegendEntry("true \$|s(f)|\$"),
+        (@pgf PGFPlotsX.Plot({color = "blue", no_marks, "line width=1.2pt", dashed},
+                             Coordinates(collect(fax), Ŝ))),
+        LegendEntry("recovered \$|\\hat s(f)|\$"),
     )
-    WideCell(PlutoPlotly.plot(traces, layout))
+    fig
 end
 
-# ╔═╡ fd5a5b29-7c3f-4fa6-959c-bb34c22c035b
-md"### Synthetic Diagnostics"
+# ╔═╡ 3b339857-27fd-4dd7-b4c5-c438afb33667
+md"""### Deconvolution vs. plain aligned stack
 
-# ╔═╡ c0000016-0000-0000-0000-000000000016
-md"---
+The whole point: a plain aligned **stack** of the data recovers ``s * \bar g``
+(still carries scattering coda / is broader). The N2N step deconvolves it toward
+the bare ``s``.
+"""
+
+# ╔═╡ 8b7f821b-d832-418d-ab40-1004a60c834f
+# Plain aligned stack of D_proc using the run's recovered shifts (no denoising).
+begin
+    freqs = Float32.(fftfreq(Nt))
+    grid = ComplexF32.(-im .* 2f0 .* Float32(π) .* freqs)
+    X̂ = ComplexF32.(fft(D_proc, 1))
+    good = .!result.outliers
+    τ_gauge = result.τ .- cn.mode_kde(result.τ[good])
+    X̂_al = cn.shift_spectrum(X̂, reshape(-τ_gauge, 1, R), grid)
+    D_aligned = real(ifft(X̂_al, 1))
+    stack_raw = vec(mean(D_aligned, dims=2))
+    # bring into the same frame as ŝ/s_ref
+    cc2 = real(ifft(conj(fft(stack_raw ./ (norm(stack_raw)+eps()))) .* fft(s_ref)))
+    stack = circshift(stack_raw, argmax(abs.(cc2)) - 1)
+    stack .*= sign(sum(stack .* s_ref))
+    stack ./= (norm(stack) + eps())
+end
+
+# ╔═╡ 85b8cff8-cefa-4a80-99d0-4d273ae34fb7
+let
+    fig = @pgf Axis(
+        {
+            xmajorgrids, ymajorgrids,
+            width = "14cm", height = "7cm",
+            xlabel = "Time (s)", ylabel = "Normalized amplitude",
+            title = "Deconvolved \$\\hat s\$ vs. plain aligned stack",
+            legend_style = "{at={(0.97,0.97)}, anchor=north east}",
+        },
+        (@pgf PGFPlotsX.Plot({color = "red", no_marks, "line width=1.2pt"},
+                             Coordinates(tvec, s_ref))),
+        LegendEntry("true \$s\$"),
+        (@pgf PGFPlotsX.Plot({"gray", no_marks, "line width=1.0pt"},
+                             Coordinates(tvec, stack))),
+        LegendEntry("aligned stack (\$s*\\bar g\$)"),
+        (@pgf PGFPlotsX.Plot({color = "blue", no_marks, "line width=1.2pt", dashed},
+                             Coordinates(tvec, ŝ))),
+        LegendEntry("deconvolved \$\\hat s\$"),
+    )
+    fig
+end
+
+# ╔═╡ 1b733567-db8e-4652-8cad-13e4ac13de4c
+md"""---
 ## Diagnostics
+### Gather before vs. after alignment (wiggle)
+"""
 
-`result.ŝ` — final complex source-spectrum estimate (`real(ifft(result.ŝ))`
-for the time-domain stack). `result.τ` — recovered per-earthquake shifts
-(absolute, anchor reapplied). `result.gains` — per-earthquake complex gain
-(all-ones if `use_polarity_gain=false`). `result.outliers` — energy-outlier
-mask (excluded from the stack/gauge fit).
-
-Two distinct \"loss\"-like signals are plotted below — don't conflate them:
-- **`result.history.delta_s` / `delta_tau`**: the **outer alternating loop's
-  own convergence** — how much the recovered source estimate / shift vector
-  changed between successive outer iterations. Not a trained loss; a
-  block-coordinate convergence check (should trend toward zero if the loop
-  is settling).
-- **`result.history.denoiser_loss`**: the **Noise2Noise network's actual
-  training loss** — MSE between the denoiser's prediction on one earthquake
-  and a different, randomly-paired earthquake's aligned spectrum, one curve
-  per outer iteration, one point per training epoch. Measures whether the
-  network is learning within a given outer iteration's training run,
-  independent of whether the outer loop itself is converging.
-"
-
-# ╔═╡ c0000017-0000-0000-0000-000000000017
-result_syn === nothing ? md"⏳ Click **Train synthetic** to populate this." : let
-    ŝ_time = real(ifft(result_syn.ŝ))
-    raw_mean = vec(mean(D_syn, dims=2))
-    ts = 1:nt_syn
-    # Normalize each trace by its own max-abs so amplitude-scale differences
-    # (raw mean is typically much smaller than ŝ before denoising) don't
-    # visually dominate the comparison.
-    norm1(x) = x ./ (maximum(abs, x) + eps(Float32))
-    traces = [
-        PlutoPlotly.scatter(x=collect(ts), y=norm1(s_true_syn), mode="lines",
-            name="True source", line=attr(color="grey", width=1.5, dash="dash")),
-        PlutoPlotly.scatter(x=collect(ts), y=norm1(ŝ_time), mode="lines",
-            name="Recovered ŝ", line=attr(color="#d62728", width=2)),
-        PlutoPlotly.scatter(x=collect(ts), y=norm1(raw_mean), mode="lines",
-            name="Raw Mean", line=attr(color="blue", width=2)),
-    ]
-    layout = Layout(
-        title=attr(text="Synthetic: recovered vs. true source (normalized)"),
-        xaxis=attr(title="Sample"), yaxis=attr(title="Normalized amplitude"),
-        height=350, width=900, plot_bgcolor="white", paper_bgcolor="white",
+# ╔═╡ 17334288-14f4-43a8-a1ed-e93ef2a66c49
+# Vertical-offset wiggle panel of a (Nt × R) gather (every `skip`-th trace).
+function wiggle_axis(title, tvec, M; dy=6, skip=5)
+    Irec = 1:skip:size(M, 2)
+    Mn = M ./ max.(std(M, dims=1), eps(Float32))
+    @pgf Axis(
+        {
+            xmajorgrids,
+            title = title, width = "6cm", height = "11cm",
+            enlargelimits = false,
+            xmin = first(tvec), xmax = last(tvec),
+            ymin = 0, ymax = (length(Irec) - 1) * dy,
+            ytick = "\\empty", xlabel = "Time (s)",
+            title_style = "{font=\\fontsize{14}{12}\\selectfont}",
+        },
+        [@pgf PGFPlotsX.Plot({color = "blue", no_marks, "line width=0.5pt"},
+                             Coordinates(tvec, dy * (i - 1) .+ Mn[:, j]))
+         for (i, j) in enumerate(Irec)]...,
     )
-    WideCell(PlutoPlotly.plot(traces, layout))
 end
 
-# ╔═╡ c0000018-0000-0000-0000-000000000018
-result_syn === nothing ? md"⏳ Click **Train synthetic** to populate this." : let
-    # Center both by mode over the same non-outlier set, matching the internal
-    # mode location gauge, so the two distributions share a reference.
-    good_syn = .!result_syn.outliers
-    τ_est_centered = result_syn.τ .- cn.mode_kde(result_syn.τ[good_syn])
-    τ_true_centered = τ_true_syn .- cn.mode_kde(τ_true_syn[good_syn])
-    idx = collect(1:length(τ_true_syn))
-    traces = [
-        PlutoPlotly.scatter(x=idx, y=τ_true_centered, mode="markers",
-            name="True τ (centered)", marker=attr(color="grey", size=8, symbol="circle-open")),
-        PlutoPlotly.scatter(x=idx, y=τ_est_centered, mode="markers",
-            name="Recovered τ (centered)", marker=attr(color="#d62728", size=6)),
-    ]
-    layout = Layout(
-        title=attr(text="Synthetic: recovered vs. true shifts (gauge-centered)"),
-        xaxis=attr(title="Earthquake index"), yaxis=attr(title="τ (samples)"),
-        height=350, width=900, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot(traces, layout))
-end
+# ╔═╡ 91fb30cb-18a5-4c8d-a00f-857ca311f808
+@pgf GroupPlot(
+    {group_style = {group_size = "2 by 1", "horizontal sep" = "1.6cm"}},
+    wiggle_axis("Before alignment (\$d\$)", tvec, D_proc),
+    wiggle_axis("After alignment", tvec, D_aligned),
+)
 
-# ╔═╡ c0000060-0000-0000-0000-000000000060
-result_syn === nothing ? md"⏳ Click **Train synthetic** to populate this." : let
-    # Recovered vs. true shift distributions (both gauge-centered). Synthetic
-    # test has ground truth, so overlay true τ for comparison. Center by median
-    # over the non-outlier set to match the internal mode location gauge.
-    good_syn = .!result_syn.outliers
-    τ_est_hist = result_syn.τ .- cn.mode_kde(result_syn.τ[good_syn])
-    τ_true_hist = τ_true_syn .- cn.mode_kde(τ_true_syn[good_syn])
-    traces = [
-        PlutoPlotly.histogram(x=τ_true_hist, name="True τ",
-            marker=attr(color="grey", opacity=0.55)),
-        PlutoPlotly.histogram(x=τ_est_hist, name="Recovered τ",
-            marker=attr(color="#d62728", opacity=0.65)),
-    ]
-    layout = Layout(
-        title=attr(text="Synthetic: recovered vs. true shift distribution (gauge-centered)"),
-        xaxis=attr(title="τ (samples)"), yaxis=attr(title="Count"),
-        barmode="overlay",
-        height=350, width=700, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot(traces, layout))
-end
+# ╔═╡ fbd9e6ad-941c-44ef-b401-350d8dc839ae
+md"### True Green's functions ``g`` (the coda that was stripped)"
 
-# ╔═╡ c0000019-0000-0000-0000-000000000019
-result_syn === nothing ? md"⏳ Click **Train synthetic** to populate this." : let
-    iters = collect(1:length(result_syn.history.delta_s))
-    tr1 = PlutoPlotly.scatter(x=iters, y=result_syn.history.delta_s, mode="lines+markers",
-        name="Δŝ", line=attr(color="#1f77b4", width=2))
-    tr2 = PlutoPlotly.scatter(x=iters, y=result_syn.history.delta_tau, mode="lines+markers",
-        name="Δτ", line=attr(color="#d62728", width=2), yaxis="y2")
-    layout = Layout(
-        title=attr(text="Synthetic: OUTER-LOOP convergence (Δŝ, Δτ between iterations — not a trained loss)"),
-        xaxis=attr(title="Outer iteration"),
-        yaxis=attr(title="‖Δŝ‖", side="left"),
-        yaxis2=attr(title="‖Δτ‖", side="right", overlaying="y"),
-        height=350, width=900, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot([tr1, tr2], layout))
-end
+# ╔═╡ 7663b20f-59a0-43f5-80c4-37043e545d48
+wiggle_axis("Impulse responses \$g_r\$", tvec, G_true)
 
-# ╔═╡ c0000030-0000-0000-0000-000000000030
-result_syn === nothing ? md"⏳ Click **Train synthetic** to populate this." : let
-    traces = [
-        PlutoPlotly.scatter(x=collect(1:length(loss_curve)), y=loss_curve, mode="lines",
-            name="Outer iter $i", line=attr(width=1.5))
-        for (i, loss_curve) in enumerate(result_syn.history.denoiser_loss)
-    ]
-    layout = Layout(
-        title=attr(text="Synthetic: Noise2Noise DENOISER training loss (per outer iteration)"),
-        xaxis=attr(title="Epoch (within outer iteration)"),
-        yaxis=attr(title="N2N MSE (nt-normalized, time-domain scale)", type="log"),
-        height=350, width=900, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot(traces, layout))
-end
+# ╔═╡ 0c4ccf4d-3f3d-4db1-b8a0-255478697f0a
+md"### Denoiser training loss (per outer iteration)"
 
-# ╔═╡ c0000013-0000-0000-0000-000000000013
-md"---
-## Real Data Section
-
-Same single-station, multi-earthquake JLD2 convention as
-`experimental/phase_aligner/Training_PhaseAligner.jl`: `Data[station_index]`
--> `(nt, n_events)` matrix, parallel `Sta`/`EventLoc`/`EventMag`/`EventDep`
-arrays, companion SNR file for quality filtering. Replace `fldir`/`dn`/`StaN`
-below with your real path and station of interest.
-"
-
-# ╔═╡ c0000014-0000-0000-0000-000000000014
-fldir_real = "/mnt/NAS/EQData/RFData"
-
-# ╔═╡ c0000015-0000-0000-0000-000000000015
-dn_real = "GSN_150ZTR_Bandpass_0.05_0.8_29nov_rf_iter_f1.jld2"
-
-# ╔═╡ c0000021-0000-0000-0000-000000000021
-snrf_real = "GSN_150ZTR_Bandpass_0.05_0.8_29nov_snr.jld2"
-
-# ╔═╡ c0000042-0000-0000-0000-000000000042
-# Load the JLD2 file handles / metadata ONCE, independent of which receivers are
-# selected, so the receiver picker below can list every available station.
-begin
-    dfile_real = "$(fldir_real)/$(dn_real)"
-    StaName_real = load(dfile_real)["Sta"][1]        # station codes (parallel to Data)
-    StaAll_real = load(dfile_real)["Sta"][2]         # station [lat, lon] coords
-    ses_snr_real = load("$(fldir_real)/$(snrf_real)", "SNR")
-    Data_real = load(dfile_real)["Data"]
-    EventLoc_real = load(dfile_real)["EventLoc"]
-    StaName_all_real = unique(StaName_real)          # picker options
-    snr_tres_real = 0.0
-    (n_stations_available=length(StaName_all_real),)
-end
-
-# ╔═╡ c0000022-0000-0000-0000-000000000022
-# Receivers (stations) to treat as groups — each becomes one group with its own
-# ŝ_g in run_coherent_n2n_grouped. All stations selected by default (select_all).
-@bind StaN_list_real PlutoUI.MultiCheckBox(StaName_all_real;
-                                           default=StaName_all_real, select_all=true)
-
-# ╔═╡ c0000023-0000-0000-0000-000000000023
-begin
-
-    # Loop over the requested receivers, building a RAGGED per-receiver gather:
-    # each station g contributes its own SNR-passing events (R_g varies). Same
-    # per-station SNR-mask + RF-window trim as the single-station path; a
-    # station code absent from the file is skipped with a warning. StaN_used
-    # records the station codes actually built, index-aligned to the groups.
-    raw_data_list = Vector{Matrix{Float64}}()
-    StaLoc_list = Vector{Any}()
-    EvtLoc_list = Vector{Any}()
-    StaN_used = String[]
-    for sta in StaN_list_real
-        hits = findall(x -> x == sta, StaName_real)
-        isempty(hits) && (@warn "Station $sta not found in $(dn_real); skipping"; continue)
-        ix = hits[1]
-        sel = findall(x -> x > snr_tres_real, ses_snr_real[ix])
-        isempty(sel) && (@warn "Station $sta has no SNR-passing events; skipping"; continue)
-        push!(raw_data_list, Data_real[ix][:, sel][501:800, :])  # trim RF window
-        push!(StaLoc_list, StaAll_real[ix])
-        push!(EvtLoc_list, EventLoc_real[ix][sel])               # 1:1 with this group's columns
-        push!(StaN_used, sta)
-    end
-    @assert !isempty(raw_data_list) "No requested station produced any data"
-
-    (n_groups=length(raw_data_list), R_per_group=size.(raw_data_list, 2),
-     nt=size(raw_data_list[1], 1))
-end
-
-# ╔═╡ c0000024-0000-0000-0000-000000000024
-# """Per-trace normalize + taper (same convention as Training_PhaseAligner.jl:388-391)."""
-# function taper_sin_real(x)
-#     nt = size(x, 1)
-#     w = sin.(range(0, π, length=nt)) .^ 1
-#     return x .* reshape(w, nt, ntuple(_ -> 1, ndims(x) - 1)...)
-# end
-
-# ╔═╡ c0000025-0000-0000-0000-000000000025
-groups_real = map(raw_data_list) do rd
-    mr = mean(rd; dims=1)
-    sr = std(rd; dims=1)
-    Float32.(((rd .- mr) ./ max.(sr, 1f-8)))
-end
-
-# ╔═╡ c0000026-0000-0000-0000-000000000026
-md"### Raw Real Data (before alignment/denoising)"
-
-# ╔═╡ c0000028-0000-0000-0000-000000000028
-para_real = cn.CoherentN2N_Para(nt=size(groups_real[1], 1), use_gpu=true)
-
-# ╔═╡ c0000054-0000-0000-0000-000000000054
-train_real_button = @bind train_real_click PlutoUI.CounterButton("Train receivers")
-
-# ╔═╡ c0000053-0000-0000-0000-000000000053
-md"""#### Training controls
-Outer iters: $(@bind ni_real PlutoUI.Slider(1:20; default=10, show_value=true))  •
-Polarity gain: $(@bind pg_real PlutoUI.CheckBox(default=false))
-
-Epochs/iter: $(@bind nepoch_real PlutoUI.Slider(20:20:400; default=200, show_value=true))  •
-Batch size: $(@bind bs_real PlutoUI.Slider(16:16:2048; default=512, show_value=true))
-
-Samples/epoch (per group): $(@bind nspe_real PlutoUI.Slider(64:64:1024; default=512, show_value=true))  •
-Restart period: $(@bind rp_real PlutoUI.Slider(10:10:200; default=50, show_value=true))
-
-Initial LR: $(@bind lr_real PlutoUI.Select([0.0003, 0.001, 0.003, 0.01]; default=0.001))
-
-Bound shifts to ±: $(@bind bound_real PlutoUI.CheckBox(default=false)) enable, $(@bind max_shift_real PlutoUI.Slider(1:64; default=10, show_value=true)) samples"""
-
-# ╔═╡ c0000029-0000-0000-0000-000000000029
-outer_para_real = cn.CoherentN2N_Outer_Para(
-    n_outer_iters=ni_real,
-    use_polarity_gain=pg_real,
-    max_shift=bound_real ? Float32(max_shift_real) : Inf32,
-    denoiser_training=cn.CoherentN2N_Denoiser_Training_Para(
-        n_samples_per_epoch=nspe_real, batchsize=bs_real, nepoch=nepoch_real,
-        initial_lr=lr_real, restart_period=rp_real))
-
-# ╔═╡ c000002a-0000-0000-0000-00000000002a
-# Runs ONLY after a button click: CounterButton starts at 0, so the body is
-# skipped (result stays `nothing`) on load; clicking "Train receivers" bumps
-# train_real_click and, via @use_memo's dep list, triggers exactly one training
-# run. Editing groups_real / para_real / outer_para_real marks this cell stale
-# but does NOT retrain until the button is clicked again. (CounterButton +
-# @use_memo pattern as in Training_PhaseAligner.jl.)
-result_real = @use_memo([train_real_click]) do
-    train_real_click == 0 ? nothing :
-    cn.run_coherent_n2n_grouped(groups_real, para_real, outer_para_real)
-end
-
-# ╔═╡ c0000040-0000-0000-0000-000000000040
-md"""### Group (receiver) selector — click a station on the map
-All per-receiver plots below show the selected receiver's group. `run_coherent_n2n_grouped`
-trains ONE shared denoiser across all receivers but returns one ŝ_g per receiver.
-**Click a marker** on the map to reactively switch which receiver's ŝ_g / plots are shown."""
-
-# ╔═╡ c0000041-0000-0000-0000-000000000041
-# Clickable receiver map: scattergeo of the used stations; a plotly_click
-# listener writes the clicked point's (1-based) index into the cell's bound
-# value so g_sel updates reactively. StaLoc_list[g] is [lat, lon].
-@bind g_sel_click let
-    lats = [loc[1] for loc in StaLoc_list]
-    lons = [loc[2] for loc in StaLoc_list]
-    tr = PlutoPlotly.scattergeo(
-        lat=lats, lon=lons, text=StaN_used, mode="markers+text",
-        textposition="top center",
-        marker=attr(size=10, color="#d62728", line=attr(width=1, color="white")),
-    )
-    layout = Layout(
-        title=attr(text="Receivers — click a marker to select its group"),
-        geo=attr(projection=attr(type="natural earth"), showland=true,
-                 landcolor="rgb(240,240,240)", showcountries=true,
-                 countrycolor="rgb(200,200,200)", showcoastlines=true),
-        height=450, width=900, margin=attr(l=0, r=0, t=40, b=0),
-    )
-    p = PlutoPlotly.plot([tr], layout)
-    PlutoPlotly.add_plotly_listener!(p, "plotly_click", PlutoPlotly.htl_js("""
-    function(e) {
-        // 1-based Julia index of the clicked receiver marker.
-        PLOT.value = e.points[0].pointIndex + 1;
-        PLOT.dispatchEvent(new CustomEvent("input"));
-    }
-    """))
-    p
-end
-
-# ╔═╡ c0000043-0000-0000-0000-000000000043
-# Coalesce the map's click value (missing until the first click) to a valid
-# 1-based group index, clamped to the current number of groups. Every
-# per-receiver plot below reads g_sel.
-g_sel = (g_sel_click === missing || g_sel_click === nothing) ? 1 :
-        clamp(Int(g_sel_click), 1, length(groups_real))
-
-# ╔═╡ c0000027-0000-0000-0000-000000000027
+# ╔═╡ 98bd6422-785d-46c1-b638-eb87bab54307
 let
-    D_g = groups_real[g_sel]
-    tr = PlutoPlotly.heatmap(z=D_g, colorscale="RdBu", zmid=0)
-    layout = Layout(
-        title=attr(text="Raw real gather — station $(StaN_used[g_sel]), $(size(D_g, 2)) earthquakes"),
-        xaxis=attr(title="Earthquake index"), yaxis=attr(title="Sample"),
-        height=400, width=900, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot([tr], layout))
-end
-
-# ╔═╡ c000002b-0000-0000-0000-00000000002b
-result_real === nothing ? md"⏳ Click **Train receivers** to populate this." : let
-    res_g = result_real.groups[g_sel]
-    D_g = groups_real[g_sel]
-    ŝ_time = real(ifft(res_g.ŝ))
-    raw_mean = vec(mean(D_g; dims=2))
-    ts = 1:size(D_g, 1)
-    # Normalize each trace by its own max-abs — the recovered ŝ and the raw
-    # mean can differ by orders of magnitude in scale (ŝ isn't amplitude-
-    # calibrated against the raw stack), which otherwise dominates the plot.
-    norm1(x) = x #./ (maximum(abs, x) + eps(Float32))
-    traces = [
-        PlutoPlotly.scatter(x=collect(ts), y=norm1(raw_mean), mode="lines",
-            name="Raw mean", line=attr(color="grey", width=1.5, dash="dash")),
-        PlutoPlotly.scatter(x=collect(ts), y=norm1(ŝ_time), mode="lines",
-            name="Recovered ŝ", line=attr(color="#d62728", width=2)),
-    ]
-    layout = Layout(
-        title=attr(text="Real data: recovered coherent stack vs. raw mean ($(StaN_used[g_sel]), normalized)"),
-        xaxis=attr(title="Sample"), yaxis=attr(title="Normalized amplitude"),
-        height=350, width=900, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot(traces, layout))
-end
-
-# ╔═╡ c000002c-0000-0000-0000-00000000002c
-D_aligned_real = result_real === nothing ? nothing : let
-    D_g = groups_real[g_sel]
-    τ_g = result_real.groups[g_sel].τ
-    freqs_real = Float32.(fftfreq(size(D_g, 1)))
-    grid_real = ComplexF32.(-im .* 2f0 .* Float32(π) .* freqs_real)
-    X̂_real = ComplexF32.(fft(D_g, 1))
-    good_g = .!result_real.groups[g_sel].outliers
-    τ_gauge_real = τ_g .- cn.mode_kde(τ_g[good_g])
-    X̂_aligned_real = cn.shift_spectrum(X̂_real, reshape(-τ_gauge_real, 1, length(τ_gauge_real)), grid_real)
-    real(ifft(X̂_aligned_real, 1))
-end
-
-# ╔═╡ c000002d-0000-0000-0000-00000000002d
-md"### Aligned Real Data (final recovered shifts applied)"
-
-# ╔═╡ c000002e-0000-0000-0000-00000000002e
-D_aligned_real === nothing ? md"⏳ Click **Train receivers** to populate this." : let
-    tr = PlutoPlotly.heatmap(z=D_aligned_real, colorscale="RdBu", zmid=0)
-    layout = Layout(
-        title=attr(text="Aligned real gather — station $(StaN_used[g_sel])"),
-        xaxis=attr(title="Earthquake index"), yaxis=attr(title="Sample"),
-        height=400, width=900, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot([tr], layout))
-end
-
-# ╔═╡ c000002f-0000-0000-0000-00000000002f
-result_real === nothing ? md"⏳ Click **Train receivers** to populate this." : let
-    ds = result_real.history.delta_s[g_sel]
-    dt = result_real.history.delta_tau[g_sel]
-    iters = collect(1:length(ds))
-    tr1 = PlutoPlotly.scatter(x=iters, y=ds, mode="lines+markers",
-        name="Δŝ", line=attr(color="#1f77b4", width=2))
-    tr2 = PlutoPlotly.scatter(x=iters, y=dt, mode="lines+markers",
-        name="Δτ", line=attr(color="#d62728", width=2), yaxis="y2")
-    layout = Layout(
-        title=attr(text="Real data: OUTER-LOOP convergence ($(StaN_used[g_sel])) — Δŝ, Δτ between iterations, not a trained loss"),
-        xaxis=attr(title="Outer iteration"),
-        yaxis=attr(title="‖Δŝ‖", side="left"),
-        yaxis2=attr(title="‖Δτ‖", side="right", overlaying="y"),
-        height=350, width=900, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot([tr1, tr2], layout))
-end
-
-# ╔═╡ c0000031-0000-0000-0000-000000000031
-result_real === nothing ? md"⏳ Click **Train receivers** to populate this." : let
-    traces = [
-        PlutoPlotly.scatter(x=collect(1:length(loss_curve)), y=loss_curve, mode="lines",
-            name="Outer iter $i", line=attr(width=1.5))
-        for (i, loss_curve) in enumerate(result_real.history.denoiser_loss)
-    ]
-    layout = Layout(
-        title=attr(text="Real data: Noise2Noise DENOISER training loss (shared across receivers, per outer iteration)"),
-        xaxis=attr(title="Epoch (within outer iteration)"),
-        yaxis=attr(title="N2N MSE (nt-normalized, time-domain scale)", type="log"),
-        height=350, width=900, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot(traces, layout))
-end
-
-# ╔═╡ c0000033-0000-0000-0000-000000000033
-md"### Shift Map (epicentral distance vs. backazimuth)"
-
-# ╔═╡ c0000034-0000-0000-0000-000000000034
-begin
-    """Great-circle epicentral distance in degrees (spherical Earth)."""
-    function epicentral_distance_deg(sta_lat, sta_lon, evt_lat, evt_lon)
-        φ1, φ2 = deg2rad(sta_lat), deg2rad(evt_lat)
-        dφ = deg2rad(evt_lat - sta_lat)
-        dλ = deg2rad(evt_lon - sta_lon)
-        h = sin(dφ / 2)^2 + cos(φ1) * cos(φ2) * sin(dλ / 2)^2
-        rad2deg(2 * asin(sqrt(h)))
+    losses = result.history.denoiser_loss
+    n = length(losses)
+    # Blue → red gradient across outer iterations (early = blue, late = red), so
+    # the progression is readable at a glance.
+    itercolor(i) = begin
+        t = n == 1 ? 0.0 : (i - 1) / (n - 1)
+        (round(Int, 255t), 40, round(Int, 255 * (1 - t)))
     end
-
-    """Backazimuth in degrees (0-360, from N, clockwise): direction FROM the
-    station back TO the source, as seen at the station — the standard
-    seismological convention (event -> station azimuth, i.e. azimuth(evt, sta))."""
-    function backazimuth_deg(sta_lat, sta_lon, evt_lat, evt_lon)
-        φ1, φ2 = deg2rad(evt_lat), deg2rad(sta_lat)
-        dλ = deg2rad(sta_lon - evt_lon)
-        y = sin(dλ) * cos(φ2)
-        x = cos(φ1) * sin(φ2) - sin(φ1) * cos(φ2) * cos(dλ)
-        mod(rad2deg(atan(y, x)) + 360.0, 360.0)
+    plots = Any[]
+    for (i, l) in enumerate(losses)
+        r, g, b = itercolor(i)
+        push!(plots, @pgf PGFPlotsX.Plot(
+            {color = "{rgb,255:red,$r;green,$g;blue,$b}", no_marks, "line width=0.9pt"},
+            Coordinates(1:length(l), Float64.(l))))
+        push!(plots, LegendEntry("iter $i"))
     end
+    fig = @pgf Axis(
+        {
+            xmajorgrids, ymajorgrids, ymode = "log",
+            width = "14cm", height = "6cm",
+            xlabel = "Epoch", ylabel = "N2N MSE loss",
+            title = "Denoiser loss per outer iteration (blue → red = early → late)",
+            legend_pos = "outer north east",
+            legend_style = "{font=\\tiny}",
+        },
+        plots...,
+    )
+    fig
 end
 
-# ╔═╡ c0000035-0000-0000-0000-000000000035
-result_real === nothing ? md"⏳ Click **Train receivers** to populate this." : let
-    sta_lat, sta_lon = StaLoc_list[g_sel][1], StaLoc_list[g_sel][2]
-    epi_dist = [epicentral_distance_deg(sta_lat, sta_lon, ev[1], ev[2]) for ev in EvtLoc_list[g_sel]]
-    baz = [backazimuth_deg(sta_lat, sta_lon, ev[1], ev[2]) for ev in EvtLoc_list[g_sel]]
-    τ_g = result_real.groups[g_sel].τ
-    good_g = .!result_real.groups[g_sel].outliers
-    τ_gauge_map = τ_g .- cn.mode_kde(τ_g[good_g])
+# ╔═╡ d667cb7d-91bf-4126-b588-5c4ffc8319da
+md"### Outer-loop convergence (``\Delta\hat s``, ``\Delta\tau``)"
 
-    tr = PlutoPlotly.scatterpolar(
-        r=epi_dist, theta=baz, mode="markers",
-        marker=attr(size=6, color=τ_gauge_map, colorscale="RdBu", cmid=0,
-                    colorbar=attr(title="τ (samples)"), showscale=true),
+# ╔═╡ ea8acce0-d515-408c-a463-0f319495560e
+let
+    ds = Float64.(result.history.delta_s)
+    dτ = Float64.(result.history.delta_tau)
+    fig = @pgf Axis(
+        {
+            xmajorgrids, ymajorgrids, ymode = "log",
+            width = "14cm", height = "6cm",
+            xlabel = "Outer iteration", ylabel = "change (log)",
+            title = "Block-coordinate convergence",
+            legend_style = "{at={(0.97,0.97)}, anchor=north east}",
+        },
+        (@pgf PGFPlotsX.Plot({color = "blue", mark = "*"}, Coordinates(1:length(ds), ds))),
+        LegendEntry("\$\\Delta\\hat s\$"),
+        (@pgf PGFPlotsX.Plot({color = "red", mark = "square*"}, Coordinates(1:length(dτ), dτ))),
+        LegendEntry("\$\\Delta\\tau\$"),
     )
-    layout = Layout(
-        title=attr(text="Real data: recovered shifts by epicentral distance / backazimuth ($(StaN_used[g_sel]))"),
-        polar=attr(
-            radialaxis=attr(title="Epicentral distance (°)"),
-            angularaxis=attr(direction="clockwise", rotation=90),  # 0=N at top, clockwise like a compass
-        ),
-        height=600, width=700, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot([tr], layout))
+    fig
 end
 
-# ╔═╡ c0000036-0000-0000-0000-000000000036
-result_real === nothing ? md"⏳ Click **Train receivers** to populate this." : let
-    τ_g = result_real.groups[g_sel].τ
-    good_g = .!result_real.groups[g_sel].outliers
-    τ_gauge_hist = τ_g .- cn.mode_kde(τ_g[good_g])
-    tr = PlutoPlotly.histogram(x=τ_gauge_hist, marker=attr(color="#d62728", opacity=0.75))
-    layout = Layout(
-        title=attr(text="Real data: recovered shift distribution ($(StaN_used[g_sel]), gauge-centered)"),
-        xaxis=attr(title="τ (samples)"), yaxis=attr(title="Count"),
-        height=350, width=700, plot_bgcolor="white", paper_bgcolor="white",
-    )
-    WideCell(PlutoPlotly.plot([tr], layout))
-end
-
-# ╔═╡ a550a648-7a94-11f1-8a00-f3225eb4ac28
+# ╔═╡ 820913ec-0a16-4e7c-902f-4199b790f7f0
 md"---"
+
+# ╔═╡ af2bb562-5d27-4023-8483-94308c4b4d93
+PlutoUI.TableOfContents()
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
 [deps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
 JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
+PGFPlotsX = "8314cec4-20b6-5062-9cdb-752b83310925"
 PlutoHooks = "0ff47ea0-7a50-410d-8455-4348d5de0774"
 PlutoLinks = "0ff47ea0-7a50-410d-8455-4348d5de0420"
-PlutoPlotly = "8e989ff0-3d88-8e9f-f020-2b208a939ff0"
 PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
 ProgressLogging = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
-Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
@@ -816,15 +502,15 @@ cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 [compat]
 CUDA = "~6.2.0"
 FFTW = "~1.10.0"
+FileIO = "~1.20.0"
 Flux = "~0.16.10"
 JLD2 = "~0.6.5"
 Optimisers = "~0.4.7"
+PGFPlotsX = "~1.6.2"
 PlutoHooks = "~0.1.0"
 PlutoLinks = "~0.1.8"
-PlutoPlotly = "~0.6.6"
 PlutoUI = "~0.7.83"
 ProgressLogging = "~0.1.6"
-Revise = "~3.16.1"
 Zygote = "~0.7.11"
 cuDNN = "~6.2.0"
 """
@@ -835,12 +521,12 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "b1d956e5e542a80f0e9f2b70765869d6aecfb4ab"
+project_hash = "c4e28a08ba6aaa2f7af6b9ce2f5484cc1014b77c"
 
 [[deps.ADTypes]]
-git-tree-sha1 = "ec6be48a85c93d995563b84bff8a86bc98df45ce"
+git-tree-sha1 = "d9aaef7c63466eee4de23b4d9dad03629df54bea"
 uuid = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
-version = "1.22.2"
+version = "1.22.1"
 weakdeps = ["ChainRulesCore", "ConstructionBase", "EnzymeCore"]
 
     [deps.ADTypes.extensions]
@@ -880,6 +566,11 @@ deps = ["PtrArrays", "Random"]
 git-tree-sha1 = "9876e1e164b144ca45e9e3198d0b689cadfed9ff"
 uuid = "66dad0bd-aa9a-41b7-9441-69ab47430ed8"
 version = "1.1.3"
+
+[[deps.ArgCheck]]
+git-tree-sha1 = "f9e9a66c9b7be1ad7372bbd9b062d9230c30c5ce"
+uuid = "dce04be8-c92d-5529-be00-80e4d2c0e197"
+version = "2.5.0"
 
 [[deps.ArgTools]]
 uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
@@ -958,9 +649,9 @@ version = "0.4.4+1"
 
 [[deps.CUDA_Driver_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "TOML"]
-git-tree-sha1 = "ff4a0abf98be36d9fa15ca7e968df562a210ab4b"
+git-tree-sha1 = "2d6222474d868469a72de5bd47c5c25c0e1fe518"
 uuid = "4ee394cb-3365-5eb0-8335-949819d2adfc"
-version = "13.3.0+1"
+version = "13.3.0+0"
 
 [[deps.CUDA_Runtime_Discovery]]
 deps = ["Libdl"]
@@ -976,9 +667,9 @@ version = "0.23.0+1"
 
 [[deps.CUDNN_jll]]
 deps = ["Artifacts", "CUDA_Runtime_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "77b169898d4cdc234b1cd9afc1d0a8cac1017a24"
+git-tree-sha1 = "70dea6a7133d2100a143b515a00d6d887e208500"
 uuid = "62b44479-cb7b-5706-934f-f13b2eb2e645"
-version = "9.24.0+0"
+version = "9.20.0+0"
 
 [[deps.CUPTI]]
 deps = ["CEnum", "CUDACore", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "GPUToolbox"]
@@ -1025,12 +716,6 @@ git-tree-sha1 = "cfb7a2e89e245a9d5016b70323db412b3a7438d5"
 uuid = "da1fd8a2-8d9e-5ec2-8556-3022fb5608a2"
 version = "3.0.2"
 
-[[deps.ColorSchemes]]
-deps = ["ColorTypes", "ColorVectorSpace", "Colors", "FixedPointNumbers", "PrecompileTools", "Random"]
-git-tree-sha1 = "b0fd3f56fa442f81e0a47815c92245acfaaa4e34"
-uuid = "35d6a980-a343-548e-a6ea-1d62b119f2f4"
-version = "3.31.0"
-
 [[deps.ColorTypes]]
 deps = ["FixedPointNumbers", "Random"]
 git-tree-sha1 = "67e11ee83a43eb71ddc950302c53bf33f0690dfe"
@@ -1040,22 +725,6 @@ weakdeps = ["StyledStrings"]
 
     [deps.ColorTypes.extensions]
     StyledStringsExt = "StyledStrings"
-
-[[deps.ColorVectorSpace]]
-deps = ["ColorTypes", "FixedPointNumbers", "LinearAlgebra", "Requires", "Statistics", "TensorCore"]
-git-tree-sha1 = "8b3b6f87ce8f65a2b4f857528fd8d70086cd72b1"
-uuid = "c3611d14-8923-5661-9e6a-0046d554d3a4"
-version = "0.11.0"
-weakdeps = ["SpecialFunctions"]
-
-    [deps.ColorVectorSpace.extensions]
-    SpecialFunctionsExt = "SpecialFunctions"
-
-[[deps.Colors]]
-deps = ["ColorTypes", "FixedPointNumbers", "Reexport"]
-git-tree-sha1 = "37ea44092930b1811e666c3bc38065d7d87fcc74"
-uuid = "5ae59095-9a9b-59fe-a467-6f913c188581"
-version = "0.13.1"
 
 [[deps.CommonSubexpressions]]
 deps = ["MacroTools"]
@@ -1099,9 +768,9 @@ version = "1.6.0"
     StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [[deps.Crayons]]
-git-tree-sha1 = "54b76cbb40d9a0f5368c880725b2f141da77c94f"
+git-tree-sha1 = "249fe38abf76d48563e2f4556bebd215aa317e15"
 uuid = "a8cc5b0e-0ffa-5ad4-8c14-923d3ee1735f"
-version = "4.2.0"
+version = "4.1.1"
 
 [[deps.DataAPI]]
 git-tree-sha1 = "abe83f3a2f1b857aac70ef8b269080af17764bbe"
@@ -1123,6 +792,12 @@ version = "1.0.0"
 deps = ["Printf"]
 uuid = "ade2ca70-3891-5945-98fb-dc099432e06a"
 version = "1.11.0"
+
+[[deps.DefaultApplication]]
+deps = ["InteractiveUtils"]
+git-tree-sha1 = "c0dfa5a35710a193d83f03124356eef3386688fc"
+uuid = "3f0dd361-4fe0-5fc6-8523-80b14ec94d85"
+version = "1.1.0"
 
 [[deps.DelimitedFiles]]
 deps = ["Mmap"]
@@ -1289,12 +964,11 @@ version = "0.2.0"
 
 [[deps.GPUCompiler]]
 deps = ["ExprTools", "InteractiveUtils", "LLVM", "Libdl", "Logging", "PrecompileTools", "Preferences", "REPL", "Scratch", "Serialization", "TOML", "Tracy", "UUIDs"]
-git-tree-sha1 = "5e54ec63c34bcc878558b173c411b8efe6b08344"
+git-tree-sha1 = "a39f85e004573d4951fa4a094b0be2944ab0b47d"
 uuid = "61eb1bfa-7361-4325-ad38-22787b887f55"
-version = "1.23.0"
+version = "1.22.7"
 
     [deps.GPUCompiler.weakdeps]
-    AMDGPU_LLVM_Backend_jll = "cc5c0156-bd05-5a77-8a68-bb0aafb29019"
     LLVMDowngrader_jll = "f52de702-fb25-5922-94ba-81dd59b07444"
     NVPTX_LLVM_Backend_jll = "ef6e0fe3-e6ef-59c0-bde6-4989574699e0"
 
@@ -1370,23 +1044,11 @@ git-tree-sha1 = "7204148362dafe5fe6a273f855b8ccbe4df8173e"
 uuid = "692b3bcd-3c85-4b1f-b108-f13ce0eb3210"
 version = "1.8.0"
 
-[[deps.JSON]]
-deps = ["Dates", "Logging", "Parsers", "PrecompileTools", "StructUtils", "UUIDs", "Unicode"]
-git-tree-sha1 = "c89d196f5ffb64bfbf80985b699ea913b0d2c211"
-uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-version = "1.6.1"
-
-    [deps.JSON.extensions]
-    JSONArrowExt = ["ArrowTypes"]
-
-    [deps.JSON.weakdeps]
-    ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
-
 [[deps.JuliaInterpreter]]
 deps = ["CodeTracking", "InteractiveUtils", "Random", "UUIDs"]
-git-tree-sha1 = "c3d401f110454b4ea24a76be33f6ee0d7d385103"
+git-tree-sha1 = "58927c485919bf17ea308d9d82156de1adf4b006"
 uuid = "aa1ae85d-cabe-5617-a682-6adf51b2e16a"
-version = "0.11.4"
+version = "0.10.12"
 
 [[deps.JuliaNVTXCallbacks_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
@@ -1413,9 +1075,9 @@ weakdeps = ["EnzymeCore", "LinearAlgebra", "SparseArrays"]
 
 [[deps.LLVM]]
 deps = ["CEnum", "LLVMExtra_jll", "Libdl", "PrecompileTools", "Preferences", "Printf", "Unicode"]
-git-tree-sha1 = "24af42ea221a14a04283e362d83d2cdcb115cd12"
+git-tree-sha1 = "f74a9668f02e33399baa5ed3a092b3f7a93f192e"
 uuid = "929cbde3-209d-540e-8aea-75f648917ca0"
-version = "9.10.1"
+version = "9.10.0"
 weakdeps = ["BFloat16s"]
 
     [deps.LLVM.extensions]
@@ -1504,9 +1166,9 @@ version = "1.11.0"
 
 [[deps.LoweredCodeUtils]]
 deps = ["CodeTracking", "Compiler", "JuliaInterpreter"]
-git-tree-sha1 = "1d4c737ab26f51ceed52ab2019c09b7660eb7440"
+git-tree-sha1 = "3733419e9a71156b389f3e331672d2e95436783f"
 uuid = "6f1432cf-f94c-5a45-995e-cdbf5db27b0b"
-version = "3.8.0"
+version = "3.6.2"
 
 [[deps.MIMEs]]
 git-tree-sha1 = "c64d943587f7187e751162b3b84445bbbd79f691"
@@ -1655,10 +1317,12 @@ deps = ["JuliaNVTXCallbacks_jll", "Libdl", "NVTX_jll"]
 git-tree-sha1 = "a9083c3e469e63cca454d1fc3b19472d9d92c14a"
 uuid = "5da4648a-3479-48b8-97b9-01cb529c0a1f"
 version = "1.0.3"
-weakdeps = ["Colors"]
 
     [deps.NVTX.extensions]
     NVTXColorsExt = "Colors"
+
+    [deps.NVTX.weakdeps]
+    Colors = "5ae59095-9a9b-59fe-a467-6f913c188581"
 
 [[deps.NVTX_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
@@ -1724,17 +1388,29 @@ git-tree-sha1 = "94ba93778373a53bfd5a0caaf7d809c445292ff4"
 uuid = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
 version = "1.8.2"
 
+[[deps.PGFPlotsX]]
+deps = ["ArgCheck", "Dates", "DefaultApplication", "DocStringExtensions", "MacroTools", "OrderedCollections", "Parameters", "Requires", "Tables"]
+git-tree-sha1 = "e5df51ffc01f8771d94c8db2d164be1f6927849c"
+uuid = "8314cec4-20b6-5062-9cdb-752b83310925"
+version = "1.6.2"
+
+    [deps.PGFPlotsX.extensions]
+    ColorsExt = "Colors"
+    ContourExt = "Contour"
+    MeasurementsExt = "Measurements"
+    StatsBaseExt = "StatsBase"
+
+    [deps.PGFPlotsX.weakdeps]
+    Colors = "5ae59095-9a9b-59fe-a467-6f913c188581"
+    Contour = "d38c429a-6771-53c6-b99e-75d170b6e991"
+    Measurements = "eff96d63-e80a-5855-80a2-b1b0885c5ab7"
+    StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
+
 [[deps.Parameters]]
 deps = ["OrderedCollections", "UnPack"]
 git-tree-sha1 = "34c0e9ad262e5f7fc75b10a9952ca7692cfc5fbe"
 uuid = "d96e819e-fc66-5662-9728-84c9c7592b0a"
 version = "0.12.3"
-
-[[deps.Parsers]]
-deps = ["Dates", "PrecompileTools", "UUIDs"]
-git-tree-sha1 = "32a4e09c5f29402573d673901778a0e03b0807b9"
-uuid = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
-version = "2.8.6"
 
 [[deps.Pkg]]
 deps = ["Artifacts", "Dates", "Downloads", "FileWatching", "LibGit2", "Libdl", "Logging", "Markdown", "Printf", "Random", "SHA", "TOML", "Tar", "UUIDs", "p7zip_jll"]
@@ -1744,24 +1420,6 @@ weakdeps = ["REPL"]
 
     [deps.Pkg.extensions]
     REPLExt = "REPL"
-
-[[deps.PlotlyBase]]
-deps = ["ColorSchemes", "Colors", "Dates", "DelimitedFiles", "DocStringExtensions", "JSON", "LaTeXStrings", "Logging", "Parameters", "Pkg", "REPL", "Requires", "Statistics", "UUIDs"]
-git-tree-sha1 = "6256ab3ee24ef079b3afa310593817e069925eeb"
-uuid = "a03496cd-edff-5a9b-9e67-9cda94a718b5"
-version = "0.8.23"
-
-    [deps.PlotlyBase.extensions]
-    DataFramesExt = "DataFrames"
-    DistributionsExt = "Distributions"
-    IJuliaExt = "IJulia"
-    JSON3Ext = "JSON3"
-
-    [deps.PlotlyBase.weakdeps]
-    DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
-    Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
-    IJulia = "7073ff75-c697-5162-941a-fcdaad2a7d2a"
-    JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 
 [[deps.PlutoHooks]]
 deps = ["InteractiveUtils", "Markdown", "UUIDs"]
@@ -1774,20 +1432,6 @@ deps = ["FileWatching", "InteractiveUtils", "Markdown", "PlutoHooks", "Revise", 
 git-tree-sha1 = "aea4eede5ab3ee188906d0cf3bbfa36eb543dccc"
 uuid = "0ff47ea0-7a50-410d-8455-4348d5de0420"
 version = "0.1.8"
-
-[[deps.PlutoPlotly]]
-deps = ["AbstractPlutoDingetjes", "Artifacts", "ColorSchemes", "Colors", "Dates", "Downloads", "HypertextLiteral", "InteractiveUtils", "LaTeXStrings", "Markdown", "Pkg", "PlotlyBase", "PrecompileTools", "Reexport", "ScopedValues", "Scratch", "TOML"]
-git-tree-sha1 = "2b9e3d771adfe535a4fdda855f4741fdaacd3f7f"
-uuid = "8e989ff0-3d88-8e9f-f020-2b208a939ff0"
-version = "0.6.6"
-
-    [deps.PlutoPlotly.extensions]
-    PlotlyKaleidoExt = "PlotlyKaleido"
-    UnitfulExt = "Unitful"
-
-    [deps.PlutoPlotly.weakdeps]
-    PlotlyKaleido = "f2990250-8cf9-495f-b13a-cce12b45703c"
-    Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
 [[deps.PlutoUI]]
 deps = ["AbstractPlutoDingetjes", "Base64", "ColorTypes", "Dates", "Downloads", "FixedPointNumbers", "Hyperscript", "HypertextLiteral", "IOCapture", "InteractiveUtils", "Logging", "MIMEs", "Markdown", "Random", "Reexport", "URIs", "UUIDs"]
@@ -1809,9 +1453,9 @@ version = "1.5.2"
 
 [[deps.PrettyTables]]
 deps = ["Crayons", "LaTeXStrings", "Markdown", "PrecompileTools", "Printf", "REPL", "Reexport", "StringManipulation", "Tables"]
-git-tree-sha1 = "7cf039cf79bb41afda7336edf2f3ca2115c44f76"
+git-tree-sha1 = "ebf455bb866ee6737030e3d3816bb6a0683c4325"
 uuid = "08abe8d2-0d0c-5749-adfa-8a2ac140af0d"
-version = "3.4.2"
+version = "3.4.0"
 
     [deps.PrettyTables.extensions]
     PrettyTablesExcelExt = "XLSX"
@@ -1877,10 +1521,10 @@ uuid = "ae029012-a4dd-5104-9daa-d747884805df"
 version = "1.3.1"
 
 [[deps.Revise]]
-deps = ["CRC32c", "CodeTracking", "FileWatching", "JuliaInterpreter", "LibGit2", "LoweredCodeUtils", "OrderedCollections", "Preferences", "REPL", "UUIDs"]
-git-tree-sha1 = "838f84266bf2e9ca4b7d0b8965807c7a72745501"
+deps = ["CRC32c", "CodeTracking", "FileWatching", "InteractiveUtils", "JuliaInterpreter", "LibGit2", "LoweredCodeUtils", "OrderedCollections", "Preferences", "REPL", "UUIDs"]
+git-tree-sha1 = "27e3ee13fc8739a59b380d6163d6a82f52c03bd7"
 uuid = "295af30f-e4ad-537b-8983-00126c2a3abe"
-version = "3.16.1"
+version = "3.15.1"
 weakdeps = ["Distributed"]
 
     [deps.Revise.extensions]
@@ -1891,9 +1535,9 @@ uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 version = "0.7.0"
 
 [[deps.SciMLPublic]]
-git-tree-sha1 = "24ff31136f3f991b74fbef71d5c638e2881d29d2"
+git-tree-sha1 = "2b1b64add566435a768abdb3b053cac17d19ff3c"
 uuid = "431bcebd-1456-4ced-9d72-93c2757fff0b"
-version = "1.2.3"
+version = "1.2.1"
 
 [[deps.ScopedValues]]
 deps = ["HashArrayMappedTries", "Logging"]
@@ -1999,9 +1643,9 @@ version = "0.34.12"
 
 [[deps.StringManipulation]]
 deps = ["PrecompileTools"]
-git-tree-sha1 = "6a73aec31c56a0c2833e8efa637d10b532cb2f0c"
+git-tree-sha1 = "d05693d339e37d6ab134c5ab53c29fce5ee5d7d5"
 uuid = "892a3eda-7b42-436c-8928-eab12a02cf0e"
-version = "0.4.5"
+version = "0.4.4"
 
 [[deps.StructArrays]]
 deps = ["ConstructionBase", "DataAPI", "Tables"]
@@ -2016,22 +1660,6 @@ weakdeps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LinearAlgebra", "Sp
     StructArraysLinearAlgebraExt = "LinearAlgebra"
     StructArraysSparseArraysExt = "SparseArrays"
     StructArraysStaticArraysExt = "StaticArrays"
-
-[[deps.StructUtils]]
-deps = ["Dates", "UUIDs"]
-git-tree-sha1 = "82bee338d650aa515f31866c460cb7e3bcef90b8"
-uuid = "ec057cc2-7a8d-4b58-b3b3-92acb9f63b42"
-version = "2.8.2"
-
-    [deps.StructUtils.extensions]
-    StructUtilsMeasurementsExt = ["Measurements"]
-    StructUtilsStaticArraysCoreExt = ["StaticArraysCore"]
-    StructUtilsTablesExt = ["Tables"]
-
-    [deps.StructUtils.weakdeps]
-    Measurements = "eff96d63-e80a-5855-80a2-b1b0885c5ab7"
-    StaticArraysCore = "1e83bf80-4336-4d27-bf5d-d5a4f845583c"
-    Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
 
 [[deps.StyledStrings]]
 uuid = "f489334b-da3d-4c2e-b8f0-e476e12c162b"
@@ -2067,12 +1695,6 @@ version = "1.13.0"
 deps = ["ArgTools", "SHA"]
 uuid = "a4e569a6-e804-4fa4-b0f3-eef7a1d5b13e"
 version = "1.10.0"
-
-[[deps.TensorCore]]
-deps = ["LinearAlgebra"]
-git-tree-sha1 = "1feb45f88d133a655e001435632f019a9a1bcdb6"
-uuid = "62fd8b95-f654-4bbd-a8a5-9c27f68ccd50"
-version = "0.1.1"
 
 [[deps.Test]]
 deps = ["InteractiveUtils", "Logging", "Random", "Serialization"]
@@ -2236,72 +1858,52 @@ version = "17.7.0+0"
 """
 
 # ╔═╡ Cell order:
-# ╠═c0000001-0000-0000-0000-000000000001
-# ╠═6967e957-8e56-43c0-be67-95298eabbd6f
-# ╠═c0000062-0000-0000-0000-000000000062
-# ╠═20c996f5-d056-4e10-b6fb-0995b444732a
-# ╠═b3f6f1ae-066b-4427-a5f6-5512a0919865
-# ╠═c0000032-0000-0000-0000-000000000032
-# ╠═ba373ea1-0f23-424c-9778-2c6b55d30c34
-# ╠═c0000002-0000-0000-0000-000000000002
-# ╠═c0000003-0000-0000-0000-000000000003
-# ╠═c0000004-0000-0000-0000-000000000004
-# ╟─c0000050-0000-0000-0000-000000000050
-# ╠═c0000051-0000-0000-0000-000000000051
-# ╠═c0000052-0000-0000-0000-000000000052
-# ╠═c000000b-0000-0000-0000-00000000000b
-# ╠═c000000c-0000-0000-0000-00000000000c
-# ╠═c000000d-0000-0000-0000-00000000000d
-# ╠═c000000e-0000-0000-0000-00000000000e
-# ╠═c000001a-0000-0000-0000-00000000001a
-# ╠═c000001b-0000-0000-0000-00000000001b
-# ╠═c000001c-0000-0000-0000-00000000001c
-# ╠═c000000f-0000-0000-0000-00000000000f
-# ╠═c0000061-0000-0000-0000-000000000061
-# ╠═c0000010-0000-0000-0000-000000000010
-# ╠═c0000055-0000-0000-0000-000000000055
-# ╠═c0000011-0000-0000-0000-000000000011
-# ╠═c0000012-0000-0000-0000-000000000012
-# ╠═c000001d-0000-0000-0000-00000000001d
-# ╠═c000001e-0000-0000-0000-00000000001e
-# ╠═c000001f-0000-0000-0000-00000000001f
-# ╠═c0000020-0000-0000-0000-000000000020
-# ╠═fd5a5b29-7c3f-4fa6-959c-bb34c22c035b
-# ╠═c0000016-0000-0000-0000-000000000016
-# ╠═c0000017-0000-0000-0000-000000000017
-# ╠═c0000018-0000-0000-0000-000000000018
-# ╠═c0000060-0000-0000-0000-000000000060
-# ╠═c0000019-0000-0000-0000-000000000019
-# ╠═c0000030-0000-0000-0000-000000000030
-# ╠═c0000013-0000-0000-0000-000000000013
-# ╠═c0000014-0000-0000-0000-000000000014
-# ╠═c0000015-0000-0000-0000-000000000015
-# ╠═c0000021-0000-0000-0000-000000000021
-# ╠═c0000042-0000-0000-0000-000000000042
-# ╠═c0000022-0000-0000-0000-000000000022
-# ╠═c0000023-0000-0000-0000-000000000023
-# ╠═c0000024-0000-0000-0000-000000000024
-# ╠═c0000025-0000-0000-0000-000000000025
-# ╠═c0000026-0000-0000-0000-000000000026
-# ╠═c0000027-0000-0000-0000-000000000027
-# ╠═c0000028-0000-0000-0000-000000000028
-# ╠═c0000029-0000-0000-0000-000000000029
-# ╠═c0000054-0000-0000-0000-000000000054
-# ╟─c0000053-0000-0000-0000-000000000053
-# ╠═c000002a-0000-0000-0000-00000000002a
-# ╟─c0000040-0000-0000-0000-000000000040
-# ╠═c0000041-0000-0000-0000-000000000041
-# ╠═c0000043-0000-0000-0000-000000000043
-# ╠═c000002b-0000-0000-0000-00000000002b
-# ╠═c000002c-0000-0000-0000-00000000002c
-# ╠═c000002d-0000-0000-0000-00000000002d
-# ╠═c000002e-0000-0000-0000-00000000002e
-# ╠═c000002f-0000-0000-0000-00000000002f
-# ╠═c0000031-0000-0000-0000-000000000031
-# ╟─c0000033-0000-0000-0000-000000000033
-# ╠═c0000034-0000-0000-0000-000000000034
-# ╠═c0000035-0000-0000-0000-000000000035
-# ╠═c0000036-0000-0000-0000-000000000036
-# ╠═a550a648-7a94-11f1-8a00-f3225eb4ac28
+# ╟─81542682-66e0-46a8-8ac1-bb6455f9e1eb
+# ╠═eb80a550-f8df-4d10-834c-bc4693926d29
+# ╠═2a8ee9cc-644c-4343-ad8e-ac5fcfc7f8af
+# ╠═b1a7c0de-0005-4000-8000-000000000005
+# ╠═71b04988-4fa8-4a16-8ff9-f7e3167c44a4
+# ╠═fdc107e3-6d19-4838-ad2d-e139ed02d756
+# ╠═135760c5-1663-4d62-85a4-5d21d942641d
+# ╟─1ce3824c-dcf0-4811-9c2c-007e99a9da11
+# ╠═89dcc49a-c979-45ec-be81-c513a66596c0
+# ╟─92f02400-a5d4-4644-9efa-9fbd053c1df1
+# ╠═86ac2a3b-89a5-4a7d-957c-564bf630cdde
+# ╠═6b13710a-462a-4851-a690-b3c50db87ecc
+# ╠═eb367d95-561d-4aa3-9b39-1af5caea610e
+# ╠═7be4f82e-3271-4c5d-bbb5-98f1d8b952cf
+# ╠═a77fd47c-473e-4a21-96ce-22d107faf0be
+# ╟─6a9880bf-ed87-4cf0-8aa7-8419e5f4ae05
+# ╠═b1a7c0de-0001-4000-8000-000000000001
+# ╠═b1a7c0de-0002-4000-8000-000000000002
+# ╠═b1a7c0de-0003-4000-8000-000000000003
+# ╠═b1a7c0de-0004-4000-8000-000000000004
+# ╟─e8d96a27-2e2e-4815-a816-5ab55f5ae868
+# ╠═0ab04a60-7267-4434-8a45-3e63dfae5d1a
+# ╠═5bedcba0-107b-46b8-b361-0f17ea7dca57
+# ╟─17a4b4d6-a75e-4932-a675-e206ec45ad78
+# ╠═d45f9551-2985-4350-b430-009887f23bd4
+# ╠═edccebf4-b93f-41df-a708-ed48a32f1fb2
+# ╠═2c8d5c22-94af-479f-85ab-ed8c25c899cd
+# ╠═7ef65dc2-9b09-4e0b-bf4f-c5f4335254db
+# ╟─ae5cb581-a734-42b0-9f20-ecddcda8cf30
+# ╠═ce0fc19f-1a64-4d1d-a606-ddd13ea3dd2f
+# ╠═132b2c51-21c9-454e-aaee-9a70df3c18c9
+# ╟─24db6c53-d503-4636-8132-f2d4f6fc0bc5
+# ╠═5dc8883b-3393-4029-83d7-7704a6de9e8c
+# ╟─3b339857-27fd-4dd7-b4c5-c438afb33667
+# ╠═8b7f821b-d832-418d-ab40-1004a60c834f
+# ╠═85b8cff8-cefa-4a80-99d0-4d273ae34fb7
+# ╟─1b733567-db8e-4652-8cad-13e4ac13de4c
+# ╠═17334288-14f4-43a8-a1ed-e93ef2a66c49
+# ╠═91fb30cb-18a5-4c8d-a00f-857ca311f808
+# ╟─fbd9e6ad-941c-44ef-b401-350d8dc839ae
+# ╠═7663b20f-59a0-43f5-80c4-37043e545d48
+# ╟─0c4ccf4d-3f3d-4db1-b8a0-255478697f0a
+# ╠═98bd6422-785d-46c1-b638-eb87bab54307
+# ╟─d667cb7d-91bf-4126-b588-5c4ffc8319da
+# ╠═ea8acce0-d515-408c-a463-0f319495560e
+# ╟─820913ec-0a16-4e7c-902f-4199b790f7f0
+# ╠═af2bb562-5d27-4023-8483-94308c4b4d93
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002

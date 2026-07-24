@@ -1,0 +1,8 @@
+[deps]
+DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+MultipleScattering = "80a8ab25-5750-5d93-a6d7-4adc97cdd5fb"
+PGFPlotsX = "8314cec4-20b6-5062-9cdb-752b83310925"

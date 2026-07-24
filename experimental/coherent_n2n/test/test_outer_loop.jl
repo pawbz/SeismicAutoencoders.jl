@@ -21,6 +21,19 @@ include(joinpath(@__DIR__, "..", "CoherentN2N_train_denoiser.jl"))
 include(joinpath(@__DIR__, "..", "CoherentN2N_outer_loop.jl"))
 include(joinpath(@__DIR__, "synthetic_data.jl"))
 
+# Blind deconvolution recovers the source only up to a GLOBAL time shift: the
+# reported ŝ sits at whatever origin the reporting gauge (the mode) implies, not
+# necessarily s_true's origin. Compare shapes by best circular-lag correlation,
+# mirroring the alignment the BlindDeconv notebook does before validating.
+function aligned_source_cor(ŝ_time::AbstractVector, s_true::AbstractVector)
+    nt = length(s_true)
+    a = ŝ_time ./ (sqrt(sum(abs2, ŝ_time)) + eps(Float32))
+    b = s_true ./ (sqrt(sum(abs2, s_true)) + eps(Float32))
+    cc = real(ifft(conj(fft(Float32.(a))) .* fft(Float32.(b))))
+    lag = argmax(abs.(cc)) - 1
+    return cor(circshift(ŝ_time, lag), s_true)
+end
+
 @testset "run_coherent_n2n: full blind pipeline recovers shifts/source/gains" begin
     rng = MersenneTwister(30)
     nt = 128
@@ -42,21 +55,22 @@ include(joinpath(@__DIR__, "synthetic_data.jl"))
 
     result = run_coherent_n2n(D, para, outer_para; rng=rng)
 
-    # τ recovered up to a global constant: after removing each side's mean,
-    # the shapes should match closely. A per-trace shift estimate can still
-    # miss on an individual noisy trace (see the shift-estimator's own
-    # moderate-SNR test) — the meaningful bar is the typical (mean) error,
-    # not a hard per-trace maximum.
-    τ_est_centered = result.τ .- mean(result.τ)
-    τ_true_centered = τ_true .- mean(τ_true)
-    errs = abs.(τ_est_centered .- τ_true_centered)
+    # τ is recovered only up to a GLOBAL constant (the gauge freedom), so
+    # compare shapes after removing the constant that best aligns the two
+    # vectors — i.e. subtract the mean of the (est − true) difference. This is
+    # distribution-agnostic (unlike mode/median centering, which is ill-defined
+    # for a uniform ground truth like range(-10,10)) and directly measures
+    # shape mismatch. A per-trace estimate can still miss on an individual noisy
+    # trace (see the shift-estimator's own moderate-SNR test); the meaningful
+    # bar is the typical error, not a hard per-trace maximum.
+    errs = abs.((result.τ .- τ_true) .- mean(result.τ .- τ_true))
     @info "Shift recovery" max_err=maximum(errs) mean_abs_err=mean(errs)
     @test mean(errs) < 1.5
     @test sum(errs .< 2.0) >= length(errs) - 2  # allow a couple of outlier traces
 
     # Source estimate should correlate strongly with the true source shape.
     ŝ_time = real(ifft(result.ŝ))
-    c = cor(ŝ_time, s_true)
+    c = aligned_source_cor(ŝ_time, s_true)
     @info "Source recovery" correlation=c
     @test c > 0.9
 
@@ -89,11 +103,65 @@ end
 
     result = run_coherent_n2n(D, para, outer_para; rng=rng)
     ŝ_time = real(ifft(result.ŝ))
-    c = cor(ŝ_time, s_true)
+    c = aligned_source_cor(ŝ_time, s_true)
     @info "Source recovery with one bad trace" correlation=c
     @test c > 0.8  # a single bad trace shouldn't derail the whole gather
     @test all(isfinite, result.τ)
     @test all(isfinite, result.ŝ)
+end
+
+@testset "run_coherent_n2n: Gaussian-distributed shifts (peaked → mode gauge favorable)" begin
+    # Unlike the range(-10,10) case above (uniform, no dominant cluster — a
+    # pathological input for a mode gauge), real single-station gathers have a
+    # peaked shift distribution. Draw τ_true ~ N(bias, σ): the bulk clusters,
+    # with a natural spread. The default mode (KDE-peak) location gauge should
+    # anchor that cluster and recover shifts/source cleanly.
+    rng = MersenneTwister(32)
+    nt = 128
+    R = 24
+    bias = 4.0f0
+    τ_true = clamp.(bias .+ Float32.(randn(rng, R) .* 3.0), -12f0, 12f0)
+    g_true = ones(ComplexF32, R)
+
+    s_true, D, freqs, _, _ = make_synthetic_gather(
+        nt=nt, R=R, f0=0.05, source_kind=:broadband,
+        true_shifts=τ_true, true_gains=g_true,
+        noise_std=0.05, rng=rng)
+
+    para = CoherentN2N_Para(nt=nt, kernels=[16, 8], filters=[8, 16])
+    outer_para = CoherentN2N_Outer_Para(
+        n_outer_iters=4,
+        denoiser_training=CoherentN2N_Denoiser_Training_Para(
+            n_samples_per_epoch=256, batchsize=32, nepoch=80,
+            initial_lr=0.003, restart_period=40, nprint=1000))
+
+    result = run_coherent_n2n(D, para, outer_para; rng=rng)
+
+    # Shape recovery up to a global constant (see the uniform test above).
+    errs = abs.((result.τ .- τ_true) .- mean(result.τ .- τ_true))
+    @info "Gaussian shifts — shift recovery" max_err=maximum(errs) mean_abs_err=mean(errs)
+    @test mean(errs) < 1.5
+    @test sum(errs .< 2.0) >= length(errs) - 2
+
+    ŝ_time = real(ifft(result.ŝ))
+    c = aligned_source_cor(ŝ_time, s_true)
+    @info "Gaussian shifts — source recovery" correlation=c
+    @test c > 0.9
+
+    # The mode GAUGE pins the dominant cluster to zero in the gauge frame. The
+    # returned τ has the (arbitrary, blind) absolute anchor reapplied, so remove
+    # it to recover the gauge-frame shifts; their mode must be ≈ 0. (Testing the
+    # absolute mode against the true bias would be wrong — the absolute origin is
+    # set by the coarse-xcorr reference pick + re-anchor lags, not the true bias;
+    # a blind method recovers shifts only up to that global constant. Shape
+    # recovery is checked separately above and is excellent.)
+    good = .!result.outliers
+    m_gauge = mode_kde(result.τ[good] .- result.anchor)
+    @info "Gaussian shifts — gauge-frame cluster mode (should be ~0)" mode=m_gauge
+    @test abs(m_gauge) < 1.0
+
+    @test all(isfinite, result.history.delta_s)
+    @test all(isfinite, result.history.delta_tau)
 end
 
 println("All CoherentN2N outer-loop tests passed.")

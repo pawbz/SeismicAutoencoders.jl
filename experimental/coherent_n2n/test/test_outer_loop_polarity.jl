@@ -17,6 +17,16 @@ include(joinpath(@__DIR__, "..", "CoherentN2N_train_denoiser.jl"))
 include(joinpath(@__DIR__, "..", "CoherentN2N_outer_loop.jl"))
 include(joinpath(@__DIR__, "synthetic_data.jl"))
 
+# ŝ is recovered only up to a global time shift (and, with polarity on, a global
+# sign). Compare by best circular-lag correlation; callers take abs() for sign.
+function aligned_source_cor(ŝ_time::AbstractVector, s_true::AbstractVector)
+    a = ŝ_time ./ (sqrt(sum(abs2, ŝ_time)) + eps(Float32))
+    b = s_true ./ (sqrt(sum(abs2, s_true)) + eps(Float32))
+    cc = real(ifft(conj(fft(Float32.(a))) .* fft(Float32.(b))))
+    lag = argmax(abs.(cc)) - 1
+    return cor(circshift(ŝ_time, lag), s_true)
+end
+
 @testset "run_coherent_n2n: use_polarity_gain=true recovers source under mixed polarity" begin
     rng = MersenneTwister(40)
     nt = 128
@@ -40,9 +50,9 @@ include(joinpath(@__DIR__, "synthetic_data.jl"))
     result = run_coherent_n2n(D, para, outer_para; rng=rng)
 
     ŝ_time = real(ifft(result.ŝ))
-    c = cor(ŝ_time, s_true)
+    c = aligned_source_cor(ŝ_time, s_true)  # up to global shift; abs() for global sign
     @info "Source recovery with polarity correction" correlation=c
-    @test c > 0.85
+    @test abs(c) > 0.85
 
     @info "Convergence history" delta_s=result.history.delta_s delta_tau=result.history.delta_tau
     @test all(isfinite, result.history.delta_s)
@@ -79,7 +89,7 @@ end
 
     result = run_coherent_n2n(D, para, outer_para; rng=rng)
     ŝ_time = real(ifft(result.ŝ))
-    c = cor(ŝ_time, s_true)
+    c = aligned_source_cor(ŝ_time, s_true)
     @info "Source recovery without polarity correction" correlation=c
     @test all(isfinite, result.ŝ)  # should not crash/diverge to NaN even though quality suffers
 end

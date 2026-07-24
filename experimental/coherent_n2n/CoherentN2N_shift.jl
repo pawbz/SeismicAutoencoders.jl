@@ -52,9 +52,15 @@ a polarity-flipped trace then no longer aligns cleanly to the wrong sign — it
 fails to find a strong positive peak at the true lag, surfacing the flip as a
 bad shift estimate. Use this when nothing downstream corrects sign
 (`use_polarity_gain=false`) and a flip should not be silently absorbed.
+
+`max_shift` (default `Inf`) restricts the peak search to lags with
+`|τ| <= max_shift` samples: only those circular lags are considered, so the
+coarse pick cannot cycle-skip to a far (and physically implausible) lag. This
+is the principled place to bound shifts — it constrains estimation itself
+rather than clamping a bad estimate after the fact.
 """
 function estimate_shift_xcorr_coarse(x_ref::AbstractVector{<:Real}, x_trace::AbstractVector{<:Real};
-                                      polarity_agnostic::Bool=true)
+                                      polarity_agnostic::Bool=true, max_shift::Real=Inf)
     nt = length(x_ref)
     @assert length(x_trace) == nt "x_ref and x_trace must have equal length"
     X̂_ref   = fft(Float32.(x_ref))
@@ -62,9 +68,18 @@ function estimate_shift_xcorr_coarse(x_ref::AbstractVector{<:Real}, x_trace::Abs
     # cc[k] = sum_n x_trace[n] * x_ref[n-k]  -> peaks at k=τ when x_trace(t) = x_ref(t-τ),
     # matching the shift_spectrum/grid convention (positive τ means x_trace lags x_ref).
     cc = real(ifft(conj.(X̂_ref) .* X̂_trace))  # circular cross-correlation
-    lag0 = (polarity_agnostic ? argmax(abs.(cc)) : argmax(cc)) - 1  # 0-based lag
-    # Wrap lags > nt/2 into negative range (circular shift convention)
-    return lag0 > nt ÷ 2 ? lag0 - nt : lag0
+    score = polarity_agnostic ? abs.(cc) : cc
+    # Signed lag for each array index k (0-based), wrapping k > nt/2 to negative.
+    signed_lag(k) = k > nt ÷ 2 ? k - nt : k
+    if isfinite(max_shift)
+        # Only consider indices whose circular lag is within ±max_shift.
+        m = floor(Int, max_shift)
+        cand = [k for k in 0:(nt-1) if abs(signed_lag(k)) <= m]
+        best = cand[argmax(score[cand .+ 1])]
+        return signed_lag(best)
+    end
+    lag0 = argmax(score) - 1  # 0-based lag
+    return signed_lag(lag0)
 end
 
 """
@@ -181,12 +196,19 @@ cross-correlation at the true lag is large and *negative*, so the signed
 secondary safeguard against the same failure mode but, being a linear fit
 over a possibly non-ideal phase spectrum, doesn't always corrupt the result
 as dramatically.
+
+`max_shift` (default `Inf`) bounds the returned delay to `[-max_shift,
++max_shift]` samples: it restricts the coarse xcorr peak search to that lag
+range (preventing a cycle-skip to a far lag) AND clamps the final
+coarse+fine result to the boundary, so a trace whose true shift exceeds the
+bound saturates at ±max_shift rather than being estimated out of range.
 """
 function estimate_shift_two_stage(x_ref::AbstractVector{<:Real}, x_trace::AbstractVector{<:Real},
                                    freqs::AbstractVector{<:Real}; freq_band=nothing,
-                                   polarity_agnostic::Bool=true)
+                                   polarity_agnostic::Bool=true, max_shift::Real=Inf)
     nt = length(x_ref)
-    τ_coarse = estimate_shift_xcorr_coarse(x_ref, x_trace; polarity_agnostic=polarity_agnostic)
+    τ_coarse = estimate_shift_xcorr_coarse(x_ref, x_trace; polarity_agnostic=polarity_agnostic,
+                                           max_shift=max_shift)
 
     # Undo the coarse shift on x_trace (circular) before the fine fit, so the
     # residual fine delay is small and safely within ±0.5 samples. x_trace
@@ -197,5 +219,8 @@ function estimate_shift_two_stage(x_ref::AbstractVector{<:Real}, x_trace::Abstra
 
     τ_fine = estimate_shift_phase_slope(X̂_ref, X̂_trace_shifted, freqs; freq_band=freq_band,
                                          zero_intercept=!polarity_agnostic)
-    return Float32(τ_coarse) + τ_fine
+    τ = Float32(τ_coarse) + τ_fine
+    # Clamp to the boundary: the fine step can nudge coarse slightly past the
+    # bound, and a saturating result is the requested behaviour.
+    return isfinite(max_shift) ? clamp(τ, -Float32(max_shift), Float32(max_shift)) : τ
 end
