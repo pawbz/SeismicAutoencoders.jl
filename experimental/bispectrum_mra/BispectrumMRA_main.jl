@@ -261,21 +261,6 @@ Each selected station contributes **one group** — all of its SNR-passing event
 # ╔═╡ 509e030b-620a-46b3-8f64-5c4abbba3645
 StaN_list_real
 
-# ╔═╡ c100001c-0000-0000-0000-00000000001c
-md"""#### Preprocessing
-
-Taper: $(@bind use_taper PlutoUI.CheckBox(default=false)) apply a Tukey window per trace
-
-⚠️ **Off by default, unlike the CoherentN2N notebooks.** A per-trace taper is
-applied *after* the (unknown) shift, so it is **not** circularly shift-equivariant
-and it breaks the MRA model. Measured cost on synthetics: correlation
-0.954 → 0.868 at σ=0.3, and 0.690 → 0.604 at σ=0.8. Demeaning and dividing by the
-per-trace standard deviation are shift-equivariant and are always applied.
-"""
-
-# ╔═╡ c100001d-0000-0000-0000-00000000001d
-taper_sin_real(x) = cat(DSP.tukey(size(x, 1), 0.3), dims=ndims(x)) .* x
-
 # ╔═╡ c100001b-0000-0000-0000-00000000001b
 # Per-station gather. Ragged: each station keeps its own SNR-passing events, so
 # R_g varies. Same SNR mask and RF-window trim as the CoherentN2N notebooks —
@@ -293,15 +278,15 @@ begin
         sel = findall(x -> x > snr_tres_real, ses_snr_real[ix])
         isempty(sel) && (@warn "Station $sta has no SNR-passing events; skipping"; continue)
 f1 = 0.01/10.              # lower corner, Hz
-f2 = 2.0/10.           # upper corner, Hz
+f2 = 0.3/10.           # upper corner, Hz
 
 bp = digitalfilter(
     Bandpass(f1, f2),
     Butterworth(2)
 )
 
-         push!(raw_data_list_full, filtfilt(bp, taper_sin_real(randn(200, 1000)))) 
-        # push!(raw_data_list_full, Data_real[ix][:, sel][550:750, :])   # trim RF window
+         # push!(raw_data_list_full, filtfilt(bp, taper_sin_real(randn(1000, 1000)))) 
+        push!(raw_data_list_full, Data_real[ix][:, sel][550:750, :])   # trim RF window
         push!(StaLoc_list, StaAll_real[ix])
         push!(EvtLoc_list, EventLoc_real[ix][sel])
         push!(StaN_used, sta)
@@ -313,6 +298,21 @@ end
 
 # ╔═╡ 450e8a79-20ba-4827-a60d-5144932bf4cf
 raw_data_list_full
+
+# ╔═╡ c100001c-0000-0000-0000-00000000001c
+md"""#### Preprocessing
+
+Taper: $(@bind use_taper PlutoUI.CheckBox(default=false)) apply a Tukey window per trace
+
+⚠️ **Off by default, unlike the CoherentN2N notebooks.** A per-trace taper is
+applied *after* the (unknown) shift, so it is **not** circularly shift-equivariant
+and it breaks the MRA model. Measured cost on synthetics: correlation
+0.954 → 0.868 at σ=0.3, and 0.690 → 0.604 at σ=0.8. Demeaning and dividing by the
+per-trace standard deviation are shift-equivariant and are always applied.
+"""
+
+# ╔═╡ c100001d-0000-0000-0000-00000000001d
+taper_sin_real(x) = cat(DSP.tukey(size(x, 1), 0.3), dims=ndims(x)) .* x
 
 # ╔═╡ c100001e-0000-0000-0000-00000000001e
 # One group per station. StaN_used stays 1:1 with groups_sta, so a result index
@@ -414,12 +414,12 @@ let
         # floating in the inversion's arbitrary phase gauge. The correlations
         # quoted below are still best-lag, hence shift-blind either way.
         traces = [
-            PlutoPlotly.scatter(x=collect(ts), y=(r.x), mode="lines",
+            PlutoPlotly.scatter(x=collect(ts), y=norm1(r.x), mode="lines",
                 name="Bispectrum MRA", line=attr(color="#d62728", width=2)),
-            PlutoPlotly.scatter(x=collect(ts), y=(base), mode="lines",
+            PlutoPlotly.scatter(x=collect(ts), y=norm1(base), mode="lines",
                 name="Robust stack, no alignment (cor $(round(aligned_cor(base, r.x), digits=3)))",
                 line=attr(color="#1f77b4", width=1.6)),
-            PlutoPlotly.scatter(x=collect(ts), y=(raw), mode="lines",
+            PlutoPlotly.scatter(x=collect(ts), y=norm1(raw), mode="lines",
                 name="Raw mean (cor $(round(aligned_cor(raw, r.x), digits=3)))",
                 line=attr(color="grey", width=1.4, dash="dash")),
         ]
