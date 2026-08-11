@@ -53,14 +53,38 @@ fails to find a strong positive peak at the true lag, surfacing the flip as a
 bad shift estimate. Use this when nothing downstream corrects sign
 (`use_polarity_gain=false`) and a flip should not be silently absorbed.
 
-`max_shift` (default `Inf`) restricts the peak search to lags with
-`|τ| <= max_shift` samples: only those circular lags are considered, so the
-coarse pick cannot cycle-skip to a far (and physically implausible) lag. This
-is the principled place to bound shifts — it constrains estimation itself
-rather than clamping a bad estimate after the fact.
+`max_shift` (default `Inf`) restricts the peak search to lags within
+`max_shift` samples **of `center`** (i.e. `|τ - center| <= max_shift`): only
+those circular lags are considered, so the coarse pick cannot cycle-skip to a
+far lag. This is the principled place to bound shifts — it constrains
+estimation itself rather than clamping a bad estimate after the fact.
+
+`center` (default `0`) is the shift the window is centred on — the trace's
+**expected** shift, e.g. its value from the previous Block-B iteration. This
+is what makes `max_shift` a *step* bound rather than an absolute-lag bound: the
+argmax then tracks the true peak near where the trace already is, instead of a
+lag-0 window snapping to the nearest in-window lobe (a half-period cycle-skip)
+when the true peak lies outside `±max_shift` of the origin. At init (no prior)
+pass `center=0`.
+
+`shift_prior_p` (default `0` → OFF, current hard-window behaviour) turns the
+hard `±max_shift` window into a **soft super-Gaussian MAP prior** on the lag:
+the score is multiplied by `prior(lag) = exp(-(|lag - center| / max_shift)^p)`
+before the argmax, so lags near `center` are preferred but a distant lag can
+still win if its correlation is decisively stronger. This is flat inside
+`±max_shift` (the plateau of the super-Gaussian) and then decays smoothly, so
+shifts no longer pile up at a hard edge; it reduces low-SNR cycle-skip
+outliers by biasing toward the plausible band. Requires a finite `max_shift`
+(the prior width) — with `max_shift = Inf` the prior is skipped (no width).
+`shift_prior_backstop_mult` (default `3`) sets a *generous* hard search bound
+at `center ± ceil(shift_prior_backstop_mult · max_shift)` so a pathological far
+cycle-skip can never be argmax'd; at `3·max_shift` the weight is `exp(-3^p)`
+(≈0 for p≥4), so the backstop only forbids what the prior already kills.
 """
 function estimate_shift_xcorr_coarse(x_ref::AbstractVector{<:Real}, x_trace::AbstractVector{<:Real};
-                                      polarity_agnostic::Bool=true, max_shift::Real=Inf)
+                                      polarity_agnostic::Bool=true, max_shift::Real=Inf,
+                                      center::Real=0, shift_prior_p::Real=0,
+                                      shift_prior_backstop_mult::Real=3)
     nt = length(x_ref)
     @assert length(x_trace) == nt "x_ref and x_trace must have equal length"
     X̂_ref   = fft(Float32.(x_ref))
@@ -71,10 +95,23 @@ function estimate_shift_xcorr_coarse(x_ref::AbstractVector{<:Real}, x_trace::Abs
     score = polarity_agnostic ? abs.(cc) : cc
     # Signed lag for each array index k (0-based), wrapping k > nt/2 to negative.
     signed_lag(k) = k > nt ÷ 2 ? k - nt : k
-    if isfinite(max_shift)
-        # Only consider indices whose circular lag is within ±max_shift.
+    c = round(Int, center)
+    prior_on = shift_prior_p > 0 && isfinite(shift_prior_p) && isfinite(max_shift) && max_shift > 0
+    if prior_on
+        # Soft super-Gaussian MAP prior on the lag, inside a generous hard backstop.
+        w = Float32(max_shift)
+        p = Float32(shift_prior_p)
+        backstop = ceil(Int, shift_prior_backstop_mult * max_shift)
+        cand = [k for k in 0:(nt-1) if abs(signed_lag(k) - c) <= backstop]
+        isempty(cand) && return Float32(c)
+        weight = Float32[exp(-(abs(signed_lag(k) - c) / w)^p) for k in cand]
+        best = cand[argmax(score[cand .+ 1] .* weight)]
+        return signed_lag(best)
+    elseif isfinite(max_shift)
+        # Hard window: only consider indices whose circular lag is within max_shift of center.
         m = floor(Int, max_shift)
-        cand = [k for k in 0:(nt-1) if abs(signed_lag(k)) <= m]
+        cand = [k for k in 0:(nt-1) if abs(signed_lag(k) - c) <= m]
+        isempty(cand) && return Float32(c)   # window fell entirely outside; keep center
         best = cand[argmax(score[cand .+ 1])]
         return signed_lag(best)
     end
@@ -197,18 +234,39 @@ secondary safeguard against the same failure mode but, being a linear fit
 over a possibly non-ideal phase spectrum, doesn't always corrupt the result
 as dramatically.
 
-`max_shift` (default `Inf`) bounds the returned delay to `[-max_shift,
-+max_shift]` samples: it restricts the coarse xcorr peak search to that lag
-range (preventing a cycle-skip to a far lag) AND clamps the final
-coarse+fine result to the boundary, so a trace whose true shift exceeds the
-bound saturates at ±max_shift rather than being estimated out of range.
+`max_shift` (default `Inf`) bounds the returned delay to `center ± max_shift`
+samples: it restricts the coarse xcorr peak search to that range (preventing a
+cycle-skip to a far lag) AND clamps the final coarse+fine result to the
+boundary, so a trace whose true shift exceeds the bound saturates at the edge
+rather than being estimated out of range.
+
+`center` (default `0`) is the shift the `±max_shift` window is centred on — the
+trace's **expected** shift (e.g. its previous Block-B value). This makes
+`max_shift` a *step* bound around where the trace already is, not an absolute
+bound around lag 0: with `center=0` a trace whose true shift is outside
+`±max_shift` of the origin gets a lag-0 window that snaps to the nearest lobe
+inside the window — for an oscillatory waveform, a half-period-shifted,
+polarity-inverted match (a cycle-skip). Passing `center=τ_prev` keeps the
+window over the true peak. Pass `center=0` only at init (no prior).
+
+`shift_prior_p` / `shift_prior_backstop_mult` (defaults `0` / `3`) turn the hard
+`±max_shift` window into a soft super-Gaussian MAP prior on the lag — see
+`estimate_shift_xcorr_coarse`. With `shift_prior_p > 0` the coarse search is
+bounded only by the generous backstop `center ± ceil(mult·max_shift)`, so the
+final result is clamped to that backstop (plus the ~0.5 fine overshoot), NOT to
+`±max_shift`: the prior, not a hard wall, is what keeps shifts small, and the
+distribution decays smoothly instead of piling up at an edge.
 """
 function estimate_shift_two_stage(x_ref::AbstractVector{<:Real}, x_trace::AbstractVector{<:Real},
                                    freqs::AbstractVector{<:Real}; freq_band=nothing,
-                                   polarity_agnostic::Bool=true, max_shift::Real=Inf)
+                                   polarity_agnostic::Bool=true, max_shift::Real=Inf,
+                                   center::Real=0, shift_prior_p::Real=0,
+                                   shift_prior_backstop_mult::Real=3)
     nt = length(x_ref)
     τ_coarse = estimate_shift_xcorr_coarse(x_ref, x_trace; polarity_agnostic=polarity_agnostic,
-                                           max_shift=max_shift)
+                                           max_shift=max_shift, center=center,
+                                           shift_prior_p=shift_prior_p,
+                                           shift_prior_backstop_mult=shift_prior_backstop_mult)
 
     # Undo the coarse shift on x_trace (circular) before the fine fit, so the
     # residual fine delay is small and safely within ±0.5 samples. x_trace
@@ -220,7 +278,14 @@ function estimate_shift_two_stage(x_ref::AbstractVector{<:Real}, x_trace::Abstra
     τ_fine = estimate_shift_phase_slope(X̂_ref, X̂_trace_shifted, freqs; freq_band=freq_band,
                                          zero_intercept=!polarity_agnostic)
     τ = Float32(τ_coarse) + τ_fine
-    # Clamp to the boundary: the fine step can nudge coarse slightly past the
-    # bound, and a saturating result is the requested behaviour.
-    return isfinite(max_shift) ? clamp(τ, -Float32(max_shift), Float32(max_shift)) : τ
+    # The bound is enforced by the coarse stage's IN-WINDOW argmax; τ_fine is only
+    # a sub-sample (|·|<~0.5) refinement, so clamp only that harmless overshoot.
+    # Bound depends on mode: soft prior → clamp to the generous backstop (the
+    # prior, not the clamp, keeps shifts small, so no ±edge pile-up); hard window
+    # → clamp to center ± max_shift as before.
+    isfinite(max_shift) || return τ
+    prior_on = shift_prior_p > 0 && isfinite(shift_prior_p) && max_shift > 0
+    bound = prior_on ? Float32(ceil(shift_prior_backstop_mult * max_shift)) + 0.5f0 :
+                       Float32(max_shift)
+    return clamp(τ, Float32(center) - bound, Float32(center) + bound)
 end

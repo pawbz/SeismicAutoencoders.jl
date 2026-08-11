@@ -34,6 +34,56 @@ function aligned_source_cor(ŝ_time::AbstractVector, s_true::AbstractVector)
     return cor(circshift(ŝ_time, lag), s_true)
 end
 
+@testset "baseline stochastic reference helpers" begin
+    rng = MersenneTwister(11)
+    @test stochastic_baseline_ref_size(1, 0) == 0
+    @test stochastic_baseline_ref_size(2, 0) == 1
+    @test stochastic_baseline_ref_size(20, 0) == floor(Int, sqrt(20))
+    @test stochastic_baseline_ref_size(20, 100) == 19
+    @test stochastic_baseline_ref_size(20, -3) == 1
+
+    for r in 1:12
+        subset = stochastic_baseline_subset_indices(12, r, 0, rng)
+        @test length(subset) == floor(Int, sqrt(12))
+        @test r ∉ subset
+        @test all(1 .<= subset .<= 12)
+        @test length(unique(subset)) == length(subset)
+    end
+end
+
+@testset "run_coherent_n2n_baseline: stochastic refs are opt-in and runnable" begin
+    nt = 64
+    R = 12
+    τ_true = Float32.(range(-5, 5, length=R))
+    s_true, D, _, _, _ = make_synthetic_gather(
+        nt=nt, R=R, f0=0.06, source_kind=:broadband,
+        true_shifts=τ_true, true_gains=ones(ComplexF32, R),
+        noise_std=0.05, rng=MersenneTwister(12))
+
+    para = CoherentN2N_Para(nt=nt, kernels=[8], filters=[8])
+    outer_default = CoherentN2N_Outer_Para(n_outer_iters=2)
+    outer_explicit = CoherentN2N_Outer_Para(n_outer_iters=2, stochastic_baseline_ref=false)
+    res_default = run_coherent_n2n_baseline(D, para, outer_default; rng=MersenneTwister(13))
+    res_explicit = run_coherent_n2n_baseline(D, para, outer_explicit; rng=MersenneTwister(13))
+
+    @test res_default.τ == res_explicit.τ
+    @test res_default.ŝ == res_explicit.ŝ
+    @test isempty(res_default.history.denoiser_loss)
+
+    outer_stoch = CoherentN2N_Outer_Para(
+        n_outer_iters=2,
+        stochastic_baseline_ref=true,
+        stochastic_baseline_subset_size=0)
+    res_stoch = run_coherent_n2n_baseline(D, para, outer_stoch; rng=MersenneTwister(13))
+
+    @test length(res_stoch.τ) == R
+    @test length(res_stoch.history.delta_s) == 2
+    @test length(res_stoch.history.delta_tau) == 2
+    @test all(isfinite, res_stoch.τ)
+    @test all(isfinite, res_stoch.ŝ)
+    @test isempty(res_stoch.history.denoiser_loss)
+end
+
 @testset "run_coherent_n2n: full blind pipeline recovers shifts/source/gains" begin
     rng = MersenneTwister(30)
     nt = 128

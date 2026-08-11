@@ -59,6 +59,43 @@ end
     @test size(inp2, 2) == n           # only g1 contributes
 end
 
+@testset "run_coherent_n2n_grouped_baseline: stochastic refs smoke + invalid guard" begin
+    nt = 64
+    groups = Matrix{Float32}[]
+    for (i, R) in enumerate((8, 11, 5))
+        τ_true = Float32.(range(-4, 4, length=R))
+        _, D, _, _, _ = make_synthetic_gather(
+            nt=nt, R=R, f0=0.04 + 0.01i, source_kind=:broadband,
+            true_shifts=τ_true, true_gains=ones(ComplexF32, R),
+            noise_std=0.05, rng=MersenneTwister(50 + i))
+        push!(groups, D)
+    end
+    _, D_bad, _, _, _ = make_synthetic_gather(
+        nt=nt, R=1, f0=0.05, source_kind=:broadband,
+        true_shifts=Float32[0], true_gains=ones(ComplexF32, 1),
+        noise_std=0.05, rng=MersenneTwister(59))
+    push!(groups, D_bad)
+
+    para = CoherentN2N_Para(nt=nt, kernels=[8], filters=[8])
+    outer_para = CoherentN2N_Outer_Para(
+        n_outer_iters=2,
+        stochastic_baseline_ref=true,
+        stochastic_baseline_subset_size=0)
+    result = run_coherent_n2n_grouped_baseline(groups, para, outer_para;
+                                               rng=MersenneTwister(60), min_events=2)
+
+    @test result.model === nothing
+    @test result.valid == BitVector([true, true, true, false])
+    @test length(result.groups) == 4
+    @test isempty(result.history.denoiser_loss)
+    @test length(result.history.delta_s[1]) == 2
+    @test isempty(result.history.delta_s[4])
+    for g in 1:4
+        @test all(isfinite, result.groups[g].τ)
+        @test all(isfinite, result.groups[g].ŝ)
+    end
+end
+
 @testset "run_coherent_n2n_grouped: per-receiver source recovery + shared model + guard" begin
     rng = MersenneTwister(40)
     nt = 128
