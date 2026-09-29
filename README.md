@@ -124,6 +124,9 @@ symvqvae train AP-BK,AP-CL --data-dir /path/to/jld2/files --nepoch 50
 # Train with custom parameters
 symvqvae train --data-dir /path/to/jld2/files --nepoch 200 --lr 0.0005 --K 8,5 --d 64 --Mnn-fraction 0.02 --index-refresh-every 4
 
+# Train only on one-sided lags between 20 s and 150 s (crops the correlation windows)
+symvqvae train --data-dir /path/to/jld2/files --nepoch 100 --min-lag 20 --max-lag 150
+
 # Train across multiple GPUs — pairs split round-robin, one Julia process per GPU
 symvqvae train --gpus 0,1 --data-dir /path/to/jld2/files --nepoch 100
 
@@ -227,6 +230,8 @@ Key parameters (defaults):
 | `--batchsize` | `4096` | Minibatch size |
 | `--Nmax` | `25000` | Encoder compiled width (inference batch size) |
 | `--periods` | `10,75` | Bandpass filter period range |
+| `--min-lag` | `0` | Min one-sided lag kept, in seconds (0 = start at `dt`) |
+| `--max-lag` | full window | Max one-sided lag kept, in seconds |
 
 See `vqvae/VQVAE_readme.md` for the full architecture evolution from v1 to v9.
 
@@ -250,6 +255,12 @@ julia --project=. vqvae/symvqvae.jl train --data-dir /path/to/data --nepoch 100 
 
 Neighbor-target refresh can be tuned from the CLI with `--Mnn-fraction` (default `0.02`) and
 `--index-refresh-every` (default `4`).
+
+To train on only part of each cross-correlation, pass `--min-lag` / `--max-lag` (seconds). Only
+one-sided samples at lag `k*dt` with `min_lag ≤ k*dt ≤ max_lag` are kept, on both the causal and
+acausal sides. The crop happens before tapering and normalisation, and the compiled `nt` shrinks to
+match, so a shorter window also trains faster. The defaults keep the full window, as before. See
+`vqvae/VQVAE_readme.md` for details.
 
 ---
 
@@ -304,11 +315,12 @@ you can catch a mismatch before training, and both `train` and `inspect` reject
 
 Trained models are saved under `--save-dir` (default: `<data-dir>/SavedModels/vqvae_YYYY.MM_K=[...]_Tmin=...s_Tmax=...s`).
 The version number indicates which release trained the model (e.g., `vqvae_2026.06_K=[5, 3]_Tmin=3s_Tmax=10s`).
+When a lag window is set, a suffix is appended, e.g. `..._Tmax=10s_lag=20-150s`.
 Each run creates a timestamped directory per pair and seed containing:
 
 - `run_summary.jld2` — hyperparameters and loss history
 - `loss_history.jld2` — per-epoch metrics
-- `source_state_averages.jld2` — codebook assignments and waveform averages
+- `source_state_averages.jld2` — codebook assignments and waveform averages, plus `lag_axis_s` (the lag, in s, of each sample; `run_summary.jld2` also stores `min_lag`/`max_lag`)
 
 ---
 
