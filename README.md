@@ -7,7 +7,7 @@ ambient seismic noise cross-correlations between station pairs. The goal is not 
 quality alone — it is to discover discrete, physically meaningful waveform modes that reveal
 coherent seismic arrivals when averaged within each quantized state.
 
-> **Other architectures** (SymAE, CatVAE, PhaseAligner, CoherentN2N) are in `experimental/`
+> **Other architectures** (SymAE, CatVAE, PhaseAligner, CoherentN2N, BispectrumMRA) are in `experimental/`
 > and are research prototypes, not production-ready.
 
 ---
@@ -19,15 +19,16 @@ SeismicAutoencoders/
 ├── vqvae/                    Primary SymVQVAE code
 │   ├── SymVQVAE_architecture.jl   Model, training loop, XLA compilation
 │   ├── Training_SymVQVAE.jl       Pluto notebook for real-pair training
-│   ├── symvqvae.jl                CLI entry point (train, inspect)
-│   ├── symvqvae.sh                Launcher (background/foreground)
-│   ├── train_vqvae.jl             Legacy CLI (deprecated)
-│   ├── train_vqvae.sh             Legacy launcher (deprecated)
+│   ├── symvqvae.jl                CLI entry point (train, inspect, list-pairs)
+│   ├── symvqvae.sh                Launcher (background/foreground, multi-GPU)
+│   ├── version.jl                 Version string (calendar versioning)
 │   ├── io_utils.jl                JLD2/HDF5 file I/O and station-pair discovery
+│   ├── whitening_utils.jl         FIR spectral whitening (used by inspect)
 │   ├── data_generators.jl         Batch/data-iterator machinery for training loops
 │   ├── Prepare_Tomography_v9.jl   Post-training tomography preparation
 │   ├── TomographySelection_v9.jl  Station-pair selection for tomography
 │   ├── VQVAE_readme.md            Detailed architecture evolution notes (v1→v9)
+│   ├── test_data/                 Small real-pair dataset (CCC-OVY) for smoke tests
 │   └── history/                   Older versions (v1–v8) and experimental variants
 │
 ├── vqvae_analysis/           Post-training analysis notebooks
@@ -47,8 +48,12 @@ SeismicAutoencoders/
 │   ├── symae/                Symmetric Autoencoder
 │   ├── catvae/               Categorical VAE
 │   ├── phase_aligner/        Phase alignment network (learned siamese scalar phase)
-│   └── coherent_n2n/         Alternating cross-spectrum shift alignment + Noise2Noise denoising
+│   ├── coherent_n2n/         Alternating cross-spectrum shift alignment + Noise2Noise denoising
+│   └── bispectrum_mra/       Bispectrum-based multi-reference alignment
 │
+├── multiple_scattering/      Synthetic blind-deconvolution data generator (own Project.toml)
+├── *_cli.jl                  Post-training acausal+causal CLIs (triplets, transfer, phase sweeps)
+├── readme_after_training.md  Runbook for the post-training CLIs
 ├── Notebooks/                Pluto/Jupyter notebooks
 ├── Project.toml              Julia package manifest
 ├── Manifest.toml             Pinned dependency versions
@@ -109,6 +114,9 @@ Once the alias is set up, `symvqvae` works from any directory:
 # Show all commands and options
 symvqvae --help
 
+# List station pairs found in a data directory (add --gpus 0,1 to preview the GPU split)
+symvqvae list-pairs --data-dir /path/to/jld2/files
+
 # Inspect a specific station pair (unified waveform axis, raw+whitened PSD comparison)
 symvqvae inspect AP_BK --data-dir /path/to/jld2/files
 
@@ -132,9 +140,6 @@ symvqvae train --gpus 0,1 --data-dir /path/to/jld2/files --nepoch 100
 
 # Multi-GPU, stream all logs to terminal (blocks until done)
 symvqvae train --gpus 0,1,2,3 --foreground --data-dir /path/to/jld2/files --nepoch 100
-
-# Backward compatibility: old alias still works
-train_vqvae --data-dir /path/to/jld2/files --nepoch 100
 ```
 
 ---
@@ -145,20 +150,20 @@ train_vqvae --data-dir /path/to/jld2/files --nepoch 100
 
 Version numbers show the month and year of release:
 - `2026.06` = June 2026 release
-- `2026.06.1` = Second release in June 2026 (if needed)
+- `2026.06.1` = Second release in June 2026
 - `2026.07` = July 2026 release
 
 This scheme makes it immediately clear when a version was released, without ambiguity about major/minor/patch semantics. Common in scientific and research software.
 
-**Current Version**: v2026.06 (June 2026)
+**Current Version**: v2026.06.1 (June 2026)
 
 Check your version:
 ```bash
 symvqvae --help
-# Shows "SymVQVAE v2026.06" in the header
+# Shows "SymVQVAE v2026.06.1" in the header
 
 julia --project=. -e 'include("vqvae/version.jl"); println(version_string())'
-# Prints: SymVQVAE v2026.06
+# Prints: SymVQVAE v2026.06.1
 ```
 
 See [releases](https://github.com/pawbz/SeismicAutoencoders/releases) for release notes and changelog.
@@ -213,6 +218,7 @@ and compiled to XLA via Reactant.jl.
 - Two independent codebooks (K₁, K₂) — quantized independently via EMA
 - Two independent decoders → x̂₁, x̂₂
 - Additive reconstruction: x̂ = x̂₁ + x̂₂ — forces each decoder to specialize
+- Single-stage variant with `--K 5`: one head, one codebook, one decoder over the full `d`
 
 **Training:**
 - XLA compiled once per session, reused across all pairs and seeds
@@ -223,17 +229,19 @@ Key parameters (defaults):
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
-| `--K` | `5,3` | Codebook sizes for the two stages |
-| `--d` | `40` | Latent dimension (split equally between two heads) |
+| `--K` | `5,3` | Codebook sizes: 2 stages (`5,3`) or 1 stage (`5`) |
+| `--d` | `40` | Latent dimension (split equally between two heads in 2-stage mode) |
 | `--nepoch` | `100` | Training epochs |
 | `--seeds` | `1234,1235` | Random seeds (one model trained per seed) |
 | `--batchsize` | `4096` | Minibatch size |
 | `--Nmax` | `25000` | Encoder compiled width (inference batch size) |
-| `--periods` | `10,75` | Bandpass filter period range |
+| `--lr` | `0.001` | Learning rate |
+| `--periods` | `3,10` | Bandpass filter period range (s) |
+| `--dt` | `1.0` | Sample interval (s); set it to match your data |
 | `--min-lag` | `0` | Min one-sided lag kept, in seconds (0 = start at `dt`) |
 | `--max-lag` | full window | Max one-sided lag kept, in seconds |
 
-See `vqvae/VQVAE_readme.md` for the full architecture evolution from v1 to v9.
+Run `symvqvae train --help` for the full option list. See `vqvae/VQVAE_readme.md` for the full architecture evolution from v1 to v9.
 
 ---
 
@@ -249,9 +257,14 @@ symvqvae train --data-dir /path/to/data --nepoch 100
 To run in the **foreground** (blocking, output to terminal):
 
 ```bash
-# Run the Julia script directly for foreground output
-julia --project=. vqvae/symvqvae.jl train --data-dir /path/to/data --nepoch 100 --foreground
+symvqvae train --data-dir /path/to/data --nepoch 100 --foreground   # or -f
+
+# Or run the Julia script directly
+julia --project=. vqvae/symvqvae.jl train --data-dir /path/to/data --nepoch 100
 ```
+
+With `--gpus 0,1,...`, pairs are split round-robin across GPUs, with one Julia process and one log
+file per GPU.
 
 Neighbor-target refresh can be tuned from the CLI with `--Mnn-fraction` (default `0.02`) and
 `--index-refresh-every` (default `4`).
@@ -267,8 +280,8 @@ match, so a shorter window also trains faster. The defaults keep the full window
 ## Data format
 
 Input data is expected as **JLD2 or HDF5 (`.h5`) files**, one per station pair, in the
-directory passed to `--data-dir`. File names must follow the pattern
-`NET1_STA1_NET2_STA2*.{jld2,h5}`. The two formats can be mixed in the same directory —
+directory passed to `--data-dir`. File names must start with the two station codes,
+`STA1_STA2*.{jld2,h5}` (e.g. `CCC_OVY-full-width-30mins-....jld2` → pair `CCC-OVY`). The two formats can be mixed in the same directory —
 `list-pairs`, `inspect`, and `train` all discover and load either transparently.
 
 Each file contains ambient noise cross-correlations (causal and acausal sides) for that
@@ -314,7 +327,7 @@ you can catch a mismatch before training, and both `train` and `inspect` reject
 ## Output
 
 Trained models are saved under `--save-dir` (default: `<data-dir>/SavedModels/vqvae_YYYY.MM_K=[...]_Tmin=...s_Tmax=...s`).
-The version number indicates which release trained the model (e.g., `vqvae_2026.06_K=[5, 3]_Tmin=3s_Tmax=10s`).
+The version number indicates which release trained the model (e.g., `vqvae_2026.06.1_K=[5, 3]_Tmin=3s_Tmax=10s`).
 When a lag window is set, a suffix is appended, e.g. `..._Tmax=10s_lag=20-150s`.
 Each run creates a timestamped directory per pair and seed containing:
 

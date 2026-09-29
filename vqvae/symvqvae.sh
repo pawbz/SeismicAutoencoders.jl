@@ -136,6 +136,8 @@ while [ $i -le $# ]; do
          [ "$arg" = "--seeds" ] || \
          [ "$arg" = "--periods" ] || \
          [ "$arg" = "--dt" ] || \
+         [ "$arg" = "--min-lag" ] || \
+         [ "$arg" = "--max-lag" ] || \
          [ "$arg" = "--K" ] || \
          [ "$arg" = "--d" ] || \
          [ "$arg" = "--n-filters" ] || \
