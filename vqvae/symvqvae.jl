@@ -38,9 +38,19 @@ function save_dir_number_label(x::Real)
     replace(label, "." => "p", "-" => "m")
 end
 
-function default_train_save_root(data_dir::AbstractString, K_vec, period_min::Real, period_max::Real)
+function default_train_save_root(data_dir::AbstractString, K_vec, period_min::Real, period_max::Real;
+    min_lag::Real=0.0, max_lag::Real=Inf)
     period_label = "Tmin=$(save_dir_number_label(period_min))s_Tmax=$(save_dir_number_label(period_max))s"
-    joinpath(data_dir, "SavedModels", "vqvae_$(VERSION)_K=$(K_vec)_$(period_label)")
+    lag_label = (min_lag == 0 && !isfinite(max_lag)) ? "" :
+        "_lag=$(save_dir_number_label(min_lag))-$(isfinite(max_lag) ? save_dir_number_label(max_lag) * "s" : "end")"
+    joinpath(data_dir, "SavedModels", "vqvae_$(VERSION)_K=$(K_vec)_$(period_label)$(lag_label)")
+end
+
+function check_lag_window(min_lag::Real, max_lag::Real)
+    min_lag >= 0 || error("--min-lag must be non-negative; got $(min_lag)")
+    max_lag > 0 || error("--max-lag must be positive; got $(max_lag)")
+    min_lag < max_lag || error("--min-lag ($(min_lag)s) must be less than --max-lag ($(max_lag)s)")
+    nothing
 end
 
 function parse_period_range(periods::AbstractString)
@@ -90,6 +100,8 @@ Commands:
       --seeds LIST                  Seeds per model (default: "1234,1235")
       --periods MIN,MAX             Period range (default: 3,10s)
       --dt FLOAT                    Sample interval (default: 1.0s)
+      --min-lag FLOAT               Min one-sided lag kept, s (default: 0 = from dt)
+      --max-lag FLOAT               Max one-sided lag kept, s (default: full window)
       --K LIST                      Codebook sizes, 1 or 2 stages (default: "5,3"; single-stage: "5")
       --d INT                       Latent dimension (default: 40)
       --n-filters INT               Encoder filters (default: 32)
@@ -489,6 +501,8 @@ train [pairs] [options]
     --seeds LIST                  Seeds per model (default: "1234,1235")
     --periods MIN,MAX             Period range (default: 3,10s)
     --dt FLOAT                    Sample interval (default: 1.0s)
+    --min-lag FLOAT               Min one-sided lag kept, s (default: 0 = from dt)
+    --max-lag FLOAT               Max one-sided lag kept, s (default: full window)
     --K LIST                      Codebook sizes (default: "5,3")
     --d INT                       Latent dimension (default: 40)
     --n-filters INT               Encoder filters (default: 32)
@@ -515,6 +529,8 @@ train [pairs] [options]
     period_min = 3.0
     period_max = 10.0
     dt = 1.0
+    min_lag = 0.0
+    max_lag = Inf
     K = "5,3"
     d = 40
     n_filters = 32
@@ -557,6 +573,12 @@ train [pairs] [options]
         elseif a == "--dt"
             i += 1
             i <= length(args) && (dt = parse(Float64, args[i]))
+        elseif a == "--min-lag"
+            i += 1
+            i <= length(args) && (min_lag = parse(Float64, args[i]))
+        elseif a == "--max-lag"
+            i += 1
+            i <= length(args) && (max_lag = parse(Float64, args[i]))
         elseif a == "--K"
             i += 1
             i <= length(args) && (K = args[i])
@@ -605,12 +627,13 @@ train [pairs] [options]
     end
 
     pairs != "TEST" && check_nyquist(period_min, dt)
+    check_lag_window(min_lag, max_lag)
 
     seeds_vec  = parse.(Int, strip.(split(seeds, ",")))
     K_vec      = parse.(Int, strip.(split(K, ",")))
     length(K_vec) in (1, 2) || error("--K must specify 1 or 2 codebook stages, e.g. \"5\" or \"5,3\". Got: $K")
     ratios_vec = parse.(Int, strip.(split(ratios, ",")))
-    default_save_root = default_train_save_root(data_dir, K_vec, period_min, period_max)
+    default_save_root = default_train_save_root(data_dir, K_vec, period_min, period_max; min_lag, max_lag)
 
     # Print all parameters for user verification
     println("\n" * "="^80)
@@ -626,6 +649,7 @@ train [pairs] [options]
     println("Seeds:                       $seeds")
     println("Period range (bandpass):     $period_min — $period_max s")
     println("Sample interval (dt):        $dt s")
+    println("Lag window (one-sided):      $(min_lag) — $(isfinite(max_lag) ? "$(max_lag)" : "end") s")
     println("Codebook sizes (K):          $K")
     println("Latent dimension (d):        $d")
     println("Encoder filters:             $n_filters")
@@ -718,7 +742,7 @@ train [pairs] [options]
     else
         @info "Loading first pair to determine nt for XLA compilation..."
         first_pair_data = load_pairs_data([selected_pairs[1]];
-            filepath=data_dir, dt, period_min, period_max)
+            filepath=data_dir, dt, period_min, period_max, min_lag, max_lag)
         nt = size(first_pair_data[1].data.D_train, 1)
     end
 
@@ -746,6 +770,7 @@ train [pairs] [options]
             save_root,
             filepath=data_dir,
             dt, period_min, period_max,
+            min_lag, max_lag,
             bp_filter,
             per_waveform_whitening_kernel_length=whitening_kernel_length,
             device,

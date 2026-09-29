@@ -19,6 +19,26 @@ The single-stage model is simpler and may be preferred when you want a single di
 - `--d`: latent dimension. For 2-stage this is split as d÷2 per head. For 1-stage the full d is used for the single codebook.
 - `--K`: codebook size(s). 1 or 2 comma-separated integers.
 
+### Lag window (--min-lag / --max-lag)
+
+Optionally crop the one-sided cross-correlation windows before training (subsampling in lag, not a
+change to the model). Values are in seconds:
+
+```
+symvqvae train AP-BK --min-lag 20 --max-lag 150
+```
+
+- Keeps one-sided samples at lag `k*dt` with `min_lag ≤ k*dt ≤ max_lag` (k ≥ 1; zero lag is always
+  dropped). The same window is applied to the causal and acausal sides.
+- Cropping happens before the Tukey taper and normalisation, so the new window edges are tapered.
+- Defaults (`0` / full window) reproduce the previous behaviour exactly.
+- `nt` for the XLA compile is taken from the cropped data, so a shorter window means a smaller, faster model.
+- Non-default windows add a `_lag=<min>-<max>s` (or `_lag=<min>-end`) suffix to the default save
+  directory. The lag axis is saved as `lag_axis_s` in `source_state_averages.jld2`, and
+  `min_lag`/`max_lag` in `run_summary.jld2`. Downstream analysis should use `lag_axis_s` rather
+  than assuming `(1:n) .* dt`.
+- In `Training_SymVQVAE.jl`, set `min_lag` / `max_lag` in the config cell next to `period_min` / `period_max`.
+
 ---
 
 This document summarizes the evolution of the seismic VQVAE code and the current design intent.

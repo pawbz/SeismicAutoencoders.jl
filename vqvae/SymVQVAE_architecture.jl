@@ -1402,17 +1402,45 @@ function split_causal_acausal(X::AbstractMatrix, zero_lag::Bool, max_lag=nothing
     return Array(X_acausal), Array(X_causal)
 end
 
+# ╔═╡ 3c2f7a1e-5b8d-4e6a-9f10-7d4c2b8e1a55
+"""
+    lag_window_indices(half, dt; min_lag=0.0, max_lag=Inf)
+
+One-sided sample indices `k ∈ 1:half` (lag `k*dt`) with `min_lag ≤ k*dt ≤ max_lag`.
+Defaults keep the full window.
+"""
+function lag_window_indices(half::Integer, dt::Real; min_lag::Real=0.0, max_lag::Real=Inf)
+    min_lag >= 0 && max_lag >= 0 || error("min_lag/max_lag must be non-negative; got $(min_lag), $(max_lag).")
+    min_lag < max_lag || error("min_lag ($(min_lag)s) must be less than max_lag ($(max_lag)s).")
+    k1 = max(1, ceil(Int, min_lag / dt - 1e-9))
+    k2 = isfinite(max_lag) ? min(half, floor(Int, max_lag / dt + 1e-9)) : half
+    k1 <= k2 || error("Lag window [$(min_lag), $(max_lag)] s keeps no samples; " *
+        "available one-sided lags are $(dt) … $(half * dt) s.")
+    return k1:k2
+end
+
 # ╔═╡ 4b8ffb0f-23b0-443d-b4c7-12a3ed4ac76d
 function build_training_bundle(pair::Tuple{String,String}; filepath::String, dt::Real=1.0,
-    period_min::Real=10, period_max::Real=50)
+    period_min::Real=10, period_max::Real=50, min_lag::Real=0.0, max_lag::Real=Inf)
     pair_name = join(pair, "_")
     raw = get_acausal_causal(pair_name, filepath)
     D1 = normalise(raw.correlations, dims=1)
     D1ac, D1c = split_causal_acausal(D1, true)
-    D1fac = Float32.(normalise(taper(D1ac)[2:end, :], dims=1))
-    D1fc  = Float32.(normalise(taper(D1c)[2:end,  :], dims=1))
+    half = size(D1ac, 1) - 1
+    idx = lag_window_indices(half, dt; min_lag, max_lag)
+    D1fac, D1fc = if idx == 1:half
+        # full window: original taper-then-drop-zero-lag path
+        Float32.(normalise(taper(D1ac)[2:end, :], dims=1)),
+        Float32.(normalise(taper(D1c)[2:end,  :], dims=1))
+    else
+        # drop zero lag, crop to the lag window, then taper so the new edges are tapered
+        Float32.(normalise(taper(D1ac[2:end, :][idx, :]), dims=1)),
+        Float32.(normalise(taper(D1c[2:end,  :][idx, :]), dims=1))
+    end
+    lag_axis_s = collect(idx .* dt)
     return (; pair, D1=Float32.(D1), D1fac, D1fc, headers=raw.headers, distance=raw.distance,
-            latitudes=raw.latitudes, longitudes=raw.longitudes)
+            latitudes=raw.latitudes, longitudes=raw.longitudes,
+            lag_axis_s, min_lag=Float64(min_lag), max_lag=Float64(max_lag))
 end
 
 # ╔═╡ 8dd1c50c-587c-471d-bc80-cd77012302a9
@@ -1437,13 +1465,14 @@ end
 
 # ╔═╡ f3583928-80f5-4e89-8d86-463eda8b97bd
 function load_pairs_data(selected_pairs; filepath::String,
-    seed::Int=1234, dt::Real=1.0, period_min::Real=10, period_max::Real=50)
+    seed::Int=1234, dt::Real=1.0, period_min::Real=10, period_max::Real=50,
+    min_lag::Real=0.0, max_lag::Real=Inf)
     rng = Xoshiro(seed)
     pairs_data = Any[]
     for pair_raw in selected_pairs
         pair = (String(pair_raw[1]), String(pair_raw[2]))
         @info "Loading SymVQVAE pair data" pair
-        bundle = build_training_bundle(pair; filepath, dt, period_min, period_max)
+        bundle = build_training_bundle(pair; filepath, dt, period_min, period_max, min_lag, max_lag)
         @info "Loaded SymVQVAE pair bundle" pair distance=bundle.distance D1fac_size=size(bundle.D1fac) D1fc_size=size(bundle.D1fc)
         data = make_pooled_split(bundle.D1fac, bundle.D1fc; rng)
         @info "Built SymVQVAE train/test split" pair train_size=size(data.D_train) test_size=size(data.D_test)
@@ -2259,6 +2288,7 @@ function save_vqvae_run(run_dir; model, ps, st, para, training_para, loss_histor
         distance=data_bundle.distance,
         latitudes=data_bundle.latitudes,
         longitudes=data_bundle.longitudes,
+        lag_axis_s=hasproperty(data_bundle, :lag_axis_s) ? Float64.(data_bundle.lag_axis_s) : Float64[],
         pair=pair)
     jldsave(joinpath(run_dir, "run_summary.jld2");
         vqvae_para=para, training_para=training_para, pair=pair,
@@ -2266,6 +2296,8 @@ function save_vqvae_run(run_dir; model, ps, st, para, training_para, loss_histor
         distance=data_bundle.distance,
         latitudes=data_bundle.latitudes,
         longitudes=data_bundle.longitudes,
+        min_lag=hasproperty(data_bundle, :min_lag) ? data_bundle.min_lag : 0.0,
+        max_lag=hasproperty(data_bundle, :max_lag) ? data_bundle.max_lag : Inf,
         loss_history=loss_history)
     jldsave(joinpath(run_dir, "loss_history.jld2"); loss_history)
     @info "Saved SymVQVAE source-state analysis artifact" run_dir
@@ -2327,6 +2359,7 @@ end
 function train_selected_pairs_lazy(selected_pairs, compiled_model;
     seeds, training_para::VQVAE_Training_Para, save_root::String,
     filepath::String, dt::Real=1.0, period_min::Real=10, period_max::Real=50,
+    min_lag::Real=0.0, max_lag::Real=Inf,
     bp_filter, per_waveform_whitening_kernel_length::Int,
     device=nothing, analysis_settings=(;))
     isempty(selected_pairs) && return Any[]
@@ -2338,14 +2371,13 @@ function train_selected_pairs_lazy(selected_pairs, compiled_model;
     for pair_raw in selected_pairs
         pair = (String(pair_raw[1]), String(pair_raw[2]))
         @info "Loading pair" pair
-        bundle = build_training_bundle(pair; filepath, dt, period_min, period_max)
+        bundle = build_training_bundle(pair; filepath, dt, period_min, period_max, min_lag, max_lag)
         data = make_pooled_split(bundle.D1fac, bundle.D1fc; rng)
         pd_raw = (; pair, data, data_bundle=bundle)
         @info "Whitening pair" pair
         pd = whiten_pair_entry(pd_raw; bp_filter, per_waveform_whitening_kernel_length)
         let D_ac = pd.data.D_ac_all, D_c = pd.data.D_c_all
-            nt      = size(D_ac, 1)
-            lags_s  = collect((1:nt) .* dt)
+            lags_s  = pd.data_bundle.lag_axis_s
             mean_ac = vec(mean(D_ac, dims=2))
             mean_c  = vec(mean(D_c,  dims=2))
             plt_w = UnicodePlots.lineplot(
@@ -2500,8 +2532,9 @@ function train_one_pair(pair::Tuple{<:AbstractString,<:AbstractString}; filepath
     vqvae_parameters::NamedTuple, training_para::VQVAE_Training_Para,
     save_root::String=joinpath(filepath, "SavedModels", "symvqvae"),
     seed::Int=1234, dt::Real=1.0, period_min::Real=10, period_max::Real=50,
+    min_lag::Real=0.0, max_lag::Real=Inf,
     device=nothing, Nmax::Int=25_000)
-    pairs_data = load_pairs_data([pair]; filepath, seed, dt, period_min, period_max)
+    pairs_data = load_pairs_data([pair]; filepath, seed, dt, period_min, period_max, min_lag, max_lag)
     nt = size(pairs_data[1].data.D_train, 1)
     compiled_model = compile_model(nt; vqvae_parameters, training_para, seed, device, Nmax)
     return only(train_selected_pairs(pairs_data, compiled_model; seeds=[seed],
@@ -4535,6 +4568,7 @@ version = "17.7.0+0"
 # ╠═566e6a4c-1153-4c6c-bf2b-385478f684c4
 # ╠═a1e5a8cb-0bd1-44b8-8cd4-c95a667d830d
 # ╠═0b79d043-0805-43b3-80d7-f64d2018525f
+# ╠═3c2f7a1e-5b8d-4e6a-9f10-7d4c2b8e1a55
 # ╠═4b8ffb0f-23b0-443d-b4c7-12a3ed4ac76d
 # ╠═8dd1c50c-587c-471d-bc80-cd77012302a9
 # ╠═7e26f064-6a32-41ce-b416-90a04adfbcc9

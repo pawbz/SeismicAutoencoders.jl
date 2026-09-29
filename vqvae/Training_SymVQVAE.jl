@@ -101,6 +101,8 @@ begin
     dt = 1.0
     period_min = 3
     period_max = 10
+    min_lag = 0.0      # one-sided lag window kept for training (s); 0.0/Inf = full window
+    max_lag = Inf
     mft_nT = 20        # number of periods log-spaced between period_min and period_max
     velocity_range = (1.0, 8.0)
     mft_nperiods = 100
@@ -246,7 +248,7 @@ end
 pairs_data_preview = let
     pd_raw = only(vqvae.load_pairs_data(selected_pairs[1:1];
         filepath=data_filepath, seed=1234,
-        dt=dt, period_min=period_min, period_max=period_max))
+        dt=dt, period_min=period_min, period_max=period_max, min_lag, max_lag))
     [vqvae.whiten_pair_entry(pd_raw;
         bp_filter, per_waveform_whitening_kernel_length)]
 end
@@ -332,6 +334,8 @@ analysis_settings = (;
     dt,
     period_min,
     period_max,
+    min_lag,
+    max_lag,
     mft_nperiods,
     mft_max_modes,
     velocity_range,
@@ -357,6 +361,8 @@ train_results = begin
             dt,
             period_min,
             period_max,
+            min_lag,
+            max_lag,
             bp_filter,
             per_waveform_whitening_kernel_length,
             device=training_device,
